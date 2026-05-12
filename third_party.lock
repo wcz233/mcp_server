@@ -1,0 +1,16 @@
+dependencies:
+  libuv:
+    path: external/libuv
+    source: https://github.com/libuv/libuv.git
+    version: v1.52.1
+    commit: 1cfa32ff59c076ffb6ed735bbc8c18361558661f
+    release_tarball: https://dist.libuv.org/dist/v1.52.1/libuv-v1.52.1.tar.gz
+    license: MIT
+
+  jansson:
+    path: external/jansson
+    source: https://github.com/akheron/jansson.git
+    version: v2.15.0
+    commit: 4a9a6db73d5dc553164992e87426502ab2d54512
+    release_tarball: https://github.com/akheron/jansson/releases/download/v2.15.0/jansson-2.15.0.tar.gz
+    license: MIT

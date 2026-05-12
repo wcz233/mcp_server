@@ -1,0 +1,6 @@
+[submodule "external/libuv"]
+	path = external/libuv
+	url = https://github.com/libuv/libuv.git
+[submodule "external/jansson"]
+	path = external/jansson
+	url = https://github.com/akheron/jansson.git
