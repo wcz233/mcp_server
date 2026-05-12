@@ -39,7 +39,8 @@ void mcp_in_flight_destroy(struct mcp_in_flight_map *map)
 
 struct mcp_in_flight_entry *mcp_in_flight_put(struct mcp_in_flight_map *map,
                                               const char *id_key,
-                                              json_t *id)
+                                              json_t *id,
+                                              const struct mcp_reply_target *reply_to)
 {
     struct mcp_in_flight_entry *entry = calloc(1, sizeof(*entry));
     int len;
@@ -69,6 +70,10 @@ struct mcp_in_flight_entry *mcp_in_flight_put(struct mcp_in_flight_map *map,
     snprintf(entry->invocation_id, (size_t)len + 1, "srv_call_%llu", map->next_invocation - 1);
 
     entry->id = json_incref(id);
+    if (reply_to)
+        entry->reply_to = *reply_to;
+    else
+        entry->reply_to.transport = MCP_REPLY_STDIO;
     entry->next = map->head;
     map->head = entry;
     map->size++;

@@ -12,19 +12,36 @@
 
 struct mcp_message_node {
     struct mcp_jsonrpc_message *message;
+    struct mcp_reply_target reply_to;
     struct mcp_message_node *next;
 };
+
+static void client_session_cleanup(struct mcp_client_session *session);
+static struct mcp_client_session *client_session_for_reply(struct mcp_server *server,
+                                                           const struct mcp_reply_target *reply_to,
+                                                           bool create_if_missing);
+static bool reply_targets_equal(const struct mcp_reply_target *lhs,
+                                const struct mcp_reply_target *rhs);
 
 static void core_async_cb(uv_async_t *handle);
 static void stdio_on_line(void *arg, const char *line, size_t len);
 static void stdio_on_exit(void *arg);
+#if MCP_HAS_TRANSPORT_UDP
+static void udp_on_datagram(void *arg,
+                            const char *data,
+                            size_t len,
+                            const struct sockaddr *peer);
+static void udp_on_error(void *arg, int status);
+#endif
 
 uv_loop_t *mcp_server_loop(struct mcp_server *server)
 {
     return server->loop;
 }
 
-static int send_json_line(struct mcp_server *server, json_t *object)
+static int send_json_object(struct mcp_server *server,
+                            const struct mcp_reply_target *reply_to,
+                            json_t *object)
 {
     char *line = mcp_jsonrpc_dump_line(object);
     int rc;
@@ -32,36 +49,130 @@ static int send_json_line(struct mcp_server *server, json_t *object)
     if (!line)
         return -1;
 
-    rc = mcp_stdio_transport_send_str(server->stdio, line);
+    if (reply_to && reply_to->transport == MCP_REPLY_UDP) {
+#if MCP_HAS_TRANSPORT_UDP
+        rc = mcp_udp_transport_send(server->udp,
+                                    line,
+                                    strlen(line),
+                                    (const struct sockaddr *)&reply_to->udp_peer);
+#else
+        rc = -1;
+#endif
+    } else {
+        rc = mcp_stdio_transport_send_str(server->stdio, line);
+    }
     free(line);
+    return rc;
+}
+
+static int send_result_to(struct mcp_server *server,
+                          const struct mcp_reply_target *reply_to,
+                          json_t *id,
+                          json_t *result)
+{
+    json_t *object = mcp_jsonrpc_build_response(id, result);
+    int rc = send_json_object(server, reply_to, object);
+
+    json_decref(object);
+    return rc;
+}
+
+static int send_error_to(struct mcp_server *server,
+                         const struct mcp_reply_target *reply_to,
+                         json_t *id,
+                         int code,
+                         const char *message)
+{
+    json_t *object = mcp_jsonrpc_build_error(id, code, message);
+    int rc = send_json_object(server, reply_to, object);
+
+    json_decref(object);
     return rc;
 }
 
 int mcp_server_send_result(struct mcp_server *server, json_t *id, json_t *result)
 {
-    json_t *object = mcp_jsonrpc_build_response(id, result);
-    int rc = send_json_line(server, object);
-
-    json_decref(object);
-    return rc;
+    return send_result_to(server, NULL, id, result);
 }
 
 int mcp_server_send_error(struct mcp_server *server, json_t *id, int code, const char *message)
 {
-    json_t *object = mcp_jsonrpc_build_error(id, code, message);
-    int rc = send_json_line(server, object);
-
-    json_decref(object);
-    return rc;
+    return send_error_to(server, NULL, id, code, message);
 }
 
-static bool gate_allows_method(struct mcp_server *server, const char *method)
+static bool reply_targets_equal(const struct mcp_reply_target *lhs,
+                                const struct mcp_reply_target *rhs)
+{
+    size_t len;
+
+    if (lhs->transport != rhs->transport)
+        return false;
+    if (lhs->transport == MCP_REPLY_STDIO)
+        return true;
+    if (lhs->transport != MCP_REPLY_UDP)
+        return false;
+
+    if (lhs->udp_peer.ss_family == AF_INET && rhs->udp_peer.ss_family == AF_INET)
+        len = sizeof(struct sockaddr_in);
+    else if (lhs->udp_peer.ss_family == AF_INET6 && rhs->udp_peer.ss_family == AF_INET6)
+        len = sizeof(struct sockaddr_in6);
+    else
+        return false;
+
+    return memcmp(&lhs->udp_peer, &rhs->udp_peer, len) == 0;
+}
+
+static void client_session_cleanup(struct mcp_client_session *session)
+{
+    if (!session)
+        return;
+
+    json_decref(session->tool_snapshot);
+    session->tool_snapshot = NULL;
+    session->state = MCP_SESSION_NOT_INITIALIZED;
+}
+
+static struct mcp_client_session *client_session_for_reply(struct mcp_server *server,
+                                                           const struct mcp_reply_target *reply_to,
+                                                           bool create_if_missing)
+{
+    struct mcp_reply_target stdio_reply = {0};
+    struct mcp_client_session *session;
+    struct mcp_client_session *created;
+
+    stdio_reply.transport = MCP_REPLY_STDIO;
+    if (!reply_to)
+        reply_to = &stdio_reply;
+
+    if (reply_to->transport == MCP_REPLY_STDIO)
+        return &server->stdio_session;
+
+    for (session = server->udp_sessions; session; session = session->next) {
+        if (reply_targets_equal(&session->reply_to, reply_to))
+            return session;
+    }
+
+    if (!create_if_missing)
+        return NULL;
+
+    created = calloc(1, sizeof(*created));
+    if (!created)
+        return NULL;
+
+    created->reply_to = *reply_to;
+    created->state = MCP_SESSION_NOT_INITIALIZED;
+    created->next = server->udp_sessions;
+    server->udp_sessions = created;
+    return created;
+}
+
+static bool gate_allows_method(const struct mcp_client_session *session, const char *method)
 {
     if (strcmp(method, "ping") == 0)
         return true;
     if (strcmp(method, "initialize") == 0)
-        return server->session_state == MCP_SESSION_NOT_INITIALIZED;
-    return server->session_state == MCP_SESSION_INITIALIZED;
+        return session && session->state == MCP_SESSION_NOT_INITIALIZED;
+    return session && session->state == MCP_SESSION_INITIALIZED;
 }
 
 static json_t *build_initialize_result(void)
@@ -84,7 +195,9 @@ static json_t *build_initialize_result(void)
     return result;
 }
 
-static void queue_message(struct mcp_server *server, struct mcp_jsonrpc_message *message)
+static void queue_message(struct mcp_server *server,
+                          struct mcp_jsonrpc_message *message,
+                          const struct mcp_reply_target *reply_to)
 {
     struct mcp_message_node *node = calloc(1, sizeof(*node));
 
@@ -94,6 +207,10 @@ static void queue_message(struct mcp_server *server, struct mcp_jsonrpc_message 
     }
 
     node->message = message;
+    if (reply_to)
+        node->reply_to = *reply_to;
+    else
+        node->reply_to.transport = MCP_REPLY_STDIO;
     if (!server->queue_tail) {
         server->queue_head = node;
         server->queue_tail = node;
@@ -105,10 +222,9 @@ static void queue_message(struct mcp_server *server, struct mcp_jsonrpc_message 
     uv_async_send(&server->core_async);
 }
 
-static struct mcp_jsonrpc_message *dequeue_message(struct mcp_server *server)
+static struct mcp_message_node *dequeue_message(struct mcp_server *server)
 {
     struct mcp_message_node *node = server->queue_head;
-    struct mcp_jsonrpc_message *message;
 
     if (!node)
         return NULL;
@@ -117,9 +233,8 @@ static struct mcp_jsonrpc_message *dequeue_message(struct mcp_server *server)
     if (!server->queue_head)
         server->queue_tail = NULL;
 
-    message = node->message;
-    free(node);
-    return message;
+    node->next = NULL;
+    return node;
 }
 
 static void free_in_flight_entry(struct mcp_in_flight_entry *entry)
@@ -141,6 +256,9 @@ static void maybe_shutdown(struct mcp_server *server)
     if (server->in_flight.size != 0)
         return;
 
+#if MCP_HAS_TRANSPORT_UDP
+    mcp_udp_transport_close(server->udp);
+#endif
     mcp_stdio_transport_close_output(server->stdio);
     if (!uv_is_closing((uv_handle_t *)&server->core_async))
         uv_close((uv_handle_t *)&server->core_async, NULL);
@@ -203,7 +321,9 @@ static int extract_tool_call(json_t *params,
     return 0;
 }
 
-static void handle_cancelled(struct mcp_server *server, json_t *params)
+static void handle_cancelled(struct mcp_server *server,
+                             const struct mcp_reply_target *reply_to,
+                             json_t *params)
 {
     json_t *request_id;
     char *key = NULL;
@@ -229,17 +349,21 @@ static void handle_cancelled(struct mcp_server *server, json_t *params)
             entry->op_ctx = NULL;
             entry->op_free = NULL;
         }
-        mcp_server_send_error(server, entry->id, -32603, "Cancelled");
+        send_error_to(server, &entry->reply_to, entry->id, -32603, "Cancelled");
         entry = mcp_in_flight_remove(&server->in_flight, key);
         if (entry)
             free_in_flight_entry(entry);
     }
 
     free(key);
+    (void)reply_to;
 }
 
-static void handle_request(struct mcp_server *server, struct mcp_jsonrpc_message *message)
+static void handle_request(struct mcp_server *server,
+                           const struct mcp_reply_target *reply_to,
+                           struct mcp_jsonrpc_message *message)
 {
+    struct mcp_client_session *session;
     json_t *result;
     json_t *error;
     char *id_key = NULL;
@@ -248,67 +372,73 @@ static void handle_request(struct mcp_server *server, struct mcp_jsonrpc_message
     json_t *arguments = NULL;
     int rc;
 
-    if (!gate_allows_method(server, message->method)) {
-        mcp_server_send_error(server, message->id, -32600, "Session not initialized");
+    session = client_session_for_reply(server, reply_to, true);
+    if (!session) {
+        send_error_to(server, reply_to, message->id, -32603, "Internal error");
+        return;
+    }
+
+    if (!gate_allows_method(session, message->method)) {
+        send_error_to(server, reply_to, message->id, -32600, "Session not initialized");
         return;
     }
 
     if (strcmp(message->method, "ping") == 0) {
         result = json_object();
-        mcp_server_send_result(server, message->id, result);
+        send_result_to(server, reply_to, message->id, result);
         json_decref(result);
         return;
     }
 
     if (strcmp(message->method, "initialize") == 0) {
         result = build_initialize_result();
-        mcp_server_send_result(server, message->id, result);
+        send_result_to(server, reply_to, message->id, result);
         json_decref(result);
 
         if (server->config.strict_initialized_notification)
-            server->session_state = MCP_SESSION_AWAIT_CLIENT_INITIALIZED;
+            session->state = MCP_SESSION_AWAIT_CLIENT_INITIALIZED;
         else
-            server->session_state = MCP_SESSION_INITIALIZED;
+            session->state = MCP_SESSION_INITIALIZED;
         return;
     }
 
     if (strcmp(message->method, "tools/list") == 0) {
-        if (!server->session_tool_snapshot)
-            server->session_tool_snapshot = mcp_tool_registry_public_list(server->registry);
-        mcp_server_send_result(server, message->id, server->session_tool_snapshot);
+        if (!session->tool_snapshot)
+            session->tool_snapshot = mcp_tool_registry_public_list(server->registry);
+        send_result_to(server, reply_to, message->id, session->tool_snapshot);
         return;
     }
 
     if (strcmp(message->method, "tools/call") == 0) {
         if (extract_tool_call(message->params, &tool_name, &arguments) != 0) {
-            mcp_server_send_error(server, message->id, -32602, "Invalid params");
+            send_error_to(server, reply_to, message->id, -32602, "Invalid params");
             return;
         }
 
-        if (!server->session_tool_snapshot)
-            server->session_tool_snapshot = mcp_tool_registry_public_list(server->registry);
+        if (!session->tool_snapshot)
+            session->tool_snapshot = mcp_tool_registry_public_list(server->registry);
 
-        if (!tool_visible_in_snapshot(server->session_tool_snapshot, tool_name)) {
+        if (!tool_visible_in_snapshot(session->tool_snapshot, tool_name)) {
             json_decref(arguments);
             result = mcp_tool_result_text(
                 "Tool is not visible in current session snapshot. Refresh tools/list or start a new session.",
                 true);
-            mcp_server_send_result(server, message->id, result);
+            send_result_to(server, reply_to, message->id, result);
             json_decref(result);
             return;
         }
 
         if (!mcp_jsonrpc_id_to_key(message->id, &id_key)) {
             json_decref(arguments);
-            mcp_server_send_error(server, message->id, -32603, "Internal error");
+            send_error_to(server, reply_to, message->id, -32603, "Internal error");
             return;
         }
 
-        entry = mcp_in_flight_put(&server->in_flight, id_key, message->id);
+        entry = mcp_in_flight_put(&server->in_flight, id_key, message->id, reply_to);
         if (!entry) {
             free(id_key);
             json_decref(arguments);
-            mcp_server_send_error(server, message->id, -32603, "Internal error");
+            send_error_to(server, reply_to, message->id, -32603, "Internal error");
             return;
         }
 
@@ -319,16 +449,16 @@ static void handle_request(struct mcp_server *server, struct mcp_jsonrpc_message
                               entry->invocation_id,
                               tool_name,
                               arguments,
-                              server->session_tool_snapshot,
+                              session->tool_snapshot,
                               &result,
                               &error);
         json_decref(arguments);
 
         if (rc == MCP_GATEWAY_OK || rc == MCP_GATEWAY_TOOL_ERROR) {
-            mcp_server_send_result(server, message->id, result);
+            send_result_to(server, reply_to, message->id, result);
             json_decref(result);
         } else {
-            send_json_line(server, error);
+            send_json_object(server, reply_to, error);
             json_decref(error);
         }
 
@@ -341,38 +471,43 @@ static void handle_request(struct mcp_server *server, struct mcp_jsonrpc_message
 
     if (strcmp(message->method, "resources/list") == 0) {
         result = json_pack("{s:[]}", "resources");
-        mcp_server_send_result(server, message->id, result);
+        send_result_to(server, reply_to, message->id, result);
         json_decref(result);
         return;
     }
 
     if (strcmp(message->method, "resources/templates/list") == 0) {
         result = json_pack("{s:[]}", "resourceTemplates");
-        mcp_server_send_result(server, message->id, result);
+        send_result_to(server, reply_to, message->id, result);
         json_decref(result);
         return;
     }
 
     if (strcmp(message->method, "prompts/list") == 0) {
         result = json_pack("{s:[]}", "prompts");
-        mcp_server_send_result(server, message->id, result);
+        send_result_to(server, reply_to, message->id, result);
         json_decref(result);
         return;
     }
 
-    mcp_server_send_error(server, message->id, -32601, "Method not found");
+    send_error_to(server, reply_to, message->id, -32601, "Method not found");
 }
 
-static void handle_notification(struct mcp_server *server, struct mcp_jsonrpc_message *message)
+static void handle_notification(struct mcp_server *server,
+                                const struct mcp_reply_target *reply_to,
+                                struct mcp_jsonrpc_message *message)
 {
+    struct mcp_client_session *session;
+
     if (strcmp(message->method, "notifications/initialized") == 0) {
-        if (server->session_state == MCP_SESSION_AWAIT_CLIENT_INITIALIZED)
-            server->session_state = MCP_SESSION_INITIALIZED;
+        session = client_session_for_reply(server, reply_to, false);
+        if (session && session->state == MCP_SESSION_AWAIT_CLIENT_INITIALIZED)
+            session->state = MCP_SESSION_INITIALIZED;
         return;
     }
 
     if (strcmp(message->method, "notifications/cancelled") == 0) {
-        handle_cancelled(server, message->params);
+        handle_cancelled(server, reply_to, message->params);
         return;
     }
 }
@@ -380,15 +515,16 @@ static void handle_notification(struct mcp_server *server, struct mcp_jsonrpc_me
 static void core_async_cb(uv_async_t *handle)
 {
     struct mcp_server *server = handle->data;
-    struct mcp_jsonrpc_message *message;
+    struct mcp_message_node *node;
 
-    while ((message = dequeue_message(server)) != NULL) {
-        if (message->type == MCP_JSONRPC_REQUEST)
-            handle_request(server, message);
+    while ((node = dequeue_message(server)) != NULL) {
+        if (node->message->type == MCP_JSONRPC_REQUEST)
+            handle_request(server, &node->reply_to, node->message);
         else
-            handle_notification(server, message);
+            handle_notification(server, &node->reply_to, node->message);
 
-        mcp_jsonrpc_message_destroy(message);
+        mcp_jsonrpc_message_destroy(node->message);
+        free(node);
     }
 
     maybe_shutdown(server);
@@ -398,18 +534,22 @@ static void stdio_on_line(void *arg, const char *line, size_t len)
 {
     struct mcp_server *server = arg;
     struct mcp_jsonrpc_message *message = NULL;
+    struct mcp_reply_target reply_to;
     json_t *error = NULL;
 
     if (server->shutting_down)
         return;
 
+    memset(&reply_to, 0, sizeof(reply_to));
+    reply_to.transport = MCP_REPLY_STDIO;
+
     if (mcp_jsonrpc_parse_line(line, len, &message, &error) != 0) {
-        send_json_line(server, error);
+        send_json_object(server, &reply_to, error);
         json_decref(error);
         return;
     }
 
-    queue_message(server, message);
+    queue_message(server, message, &reply_to);
 }
 
 static void stdio_on_exit(void *arg)
@@ -420,6 +560,48 @@ static void stdio_on_exit(void *arg)
     uv_async_send(&server->core_async);
 }
 
+#if MCP_HAS_TRANSPORT_UDP
+static void udp_on_datagram(void *arg,
+                            const char *data,
+                            size_t len,
+                            const struct sockaddr *peer)
+{
+    struct mcp_server *server = arg;
+    struct mcp_jsonrpc_message *message = NULL;
+    struct mcp_reply_target reply_to;
+    json_t *error = NULL;
+    size_t peer_len;
+
+    if (server->shutting_down)
+        return;
+
+    if (peer->sa_family == AF_INET)
+        peer_len = sizeof(struct sockaddr_in);
+    else if (peer->sa_family == AF_INET6)
+        peer_len = sizeof(struct sockaddr_in6);
+    else
+        return;
+
+    memset(&reply_to, 0, sizeof(reply_to));
+    reply_to.transport = MCP_REPLY_UDP;
+    memcpy(&reply_to.udp_peer, peer, peer_len);
+
+    if (mcp_jsonrpc_parse_line(data, len, &message, &error) != 0) {
+        send_json_object(server, &reply_to, error);
+        json_decref(error);
+        return;
+    }
+
+    queue_message(server, message, &reply_to);
+}
+
+static void udp_on_error(void *arg, int status)
+{
+    (void)arg;
+    (void)status;
+}
+#endif
+
 void mcp_server_complete_async_ok(struct mcp_server *server, const char *id_key, json_t *result)
 {
     struct mcp_in_flight_entry *entry = mcp_in_flight_get(&server->in_flight, id_key);
@@ -427,7 +609,7 @@ void mcp_server_complete_async_ok(struct mcp_server *server, const char *id_key,
     if (!entry)
         return;
 
-    mcp_server_send_result(server, entry->id, result);
+    send_result_to(server, &entry->reply_to, entry->id, result);
     entry = mcp_in_flight_remove(&server->in_flight, id_key);
     if (entry)
         free_in_flight_entry(entry);
@@ -446,7 +628,8 @@ int mcp_server_init(struct mcp_server **out, uv_loop_t *loop, struct mcp_server_
 
     server->loop = loop;
     server->config = config;
-    server->session_state = MCP_SESSION_NOT_INITIALIZED;
+    server->stdio_session.reply_to.transport = MCP_REPLY_STDIO;
+    server->stdio_session.state = MCP_SESSION_NOT_INITIALIZED;
     mcp_in_flight_init(&server->in_flight);
 
     if (mcp_stdio_transport_create(&server->stdio,
@@ -458,7 +641,22 @@ int mcp_server_init(struct mcp_server **out, uv_loop_t *loop, struct mcp_server_
         return -1;
     }
 
+#if MCP_HAS_TRANSPORT_UDP
+    if (mcp_udp_transport_create(&server->udp,
+                                 loop,
+                                 (struct mcp_udp_transport_config){
+                                     .max_datagram_bytes = config.max_line_bytes,
+                                 }) != 0) {
+        mcp_stdio_transport_destroy(server->stdio);
+        free(server);
+        return -1;
+    }
+#endif
+
     if (uv_async_init(loop, &server->core_async, core_async_cb) != 0) {
+#if MCP_HAS_TRANSPORT_UDP
+        mcp_udp_transport_destroy(server->udp);
+#endif
         mcp_stdio_transport_destroy(server->stdio);
         free(server);
         return -1;
@@ -473,6 +671,9 @@ int mcp_server_init(struct mcp_server **out, uv_loop_t *loop, struct mcp_server_
         if (server->registry)
             mcp_tool_registry_destroy(server->registry);
         uv_close((uv_handle_t *)&server->core_async, NULL);
+#if MCP_HAS_TRANSPORT_UDP
+        mcp_udp_transport_destroy(server->udp);
+#endif
         mcp_stdio_transport_destroy(server->stdio);
         free(server);
         return -1;
@@ -484,18 +685,31 @@ int mcp_server_init(struct mcp_server **out, uv_loop_t *loop, struct mcp_server_
 
 void mcp_server_destroy(struct mcp_server *server)
 {
-    struct mcp_jsonrpc_message *message;
+    struct mcp_message_node *node;
+    struct mcp_client_session *session;
 
     if (!server)
         return;
 
-    while ((message = dequeue_message(server)) != NULL)
-        mcp_jsonrpc_message_destroy(message);
+    while ((node = dequeue_message(server)) != NULL) {
+        mcp_jsonrpc_message_destroy(node->message);
+        free(node);
+    }
 
-    json_decref(server->session_tool_snapshot);
+    client_session_cleanup(&server->stdio_session);
+    session = server->udp_sessions;
+    while (session) {
+        struct mcp_client_session *next = session->next;
+        client_session_cleanup(session);
+        free(session);
+        session = next;
+    }
     mcp_gateway_destroy(server->gateway);
     mcp_tool_registry_destroy(server->registry);
     mcp_in_flight_destroy(&server->in_flight);
+#if MCP_HAS_TRANSPORT_UDP
+    mcp_udp_transport_destroy(server->udp);
+#endif
     mcp_stdio_transport_destroy(server->stdio);
     free(server);
 }
@@ -509,4 +723,35 @@ int mcp_server_start_stdio(struct mcp_server *server, int stdin_fd, int stdout_f
         return -1;
 
     return 0;
+}
+
+int mcp_server_start_udp(struct mcp_server *server, const char *bind_host, unsigned int bind_port)
+{
+#if MCP_HAS_TRANSPORT_UDP
+    if (!server->udp)
+        return -1;
+
+    if (mcp_udp_transport_open(server->udp, bind_host, bind_port) != 0)
+        return -1;
+
+    if (mcp_udp_transport_start(server->udp, udp_on_datagram, udp_on_error, server) != 0)
+        return -1;
+
+    return 0;
+#else
+    (void)server;
+    (void)bind_host;
+    (void)bind_port;
+    return -1;
+#endif
+}
+
+bool mcp_server_udp_enabled(const struct mcp_server *server)
+{
+#if MCP_HAS_TRANSPORT_UDP
+    return server && mcp_udp_transport_is_open(server->udp);
+#else
+    (void)server;
+    return false;
+#endif
 }

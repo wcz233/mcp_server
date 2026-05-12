@@ -286,7 +286,9 @@ static int tool_gateway_status(struct mcp_server *server,
 
     status = mcp_gateway_status_json(server->gateway);
     json_object_set_new(status, "stdio_transport", json_string("enabled"));
-    json_object_set_new(status, "udp_transport", json_string("not_enabled_in_initial_build"));
+    json_object_set_new(status,
+                        "udp_transport",
+                        json_string(mcp_server_udp_enabled(server) ? "enabled" : "disabled"));
     *out_result = mcp_tool_result_json_text(status, false);
     json_decref(status);
     return 0;

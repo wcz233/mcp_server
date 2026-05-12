@@ -6,6 +6,7 @@
 #include "mcp/gateway/gateway.h"
 #include "mcp/registry/tool_registry.h"
 #include "transport/stdio_transport.h"
+#include "transport/udp_transport.h"
 
 enum mcp_session_state {
     MCP_SESSION_NOT_INITIALIZED = 0,
@@ -13,11 +14,19 @@ enum mcp_session_state {
     MCP_SESSION_INITIALIZED,
 };
 
+struct mcp_client_session {
+    enum mcp_session_state state;
+    struct mcp_reply_target reply_to;
+    json_t *tool_snapshot;
+    struct mcp_client_session *next;
+};
+
 struct mcp_server {
     uv_loop_t *loop;
     struct mcp_server_config config;
 
     struct mcp_stdio_transport *stdio;
+    struct mcp_udp_transport *udp;
     uv_async_t core_async;
     enum mcp_session_state session_state;
     bool shutting_down;
@@ -29,11 +38,13 @@ struct mcp_server {
     struct mcp_tool_registry *registry;
     struct mcp_gateway *gateway;
 
-    json_t *session_tool_snapshot;
+    struct mcp_client_session stdio_session;
+    struct mcp_client_session *udp_sessions;
 };
 
 int mcp_server_send_result(struct mcp_server *server, json_t *id, json_t *result);
 int mcp_server_send_error(struct mcp_server *server, json_t *id, int code, const char *message);
+bool mcp_server_udp_enabled(const struct mcp_server *server);
 
 void mcp_server_complete_async_ok(struct mcp_server *server,
                                   const char *id_key,

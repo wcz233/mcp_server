@@ -21,6 +21,31 @@ static bool env_bool(const char *name, bool default_value)
     return true;
 }
 
+static const char *env_str(const char *name, const char *default_value)
+{
+    const char *value = getenv(name);
+
+    if (!value || value[0] == '\0')
+        return default_value;
+    return value;
+}
+
+static unsigned int env_uint(const char *name, unsigned int default_value)
+{
+    const char *value = getenv(name);
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!value || value[0] == '\0')
+        return default_value;
+
+    parsed = strtoul(value, &end, 10);
+    if (!end || *end != '\0' || parsed > 65535ul)
+        return default_value;
+
+    return (unsigned int)parsed;
+}
+
 static int stdin_fileno_value(void)
 {
 #ifdef _WIN32
@@ -58,6 +83,9 @@ int main(void)
         .strict_initialized_notification = env_bool("MCP_STRICT_INIT", true),
         .max_line_bytes = 1024 * 1024,
     };
+    bool udp_enabled = env_bool("MCP_ENABLE_UDP", false);
+    const char *udp_host = env_str("MCP_UDP_HOST", "127.0.0.1");
+    unsigned int udp_port = env_uint("MCP_UDP_PORT", 8765);
     int stdin_fd;
     int stdout_fd;
     int rc;
@@ -93,6 +121,16 @@ int main(void)
         mcp_server_destroy(server);
         uv_loop_close(&loop);
         return 1;
+    }
+
+    if (udp_enabled) {
+        rc = mcp_server_start_udp(server, udp_host, udp_port);
+        if (rc != 0) {
+            fprintf(stderr, "mcp_server_start_udp failed for %s:%u\n", udp_host, udp_port);
+            mcp_server_destroy(server);
+            uv_loop_close(&loop);
+            return 1;
+        }
     }
 
     uv_run(&loop, UV_RUN_DEFAULT);

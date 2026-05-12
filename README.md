@@ -5,6 +5,7 @@ This repository contains the host-side MCP Server implementation.
 Current scope:
 
 - stdio JSON-RPC transport for local MCP clients.
+- UDP JSON-RPC datagram transport for lightweight LAN clients, enabled at runtime.
 - `initialize`, `ping`, `tools/list`, `tools/call`, `resources/list`, `prompts/list`.
 - Session-level tool snapshot for stable `tools/list` behavior.
 - Gateway + registry dispatch path for built-in, module, embedded, and remote routing metadata.
@@ -91,5 +92,16 @@ Enable it only in a trusted local session:
 $env:MCP_ENABLE_SHELL_EXEC = "1"
 .\build\mcp_server.exe
 ```
+
+UDP transport is compiled when `MCP_TRANSPORT_UDP=ON` and is disabled at runtime unless explicitly requested:
+
+```powershell
+$env:MCP_ENABLE_UDP = "1"
+$env:MCP_UDP_HOST = "127.0.0.1"
+$env:MCP_UDP_PORT = "8765"
+.\build\src\Debug\mcp_server.exe
+```
+
+The initial UDP mode maps one datagram to one compact JSON-RPC message and sends each response back to the datagram sender.
 
 The repository policy for third-party updates and version locks is documented in `docs/dependency_policy.md` and `third_party.lock`.
