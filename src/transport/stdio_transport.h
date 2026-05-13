@@ -28,6 +28,7 @@ int mcp_stdio_transport_start(struct mcp_stdio_transport *transport,
                               void *arg);
 int mcp_stdio_transport_send(struct mcp_stdio_transport *transport, const char *data, size_t len);
 int mcp_stdio_transport_send_str(struct mcp_stdio_transport *transport, const char *text);
+void mcp_stdio_transport_close(struct mcp_stdio_transport *transport);
 void mcp_stdio_transport_close_output(struct mcp_stdio_transport *transport);
 
 #endif

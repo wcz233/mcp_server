@@ -5,6 +5,7 @@
 #include "mcp/core/server.h"
 #include "mcp/gateway/gateway.h"
 #include "mcp/registry/tool_registry.h"
+#include "listener/framed_listener.h"
 #include "transport/stdio_transport.h"
 #include "transport/udp_transport.h"
 
@@ -27,6 +28,10 @@ struct mcp_server {
 
     struct mcp_stdio_transport *stdio;
     struct mcp_udp_transport *udp;
+    struct mcp_framed_listener *pipe_listener;
+    struct mcp_framed_listener *tcp_listener;
+    bool stdio_started;
+    bool core_async_initialized;
     uv_async_t core_async;
     enum mcp_session_state session_state;
     bool shutting_down;
@@ -39,12 +44,15 @@ struct mcp_server {
     struct mcp_gateway *gateway;
 
     struct mcp_client_session stdio_session;
-    struct mcp_client_session *udp_sessions;
+    struct mcp_client_session *peer_sessions;
 };
 
 int mcp_server_send_result(struct mcp_server *server, json_t *id, json_t *result);
 int mcp_server_send_error(struct mcp_server *server, json_t *id, int code, const char *message);
 bool mcp_server_udp_enabled(const struct mcp_server *server);
+bool mcp_server_stdio_enabled(const struct mcp_server *server);
+bool mcp_server_pipe_enabled(const struct mcp_server *server);
+bool mcp_server_tcp_enabled(const struct mcp_server *server);
 
 void mcp_server_complete_async_ok(struct mcp_server *server,
                                   const char *id_key,

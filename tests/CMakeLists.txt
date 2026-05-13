@@ -11,6 +11,26 @@ if(Python3_Interpreter_FOUND)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools_dynamic_smoke.py" "$<TARGET_FILE:mcp_server>"
     )
 
+    add_test(
+        NAME mcp_shell_exec_policy_smoke
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/shell_exec_policy_smoke.py" "$<TARGET_FILE:mcp_server>"
+    )
+
+    add_test(
+        NAME mcp_startup_failure_cleanup_smoke
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/startup_failure_cleanup_smoke.py" "$<TARGET_FILE:mcp_server>"
+    )
+
+    add_test(
+        NAME mcp_no_stdio_listener_smoke
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/no_stdio_listener_smoke.py" "$<TARGET_FILE:mcp_server>" 18766
+    )
+
+    add_test(
+        NAME mcp_tcp_framed_smoke
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tcp_framed_smoke.py" "$<TARGET_FILE:mcp_server>" 18767
+    )
+
     if(MCP_TRANSPORT_UDP)
         add_test(
             NAME mcp_udp_smoke

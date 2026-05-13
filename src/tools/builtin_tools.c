@@ -163,28 +163,43 @@ static int tool_system_get_status(struct mcp_server *server,
     return 0;
 }
 
-static int command_has_forbidden_token(const char *command)
+static int command_uses_unsupported_shell_syntax(const char *command)
 {
-    static const char *forbidden[] = {
-        " rm ",
-        " del ",
-        " format ",
-        " shutdown ",
-        " reboot ",
-        " Remove-Item ",
-        " rmdir ",
-        NULL,
-    };
-    size_t i;
-    char wrapped[4096];
+    const unsigned char *cursor = (const unsigned char *)command;
 
     if (strlen(command) > 3500)
         return 1;
 
-    snprintf(wrapped, sizeof(wrapped), " %s ", command);
-    for (i = 0; forbidden[i]; i++) {
-        if (strstr(wrapped, forbidden[i]))
+    while (*cursor) {
+        switch (*cursor) {
+        case '&':
+        case '|':
+        case ';':
+        case '<':
+        case '>':
+        case '$':
+        case '(':
+        case ')':
+        case '{':
+        case '}':
+        case '[':
+        case ']':
+        case '*':
+        case '?':
+        case '!':
+        case '`':
+        case '"':
+        case '\'':
+        case '%':
+        case '\r':
+        case '\n':
             return 1;
+        default:
+            if (*cursor < 0x20u)
+                return 1;
+            break;
+        }
+        cursor++;
     }
 
     return 0;
@@ -218,8 +233,10 @@ static int tool_system_shell_exec(struct mcp_server *server,
     }
 
     command = json_string_value(command_value);
-    if (command_has_forbidden_token(command)) {
-        *out_result = mcp_tool_result_text("Command rejected by the built-in shell safety filter.", true);
+    if (command_uses_unsupported_shell_syntax(command)) {
+        *out_result = mcp_tool_result_text(
+            "Unsupported shell metacharacters. Only simple command lines are accepted when shell_exec is enabled.",
+            true);
         return 0;
     }
 
@@ -285,10 +302,18 @@ static int tool_gateway_status(struct mcp_server *server,
     (void)invocation;
 
     status = mcp_gateway_status_json(server->gateway);
-    json_object_set_new(status, "stdio_transport", json_string("enabled"));
+    json_object_set_new(status,
+                        "stdio_transport",
+                        json_string(mcp_server_stdio_enabled(server) ? "enabled" : "disabled"));
     json_object_set_new(status,
                         "udp_transport",
                         json_string(mcp_server_udp_enabled(server) ? "enabled" : "disabled"));
+    json_object_set_new(status,
+                        "pipe_transport",
+                        json_string(mcp_server_pipe_enabled(server) ? "enabled" : "disabled"));
+    json_object_set_new(status,
+                        "tcp_transport",
+                        json_string(mcp_server_tcp_enabled(server) ? "enabled" : "disabled"));
     *out_result = mcp_tool_result_json_text(status, false);
     json_decref(status);
     return 0;

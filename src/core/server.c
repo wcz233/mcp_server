@@ -22,6 +22,7 @@ static struct mcp_client_session *client_session_for_reply(struct mcp_server *se
                                                            bool create_if_missing);
 static bool reply_targets_equal(const struct mcp_reply_target *lhs,
                                 const struct mcp_reply_target *rhs);
+static void close_runtime_handles(struct mcp_server *server);
 
 static void core_async_cb(uv_async_t *handle);
 static void stdio_on_line(void *arg, const char *line, size_t len);
@@ -33,6 +34,11 @@ static void udp_on_datagram(void *arg,
                             const struct sockaddr *peer);
 static void udp_on_error(void *arg, int status);
 #endif
+static void framed_on_message(void *arg,
+                              struct mcp_framed_connection *conn,
+                              const char *data,
+                              size_t len);
+static void framed_on_close(void *arg, struct mcp_framed_connection *conn);
 
 uv_loop_t *mcp_server_loop(struct mcp_server *server)
 {
@@ -49,7 +55,13 @@ static int send_json_object(struct mcp_server *server,
     if (!line)
         return -1;
 
-    if (reply_to && reply_to->transport == MCP_REPLY_UDP) {
+    if (reply_to && reply_to->transport == MCP_REPLY_STREAM) {
+        size_t len = strlen(line);
+
+        if (len > 0 && line[len - 1] == '\n')
+            len--;
+        rc = mcp_framed_connection_send(reply_to->stream, line, len);
+    } else if (reply_to && reply_to->transport == MCP_REPLY_UDP) {
 #if MCP_HAS_TRANSPORT_UDP
         rc = mcp_udp_transport_send(server->udp,
                                     line,
@@ -109,6 +121,8 @@ static bool reply_targets_equal(const struct mcp_reply_target *lhs,
         return false;
     if (lhs->transport == MCP_REPLY_STDIO)
         return true;
+    if (lhs->transport == MCP_REPLY_STREAM)
+        return lhs->stream == rhs->stream;
     if (lhs->transport != MCP_REPLY_UDP)
         return false;
 
@@ -147,7 +161,7 @@ static struct mcp_client_session *client_session_for_reply(struct mcp_server *se
     if (reply_to->transport == MCP_REPLY_STDIO)
         return &server->stdio_session;
 
-    for (session = server->udp_sessions; session; session = session->next) {
+    for (session = server->peer_sessions; session; session = session->next) {
         if (reply_targets_equal(&session->reply_to, reply_to))
             return session;
     }
@@ -161,9 +175,28 @@ static struct mcp_client_session *client_session_for_reply(struct mcp_server *se
 
     created->reply_to = *reply_to;
     created->state = MCP_SESSION_NOT_INITIALIZED;
-    created->next = server->udp_sessions;
-    server->udp_sessions = created;
+    created->next = server->peer_sessions;
+    server->peer_sessions = created;
     return created;
+}
+
+static void client_session_remove_reply(struct mcp_server *server,
+                                        const struct mcp_reply_target *reply_to)
+{
+    struct mcp_client_session **current = &server->peer_sessions;
+
+    while (*current) {
+        struct mcp_client_session *session = *current;
+
+        if (reply_targets_equal(&session->reply_to, reply_to)) {
+            *current = session->next;
+            client_session_cleanup(session);
+            free(session);
+            return;
+        }
+
+        current = &session->next;
+    }
 }
 
 static bool gate_allows_method(const struct mcp_client_session *session, const char *method)
@@ -259,9 +292,31 @@ static void maybe_shutdown(struct mcp_server *server)
 #if MCP_HAS_TRANSPORT_UDP
     mcp_udp_transport_close(server->udp);
 #endif
+    mcp_framed_listener_close(server->pipe_listener);
+    mcp_framed_listener_close(server->tcp_listener);
     mcp_stdio_transport_close_output(server->stdio);
     if (!uv_is_closing((uv_handle_t *)&server->core_async))
         uv_close((uv_handle_t *)&server->core_async, NULL);
+}
+
+static void close_runtime_handles(struct mcp_server *server)
+{
+    if (!server)
+        return;
+
+    server->shutting_down = true;
+#if MCP_HAS_TRANSPORT_UDP
+    mcp_udp_transport_close(server->udp);
+#endif
+    mcp_framed_listener_close(server->pipe_listener);
+    mcp_framed_listener_close(server->tcp_listener);
+    mcp_stdio_transport_close(server->stdio);
+    if (server->core_async_initialized &&
+        !uv_is_closing((uv_handle_t *)&server->core_async))
+        uv_close((uv_handle_t *)&server->core_async, NULL);
+
+    while (server->loop && uv_loop_alive(server->loop))
+        uv_run(server->loop, UV_RUN_DEFAULT);
 }
 
 static bool tool_visible_in_snapshot(const json_t *snapshot, const char *tool_name)
@@ -556,7 +611,12 @@ static void stdio_on_exit(void *arg)
 {
     struct mcp_server *server = arg;
 
-    server->shutting_down = true;
+    if (server->config.stdio_eof_shutdown)
+        server->shutting_down = true;
+    else {
+        client_session_cleanup(&server->stdio_session);
+        mcp_stdio_transport_close_output(server->stdio);
+    }
     uv_async_send(&server->core_async);
 }
 
@@ -601,6 +661,43 @@ static void udp_on_error(void *arg, int status)
     (void)status;
 }
 #endif
+
+static void framed_on_message(void *arg,
+                              struct mcp_framed_connection *conn,
+                              const char *data,
+                              size_t len)
+{
+    struct mcp_server *server = arg;
+    struct mcp_jsonrpc_message *message = NULL;
+    struct mcp_reply_target reply_to;
+    json_t *error = NULL;
+
+    if (server->shutting_down)
+        return;
+
+    memset(&reply_to, 0, sizeof(reply_to));
+    reply_to.transport = MCP_REPLY_STREAM;
+    reply_to.stream = conn;
+
+    if (mcp_jsonrpc_parse_line(data, len, &message, &error) != 0) {
+        send_json_object(server, &reply_to, error);
+        json_decref(error);
+        return;
+    }
+
+    queue_message(server, message, &reply_to);
+}
+
+static void framed_on_close(void *arg, struct mcp_framed_connection *conn)
+{
+    struct mcp_server *server = arg;
+    struct mcp_reply_target reply_to;
+
+    memset(&reply_to, 0, sizeof(reply_to));
+    reply_to.transport = MCP_REPLY_STREAM;
+    reply_to.stream = conn;
+    client_session_remove_reply(server, &reply_to);
+}
 
 void mcp_server_complete_async_ok(struct mcp_server *server, const char *id_key, json_t *result)
 {
@@ -654,28 +751,16 @@ int mcp_server_init(struct mcp_server **out, uv_loop_t *loop, struct mcp_server_
 #endif
 
     if (uv_async_init(loop, &server->core_async, core_async_cb) != 0) {
-#if MCP_HAS_TRANSPORT_UDP
-        mcp_udp_transport_destroy(server->udp);
-#endif
-        mcp_stdio_transport_destroy(server->stdio);
-        free(server);
+        mcp_server_destroy(server);
         return -1;
     }
+    server->core_async_initialized = true;
     server->core_async.data = server;
 
     if (mcp_tool_registry_create(&server->registry) != 0 ||
         mcp_gateway_create(&server->gateway, server->registry) != 0 ||
         mcp_register_builtin_tools(server, server->registry) != 0) {
-        if (server->gateway)
-            mcp_gateway_destroy(server->gateway);
-        if (server->registry)
-            mcp_tool_registry_destroy(server->registry);
-        uv_close((uv_handle_t *)&server->core_async, NULL);
-#if MCP_HAS_TRANSPORT_UDP
-        mcp_udp_transport_destroy(server->udp);
-#endif
-        mcp_stdio_transport_destroy(server->stdio);
-        free(server);
+        mcp_server_destroy(server);
         return -1;
     }
 
@@ -691,13 +776,15 @@ void mcp_server_destroy(struct mcp_server *server)
     if (!server)
         return;
 
+    close_runtime_handles(server);
+
     while ((node = dequeue_message(server)) != NULL) {
         mcp_jsonrpc_message_destroy(node->message);
         free(node);
     }
 
     client_session_cleanup(&server->stdio_session);
-    session = server->udp_sessions;
+    session = server->peer_sessions;
     while (session) {
         struct mcp_client_session *next = session->next;
         client_session_cleanup(session);
@@ -710,6 +797,8 @@ void mcp_server_destroy(struct mcp_server *server)
 #if MCP_HAS_TRANSPORT_UDP
     mcp_udp_transport_destroy(server->udp);
 #endif
+    mcp_framed_listener_destroy(server->pipe_listener);
+    mcp_framed_listener_destroy(server->tcp_listener);
     mcp_stdio_transport_destroy(server->stdio);
     free(server);
 }
@@ -722,6 +811,7 @@ int mcp_server_start_stdio(struct mcp_server *server, int stdin_fd, int stdout_f
     if (mcp_stdio_transport_start(server->stdio, stdio_on_line, stdio_on_exit, server) != 0)
         return -1;
 
+    server->stdio_started = true;
     return 0;
 }
 
@@ -754,4 +844,64 @@ bool mcp_server_udp_enabled(const struct mcp_server *server)
     (void)server;
     return false;
 #endif
+}
+
+bool mcp_server_stdio_enabled(const struct mcp_server *server)
+{
+    return server && server->stdio_started;
+}
+
+int mcp_server_start_pipe(struct mcp_server *server, const char *path)
+{
+    if (!server || !path || server->pipe_listener)
+        return -1;
+
+    if (mcp_framed_listener_create(&server->pipe_listener,
+                                   server->loop,
+                                   (struct mcp_framed_listener_config){
+                                       .max_frame_bytes = server->config.max_line_bytes,
+                                   }) != 0)
+        return -1;
+
+    if (mcp_framed_listener_start_pipe(server->pipe_listener,
+                                       path,
+                                       framed_on_message,
+                                       framed_on_close,
+                                       server) != 0)
+        return -1;
+
+    return 0;
+}
+
+int mcp_server_start_tcp(struct mcp_server *server, const char *host, unsigned int port)
+{
+    if (!server || !host || server->tcp_listener)
+        return -1;
+
+    if (mcp_framed_listener_create(&server->tcp_listener,
+                                   server->loop,
+                                   (struct mcp_framed_listener_config){
+                                       .max_frame_bytes = server->config.max_line_bytes,
+                                   }) != 0)
+        return -1;
+
+    if (mcp_framed_listener_start_tcp(server->tcp_listener,
+                                      host,
+                                      port,
+                                      framed_on_message,
+                                      framed_on_close,
+                                      server) != 0)
+        return -1;
+
+    return 0;
+}
+
+bool mcp_server_pipe_enabled(const struct mcp_server *server)
+{
+    return server && mcp_framed_listener_is_open(server->pipe_listener);
+}
+
+bool mcp_server_tcp_enabled(const struct mcp_server *server)
+{
+    return server && mcp_framed_listener_is_open(server->tcp_listener);
 }

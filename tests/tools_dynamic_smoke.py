@@ -76,6 +76,8 @@ def verify_tool(proc, request_id, tool_name):
         assert result["isError"] is False, result
         payload = assert_json_text(result)
         assert payload["stdio_transport"] == "enabled", payload
+        assert "pipe_transport" in payload, payload
+        assert "tcp_transport" in payload, payload
         return
 
     if tool_name == "registry.list_tools":

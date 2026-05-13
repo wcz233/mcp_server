@@ -8,15 +8,18 @@
 #include <uv.h>
 
 struct uv_timer_s;
+struct mcp_framed_connection;
 
 enum mcp_reply_transport {
     MCP_REPLY_STDIO = 1,
     MCP_REPLY_UDP = 2,
+    MCP_REPLY_STREAM = 3,
 };
 
 struct mcp_reply_target {
     enum mcp_reply_transport transport;
     struct sockaddr_storage udp_peer;
+    struct mcp_framed_connection *stream;
 };
 
 struct mcp_in_flight_entry {

@@ -10,6 +10,7 @@ struct mcp_server;
 
 struct mcp_server_config {
     bool strict_initialized_notification;
+    bool stdio_eof_shutdown;
     size_t max_line_bytes;
 };
 
@@ -18,6 +19,8 @@ void mcp_server_destroy(struct mcp_server *server);
 
 int mcp_server_start_stdio(struct mcp_server *server, int stdin_fd, int stdout_fd);
 int mcp_server_start_udp(struct mcp_server *server, const char *bind_host, unsigned int bind_port);
+int mcp_server_start_pipe(struct mcp_server *server, const char *path);
+int mcp_server_start_tcp(struct mcp_server *server, const char *host, unsigned int port);
 uv_loop_t *mcp_server_loop(struct mcp_server *server);
 
 #endif

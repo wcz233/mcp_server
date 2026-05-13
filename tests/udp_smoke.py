@@ -139,6 +139,8 @@ def main():
         payload = json.loads(parse_text(status))
         assert payload["stdio_transport"] == "enabled", payload
         assert payload["udp_transport"] == "enabled", payload
+        assert "pipe_transport" in payload, payload
+        assert "tcp_transport" in payload, payload
 
         init_b = call(
             sock_b,

@@ -5,6 +5,7 @@ target_sources(mcp_server
         core/in_flight.c
         core/server.c
         gateway/gateway.c
+        listener/framed_listener.c
         main/main.c
         protocol/jsonrpc.c
         registry/tool_registry.c

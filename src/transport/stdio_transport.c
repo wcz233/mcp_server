@@ -17,10 +17,14 @@ struct mcp_stdio_transport {
 
     uv_pipe_t stdin_pipe;
     uv_pipe_t stdout_pipe;
+    bool stdin_initialized;
+    bool stdout_initialized;
     bool opened;
     bool closing;
+    bool destroy_on_close;
     bool close_stdout_requested;
     bool close_stdout_allowed;
+    unsigned int close_pending;
 
     char *rx_buf;
     size_t rx_len;
@@ -36,10 +40,48 @@ struct mcp_stdio_transport {
 };
 
 static void flush_writes(struct mcp_stdio_transport *transport);
+static void transport_free(struct mcp_stdio_transport *transport);
 
 static void close_cb(uv_handle_t *handle)
 {
-    (void)handle;
+    struct mcp_stdio_transport *transport = handle->data;
+
+    if (!transport)
+        return;
+
+    if (handle == (uv_handle_t *)&transport->stdin_pipe)
+        transport->stdin_initialized = false;
+    else if (handle == (uv_handle_t *)&transport->stdout_pipe)
+        transport->stdout_initialized = false;
+
+    if (transport->close_pending > 0)
+        transport->close_pending--;
+    if (transport->close_pending == 0 && transport->destroy_on_close)
+        transport_free(transport);
+}
+
+static void request_close(uv_handle_t *handle, bool *initialized, unsigned int *close_pending)
+{
+    if (!*initialized || uv_is_closing(handle))
+        return;
+
+    (*close_pending)++;
+    uv_close(handle, close_cb);
+}
+
+static void transport_free(struct mcp_stdio_transport *transport)
+{
+    struct write_node *node = transport->write_head;
+
+    while (node) {
+        struct write_node *next = node->next;
+        free(node->buf.base);
+        free(node);
+        node = next;
+    }
+
+    free(transport->rx_buf);
+    free(transport);
 }
 
 static void maybe_close_stdout(struct mcp_stdio_transport *transport)
@@ -48,10 +90,13 @@ static void maybe_close_stdout(struct mcp_stdio_transport *transport)
         return;
     if (transport->write_busy || transport->write_head)
         return;
-    if (uv_is_closing((uv_handle_t *)&transport->stdout_pipe))
+    if (!transport->stdout_initialized ||
+        uv_is_closing((uv_handle_t *)&transport->stdout_pipe))
         return;
 
-    uv_close((uv_handle_t *)&transport->stdout_pipe, close_cb);
+    request_close((uv_handle_t *)&transport->stdout_pipe,
+                  &transport->stdout_initialized,
+                  &transport->close_pending);
 }
 
 static void signal_exit(struct mcp_stdio_transport *transport, bool close_stdout_now)
@@ -60,16 +105,20 @@ static void signal_exit(struct mcp_stdio_transport *transport, bool close_stdout
         return;
 
     transport->closing = true;
-    uv_read_stop((uv_stream_t *)&transport->stdin_pipe);
+    transport->opened = false;
+    if (transport->stdin_initialized)
+        uv_read_stop((uv_stream_t *)&transport->stdin_pipe);
 
-    if (!uv_is_closing((uv_handle_t *)&transport->stdin_pipe))
-        uv_close((uv_handle_t *)&transport->stdin_pipe, close_cb);
+    request_close((uv_handle_t *)&transport->stdin_pipe,
+                  &transport->stdin_initialized,
+                  &transport->close_pending);
 
     transport->close_stdout_requested = true;
     if (close_stdout_now) {
         transport->close_stdout_allowed = true;
-        if (!uv_is_closing((uv_handle_t *)&transport->stdout_pipe))
-            uv_close((uv_handle_t *)&transport->stdout_pipe, close_cb);
+        request_close((uv_handle_t *)&transport->stdout_pipe,
+                      &transport->stdout_initialized,
+                      &transport->close_pending);
     }
 
     if (transport->on_exit)
@@ -240,6 +289,8 @@ int mcp_stdio_transport_create(struct mcp_stdio_transport **out,
 
     uv_pipe_init(loop, &transport->stdin_pipe, 0);
     uv_pipe_init(loop, &transport->stdout_pipe, 0);
+    transport->stdin_initialized = true;
+    transport->stdout_initialized = true;
     transport->stdin_pipe.data = transport;
     transport->stdout_pipe.data = transport;
 
@@ -249,21 +300,20 @@ int mcp_stdio_transport_create(struct mcp_stdio_transport **out,
 
 void mcp_stdio_transport_destroy(struct mcp_stdio_transport *transport)
 {
-    struct write_node *node;
-
     if (!transport)
         return;
 
-    node = transport->write_head;
-    while (node) {
-        struct write_node *next = node->next;
-        free(node->buf.base);
-        free(node);
-        node = next;
+    if ((transport->stdin_initialized &&
+         !uv_is_closing((uv_handle_t *)&transport->stdin_pipe)) ||
+        (transport->stdout_initialized &&
+         !uv_is_closing((uv_handle_t *)&transport->stdout_pipe))) {
+        transport->destroy_on_close = true;
+        mcp_stdio_transport_close(transport);
+        if (transport->close_pending != 0)
+            return;
     }
 
-    free(transport->rx_buf);
-    free(transport);
+    transport_free(transport);
 }
 
 int mcp_stdio_transport_open(struct mcp_stdio_transport *transport,
@@ -301,6 +351,8 @@ int mcp_stdio_transport_send(struct mcp_stdio_transport *transport, const char *
 {
     struct write_node *node;
 
+    if (!transport || transport->closing)
+        return -1;
     if (!data || len == 0)
         return 0;
 #ifdef _WIN32
@@ -340,6 +392,32 @@ int mcp_stdio_transport_send(struct mcp_stdio_transport *transport, const char *
 int mcp_stdio_transport_send_str(struct mcp_stdio_transport *transport, const char *text)
 {
     return mcp_stdio_transport_send(transport, text, strlen(text));
+}
+
+void mcp_stdio_transport_close(struct mcp_stdio_transport *transport)
+{
+    if (!transport)
+        return;
+
+    transport->closing = true;
+    transport->opened = false;
+
+    if (transport->stdin_initialized)
+        uv_read_stop((uv_stream_t *)&transport->stdin_pipe);
+    request_close((uv_handle_t *)&transport->stdin_pipe,
+                  &transport->stdin_initialized,
+                  &transport->close_pending);
+
+    transport->close_stdout_requested = true;
+    transport->close_stdout_allowed = true;
+    if (transport->write_busy || transport->write_head) {
+        request_close((uv_handle_t *)&transport->stdout_pipe,
+                      &transport->stdout_initialized,
+                      &transport->close_pending);
+        return;
+    }
+
+    maybe_close_stdout(transport);
 }
 
 void mcp_stdio_transport_close_output(struct mcp_stdio_transport *transport)
