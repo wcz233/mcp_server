@@ -154,6 +154,8 @@ def main():
         assert tools_response["id"] == 2, tools_response
         tools = tools_response["result"]["tools"]
         assert tools, tools_response
+        shell_exec = next(tool for tool in tools if tool["name"] == "system.shell_exec")
+        assert shell_exec["annotations"]["timeout_ms"] == 5000, shell_exec
 
         for index, tool in enumerate(tools, start=3):
             verify_tool(proc, index, tool["name"])

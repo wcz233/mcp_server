@@ -22,6 +22,7 @@ def main():
 
     if proc.stdin:
         proc.stdin.close()
+        proc.stdin = None
 
     stdout, stderr = proc.communicate(timeout=5)
     assert proc.returncode == 1, (proc.returncode, stdout, stderr)

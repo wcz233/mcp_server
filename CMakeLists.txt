@@ -33,3 +33,7 @@ endif()
 install(TARGETS mcp_server
     RUNTIME DESTINATION bin
 )
+
+install(FILES "${PROJECT_SOURCE_DIR}/config/tools/shell_exec.json"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/mcp_server/config/tools"
+)

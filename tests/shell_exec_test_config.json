@@ -1,0 +1,41 @@
+{
+  "enabled": true,
+  "max_command_length": 3500,
+  "default_timeout_ms": 2000,
+  "max_timeout_ms": 5000,
+  "max_output_bytes": 16384,
+  "chunk_size": 1024,
+  "capture_stderr": true,
+  "merge_stderr": false,
+  "execution": {
+    "mode": "shell",
+    "shell_path": "/bin/sh",
+    "shell_arg": "-c",
+    "working_directory": "/tmp",
+    "clear_environment": true,
+    "allowed_env": [
+      "PATH",
+      "HOME",
+      "LANG",
+      "LC_ALL"
+    ],
+    "env": {
+      "PATH": "/usr/bin:/bin",
+      "HOME": "/tmp",
+      "LANG": "C"
+    },
+    "run_as_user": "",
+    "run_as_group": "",
+    "kill_process_group_on_timeout": true
+  },
+  "limits": {
+    "max_cpu_seconds": 5,
+    "max_memory_bytes": 134217728,
+    "max_file_size_bytes": 10485760,
+    "max_open_files": 64,
+    "max_processes": 16
+  },
+  "isolation": {
+    "require_non_root": false
+  }
+}

@@ -10,6 +10,8 @@ target_sources(mcp_server
         protocol/jsonrpc.c
         registry/tool_registry.c
         tools/builtin_tools.c
+        tools/shell_exec.c
+        tools/tool_result.c
         transport/stdio_transport.c
         $<$<BOOL:${MCP_TRANSPORT_UDP}>:transport/udp_transport.c>
 )
@@ -35,6 +37,8 @@ target_compile_definitions(mcp_server
         MCP_HAS_TOOL_PLUGIN_MANAGER=$<IF:$<STREQUAL:${MCP_TOOL_PLUGIN_MANAGER},n>,0,1>
         MCP_HAS_TOOL_EMBEDDED=$<IF:$<STREQUAL:${MCP_TOOL_EMBEDDED},n>,0,1>
         MCP_HAS_TRANSPORT_UDP=$<IF:$<BOOL:${MCP_TRANSPORT_UDP}>,1,0>
+        MCP_SHELL_EXEC_DEFAULT_CONFIG="${PROJECT_SOURCE_DIR}/config/tools/shell_exec.json"
+        MCP_SHELL_EXEC_INSTALLED_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/mcp_server/config/tools/shell_exec.json"
         $<$<PLATFORM_ID:Linux>:_GNU_SOURCE>
         $<$<PLATFORM_ID:Linux>:_POSIX_C_SOURCE=200809L>
 )

@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 
 def send(proc, payload):
@@ -37,10 +38,18 @@ def text_content(result):
     return result["content"][0]["text"]
 
 
+def json_content(result):
+    return json.loads(text_content(result))
+
+
 def main():
     exe = sys.argv[1]
     env = os.environ.copy()
     env["MCP_ENABLE_SHELL_EXEC"] = "1"
+    env["MCP_SHOULD_NOT_LEAK"] = "secret"
+    env["MCP_SHELL_EXEC_CONFIG"] = os.path.join(
+        os.path.dirname(__file__), "shell_exec_test_config.json"
+    )
     proc = subprocess.Popen(
         [exe],
         stdin=subprocess.PIPE,
@@ -70,11 +79,51 @@ def main():
 
         ok = call_tool(proc, 2, "system.shell_exec", {"command": "echo smoke"})
         assert ok["isError"] is False, ok
-        assert "smoke" in text_content(ok), ok
+        payload = json_content(ok)
+        assert payload["stdout"].strip() == "smoke", payload
+        assert payload["stderr"] == "", payload
+        assert payload["exit_code"] == 0, payload
+        assert payload["timed_out"] is False, payload
+        assert payload["truncated"] is False, payload
 
-        rejected = call_tool(proc, 3, "system.shell_exec", {"command": "echo smoke && echo bad"})
-        assert rejected["isError"] is True, rejected
-        assert "Unsupported shell metacharacters" in text_content(rejected), rejected
+        shell_syntax = call_tool(
+            proc, 3, "system.shell_exec", {"command": "echo smoke && echo ok"}
+        )
+        assert shell_syntax["isError"] is False, shell_syntax
+        syntax_payload = json_content(shell_syntax)
+        assert syntax_payload["stdout"].splitlines() == ["smoke", "ok"], syntax_payload
+
+        cwd = call_tool(proc, 4, "system.shell_exec", {"command": "pwd"})
+        assert cwd["isError"] is False, cwd
+        cwd_payload = json_content(cwd)
+        assert cwd_payload["stdout"].strip() == "/tmp", cwd_payload
+
+        env_clean = call_tool(
+            proc, 5,
+            "system.shell_exec",
+            {"command": "printf '%s' \"${MCP_SHOULD_NOT_LEAK-unset}\""},
+        )
+        assert env_clean["isError"] is False, env_clean
+        env_payload = json_content(env_clean)
+        assert env_payload["stdout"] == "unset", env_payload
+
+        if os.name != "nt":
+            marker = f"/tmp/mcp_shell_exec_marker_{os.getpid()}"
+            timed_out = call_tool(
+                proc,
+                6,
+                "system.shell_exec",
+                {
+                    "command": f"sh -c 'sleep 2; touch {marker}' & wait",
+                    "timeout_ms": 50,
+                },
+            )
+            assert timed_out["isError"] is True, timed_out
+            timeout_payload = json_content(timed_out)
+            assert timeout_payload["timed_out"] is True, timeout_payload
+            assert timeout_payload["signal"] != 0, timeout_payload
+            time.sleep(2.2)
+            assert not os.path.exists(marker), marker
     finally:
         if proc.stdin:
             proc.stdin.close()

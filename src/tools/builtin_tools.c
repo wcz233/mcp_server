@@ -3,6 +3,8 @@
 #include "common/platform.h"
 #include "core/server_internal.h"
 #include "mcp/embedded/mep.h"
+#include "tools/shell_exec.h"
+#include "tools/tool_result.h"
 
 #include <jansson.h>
 #include <stdio.h>
@@ -31,44 +33,6 @@ static json_t *schema_with_properties(json_t *properties, json_t *required)
         json_object_set_new(schema, "required", required);
 
     return schema;
-}
-
-json_t *mcp_tool_result_text(const char *text, bool is_error)
-{
-    return json_pack("{s:[{s:s,s:s}],s:b}",
-                     "content",
-                     "type",
-                     "text",
-                     "text",
-                     text ? text : "",
-                     "isError",
-                     is_error);
-}
-
-json_t *mcp_tool_result_json_text(json_t *value, bool is_error)
-{
-    char *dumped = json_dumps(value, JSON_COMPACT | JSON_ENSURE_ASCII);
-    json_t *result;
-
-    if (!dumped)
-        return mcp_tool_result_text("{}", is_error);
-
-    result = mcp_tool_result_text(dumped, is_error);
-    free(dumped);
-    return result;
-}
-
-static bool env_enabled(const char *name)
-{
-    const char *value = getenv(name);
-
-    if (!value)
-        return false;
-    if (value[0] == '\0' || value[0] == '0' || value[0] == 'n' || value[0] == 'N' ||
-        value[0] == 'f' || value[0] == 'F')
-        return false;
-
-    return true;
 }
 
 static int tool_system_ping(struct mcp_server *server,
@@ -160,136 +124,6 @@ static int tool_system_get_status(struct mcp_server *server,
 
     *out_result = mcp_tool_result_json_text(status, false);
     json_decref(status);
-    return 0;
-}
-
-static int command_uses_unsupported_shell_syntax(const char *command)
-{
-    const unsigned char *cursor = (const unsigned char *)command;
-
-    if (strlen(command) > 3500)
-        return 1;
-
-    while (*cursor) {
-        switch (*cursor) {
-        case '&':
-        case '|':
-        case ';':
-        case '<':
-        case '>':
-        case '$':
-        case '(':
-        case ')':
-        case '{':
-        case '}':
-        case '[':
-        case ']':
-        case '*':
-        case '?':
-        case '!':
-        case '`':
-        case '"':
-        case '\'':
-        case '%':
-        case '\r':
-        case '\n':
-            return 1;
-        default:
-            if (*cursor < 0x20u)
-                return 1;
-            break;
-        }
-        cursor++;
-    }
-
-    return 0;
-}
-
-static int tool_system_shell_exec(struct mcp_server *server,
-                                  const struct mcp_tool_invocation *invocation,
-                                  json_t **out_result)
-{
-    json_t *command_value;
-    const char *command;
-    FILE *pipe;
-    char buffer[256];
-    char *output = NULL;
-    size_t output_len = 0;
-    size_t output_cap = 0;
-
-    (void)server;
-
-    if (!env_enabled("MCP_ENABLE_SHELL_EXEC")) {
-        *out_result = mcp_tool_result_text(
-            "system.shell_exec is disabled. Set MCP_ENABLE_SHELL_EXEC=1 to enable it for a trusted session.",
-            true);
-        return 0;
-    }
-
-    command_value = json_object_get(invocation->arguments, "command");
-    if (!json_is_string(command_value)) {
-        *out_result = mcp_tool_result_text("Invalid params: command must be a string.", true);
-        return 0;
-    }
-
-    command = json_string_value(command_value);
-    if (command_uses_unsupported_shell_syntax(command)) {
-        *out_result = mcp_tool_result_text(
-            "Unsupported shell metacharacters. Only simple command lines are accepted when shell_exec is enabled.",
-            true);
-        return 0;
-    }
-
-#ifdef _WIN32
-    pipe = _popen(command, "r");
-#else
-    pipe = popen(command, "r");
-#endif
-    if (!pipe) {
-        *out_result = mcp_tool_result_text("Failed to start command.", true);
-        return 0;
-    }
-
-    while (fgets(buffer, sizeof(buffer), pipe)) {
-        size_t chunk_len = strlen(buffer);
-        char *next;
-
-        if (output_len + chunk_len > 16 * 1024)
-            break;
-
-        if (output_len + chunk_len + 1 > output_cap) {
-            output_cap = output_cap == 0 ? 1024 : output_cap * 2;
-            while (output_len + chunk_len + 1 > output_cap)
-                output_cap *= 2;
-            next = realloc(output, output_cap);
-            if (!next) {
-                free(output);
-#ifdef _WIN32
-                _pclose(pipe);
-#else
-                pclose(pipe);
-#endif
-                *out_result = mcp_tool_result_text("Failed to collect command output.", true);
-                return -1;
-            }
-            output = next;
-        }
-
-        memcpy(output + output_len, buffer, chunk_len);
-        output_len += chunk_len;
-        output[output_len] = '\0';
-    }
-
-#ifdef _WIN32
-    _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
-
-    if (!output)
-        output = mcp_strdup("");
-    *out_result = mcp_tool_result_text(output, false);
-    free(output);
     return 0;
 }
 
@@ -477,22 +311,15 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
 
     if (register_tool(registry,
                       "system.shell_exec",
-                      "Execute a host shell command when explicitly enabled by environment policy.",
-                      schema_with_properties(
-                          json_pack("{s:{s:s,s:s}}",
-                                    "command",
-                                    "type",
-                                    "string",
-                                    "description",
-                                    "Command line to execute."),
-                          json_pack("[s]", "command")),
+                      "Execute a host shell command with OS-level isolation, timeout and structured output.",
+                      mcp_shell_exec_input_schema(),
                       "builtin",
                       "L4",
                       "system.shell",
                       false,
                       false,
-                      5000,
-                      tool_system_shell_exec) != 0)
+                      mcp_shell_exec_registration_timeout_ms(),
+                      mcp_tool_system_shell_exec) != 0)
         return -1;
 #endif
 
