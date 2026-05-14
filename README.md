@@ -104,4 +104,34 @@ $env:MCP_UDP_PORT = "8765"
 
 The initial UDP mode maps one datagram to one compact JSON-RPC message and sends each response back to the datagram sender.
 
+TCP framed transport is also disabled at runtime unless explicitly requested.
+On Linux, the server can listen on a specific IP and port via `MCP_TCP_HOST` and `MCP_TCP_PORT`.
+For a TCP-only listener, disable stdio explicitly:
+
+```bash
+MCP_ENABLE_STDIO=0 \
+MCP_ENABLE_TCP=1 \
+MCP_TCP_HOST=127.0.0.1 \
+MCP_TCP_PORT=18767 \
+./build-ninja/src/mcp_server
+```
+
+To bind on all interfaces, set `MCP_TCP_HOST=0.0.0.0`.
+If the binary was built into a different directory, replace `./build-ninja/src/mcp_server` with the corresponding `./<build-dir>/src/mcp_server`.
+If you want stdio and TCP enabled at the same time, omit `MCP_ENABLE_STDIO=0`.
+
+TCP defaults:
+
+- `MCP_TCP_HOST=127.0.0.1`
+- `MCP_TCP_PORT=8765`
+
+The TCP transport uses framed JSON-RPC messages: each request or response is encoded as a 4-byte big-endian frame length followed by one UTF-8 JSON message.
+A minimal client-side framing example is available in `tests/tcp_framed_smoke.py`.
+
+On Linux, the listener can be verified with:
+
+```bash
+ss -ltn | grep 18767
+```
+
 The repository policy for third-party updates and version locks is documented in `docs/dependency_policy.md` and `third_party.lock`.

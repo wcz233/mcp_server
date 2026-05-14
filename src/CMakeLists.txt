@@ -35,6 +35,8 @@ target_compile_definitions(mcp_server
         MCP_HAS_TOOL_PLUGIN_MANAGER=$<IF:$<STREQUAL:${MCP_TOOL_PLUGIN_MANAGER},n>,0,1>
         MCP_HAS_TOOL_EMBEDDED=$<IF:$<STREQUAL:${MCP_TOOL_EMBEDDED},n>,0,1>
         MCP_HAS_TRANSPORT_UDP=$<IF:$<BOOL:${MCP_TRANSPORT_UDP}>,1,0>
+        $<$<PLATFORM_ID:Linux>:_GNU_SOURCE>
+        $<$<PLATFORM_ID:Linux>:_POSIX_C_SOURCE=200809L>
 )
 
 if(MSVC)
