@@ -1,0 +1,24 @@
+# Normalize first-party project files to LF on every platform.
+/.gitattributes text eol=lf
+/.gitignore text eol=lf
+/.gitmodules text eol=lf
+/CMakeLists.txt text eol=lf
+/README.md text eol=lf
+/third_party.lock text eol=lf
+/LICENSE text eol=lf
+
+/cmake/** text eol=lf
+/config/** text eol=lf
+/include/** text eol=lf
+/scripts/** text eol=lf
+/src/** text eol=lf
+/tests/** text eol=lf
+
+# Keep the project-owned external aggregator aligned as well.
+/external/CMakeLists.txt text eol=lf
+
+# Preserve native Windows line endings for Windows-only project metadata.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.sln text eol=crlf
+*.vcxproj text eol=crlf

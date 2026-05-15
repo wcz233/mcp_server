@@ -48,8 +48,8 @@ Windows PowerShell：
 cmake -S mcp_server -B mcp_server/build -C mcp_server/config/linux_defconfig.cmake -DCMAKE_BUILD_TYPE=Release
 cmake --build mcp_server/build --parallel
 
-cmake -S mcp_stdio_proxy_adapter -B mcp_stdio_proxy_adapter/build -DCMAKE_BUILD_TYPE=Release
-cmake --build mcp_stdio_proxy_adapter/build --parallel
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
 ```
 
 产物路径通常是：
@@ -64,8 +64,8 @@ mcp_stdio_proxy_adapter/build/mcp_stdio_proxy_adapter
 在仓库根目录使用 PowerShell 执行：
 
 ```powershell
-cmake -S mcp_server -B mcp_server\build -C mcp_server\config\windows_defconfig.cmake
-cmake --build mcp_server\build --config Release
+cmake -S . -B build -C config\windows_defconfig.cmake
+cmake --build build --config Release
 
 cmake -S mcp_stdio_proxy_adapter -B mcp_stdio_proxy_adapter\build
 cmake --build mcp_stdio_proxy_adapter\build --config Release
@@ -102,10 +102,10 @@ PowerShell：
 ```powershell
 $env:MCP_ENABLE_STDIO = "0"
 $env:MCP_ENABLE_TCP = "1"
-$env:MCP_TCP_HOST = "192.168.222.128"
+$env:MCP_TCP_HOST = "192.168.222.1"
 $env:MCP_TCP_PORT = "18767"
 $env:MCP_ENABLE_SHELL_EXEC = "1"
-.\mcp_server\build\src\Release\mcp_server.exe
+.\build\src\Release\mcp_server.exe
 ```
 
 如果只允许本机访问，可以把 `MCP_TCP_HOST` 设为 `127.0.0.1`。

@@ -115,6 +115,8 @@ struct shell_exec_outcome {
     char *spawn_error;
 };
 
+static int shell_exec_prepare_working_directory(const struct shell_exec_config *cfg);
+
 static bool env_bool(const char *name, bool default_value)
 {
     const char *value = getenv(name);
@@ -699,6 +701,139 @@ static int shell_exec_buffer_append(struct shell_exec_buffer *buffer,
 
     return 0;
 }
+
+#ifdef _WIN32
+static bool shell_exec_windows_is_valid_utf8(const char *data, size_t len)
+{
+    if (!data || len == 0)
+        return true;
+    if (len > (size_t)INT_MAX)
+        return false;
+
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, data, (int)len, NULL, 0) > 0;
+}
+
+static int shell_exec_windows_convert_codepage_to_utf8(const char *data,
+                                                       size_t len,
+                                                       UINT code_page,
+                                                       char **out_utf8,
+                                                       size_t *out_len,
+                                                       size_t *out_consumed)
+{
+    const DWORD flags = code_page == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0;
+    size_t trim;
+
+    *out_utf8 = NULL;
+    *out_len = 0;
+    *out_consumed = 0;
+
+    if (!data || len == 0) {
+        *out_utf8 = mcp_strdup("");
+        return *out_utf8 ? 0 : -1;
+    }
+    if (len > (size_t)INT_MAX)
+        return -1;
+
+    for (trim = 0; trim <= 4 && trim < len; trim++) {
+        const int source_len = (int)(len - trim);
+        int wide_len;
+        int utf8_len;
+        WCHAR *wide_buf;
+        char *utf8_buf;
+
+        if (source_len <= 0)
+            break;
+
+        wide_len = MultiByteToWideChar(code_page, flags, data, source_len, NULL, 0);
+        if (wide_len <= 0)
+            continue;
+
+        wide_buf = malloc(sizeof(WCHAR) * (size_t)wide_len);
+        if (!wide_buf)
+            return -1;
+
+        if (MultiByteToWideChar(code_page, flags, data, source_len, wide_buf, wide_len) != wide_len) {
+            free(wide_buf);
+            continue;
+        }
+
+        utf8_len = WideCharToMultiByte(CP_UTF8, 0, wide_buf, wide_len, NULL, 0, NULL, NULL);
+        if (utf8_len <= 0) {
+            free(wide_buf);
+            continue;
+        }
+
+        utf8_buf = malloc((size_t)utf8_len + 1u);
+        if (!utf8_buf) {
+            free(wide_buf);
+            return -1;
+        }
+
+        if (WideCharToMultiByte(CP_UTF8, 0, wide_buf, wide_len, utf8_buf, utf8_len, NULL, NULL) != utf8_len) {
+            free(utf8_buf);
+            free(wide_buf);
+            continue;
+        }
+
+        utf8_buf[utf8_len] = '\0';
+        free(wide_buf);
+        *out_utf8 = utf8_buf;
+        *out_len = (size_t)utf8_len;
+        *out_consumed = (size_t)source_len;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int shell_exec_windows_normalize_buffer(struct shell_exec_buffer *buffer)
+{
+    const UINT code_pages[] = {CP_OEMCP, CP_ACP};
+    size_t i;
+
+    if (!buffer || !buffer->data || buffer->len == 0 || shell_exec_windows_is_valid_utf8(buffer->data, buffer->len))
+        return 0;
+
+    for (i = 0; i < sizeof(code_pages) / sizeof(code_pages[0]); i++) {
+        char *utf8 = NULL;
+        size_t utf8_len = 0;
+        size_t consumed = 0;
+        size_t original_len;
+
+        if (i > 0 && code_pages[i] == code_pages[i - 1])
+            continue;
+        if (shell_exec_windows_convert_codepage_to_utf8(buffer->data,
+                                                        buffer->len,
+                                                        code_pages[i],
+                                                        &utf8,
+                                                        &utf8_len,
+                                                        &consumed) != 0)
+            continue;
+
+        original_len = buffer->len;
+        free(buffer->data);
+        buffer->data = utf8;
+        buffer->len = utf8_len;
+        buffer->cap = utf8_len + 1u;
+        if (consumed < original_len)
+            buffer->truncated = true;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int shell_exec_windows_normalize_outcome(struct shell_exec_outcome *outcome)
+{
+    if (!outcome)
+        return -1;
+    if (shell_exec_windows_normalize_buffer(&outcome->stdout_buf) != 0)
+        return -1;
+    if (shell_exec_windows_normalize_buffer(&outcome->stderr_buf) != 0)
+        return -1;
+    return 0;
+}
+#endif
 
 static void shell_exec_buffer_destroy(struct shell_exec_buffer *buffer)
 {
@@ -1316,6 +1451,18 @@ fail:
     return -1;
 }
 #else
+static int shell_exec_prepare_working_directory(const struct shell_exec_config *cfg)
+{
+    int rc;
+
+    if (!cfg->working_directory || cfg->working_directory[0] == '\0')
+        return -1;
+    rc = _mkdir(cfg->working_directory);
+    if (rc == 0 || errno == EEXIST)
+        return 0;
+    return -1;
+}
+
 static void shell_exec_free_environment_block(char *block)
 {
     free(block);
@@ -1575,10 +1722,17 @@ static json_t *shell_exec_build_result(const struct shell_exec_request *request,
                                        bool is_error)
 {
     json_t *payload = json_object();
-    json_t *stdout_value = json_stringn_nocheck(outcome->stdout_buf.data ? outcome->stdout_buf.data : "",
-                                                outcome->stdout_buf.len);
-    json_t *stderr_value = json_stringn_nocheck(outcome->stderr_buf.data ? outcome->stderr_buf.data : "",
-                                                outcome->stderr_buf.len);
+#ifdef _WIN32
+    json_t *stdout_value = json_stringn(outcome->stdout_buf.data ? outcome->stdout_buf.data : "",
+                                        outcome->stdout_buf.len);
+    json_t *stderr_value = json_stringn(outcome->stderr_buf.data ? outcome->stderr_buf.data : "",
+                                        outcome->stderr_buf.len);
+#else
+    json_t *stdout_value = json_stringn(outcome->stdout_buf.data ? outcome->stdout_buf.data : "",
+                                        outcome->stdout_buf.len);
+    json_t *stderr_value = json_stringn(outcome->stderr_buf.data ? outcome->stderr_buf.data : "",
+                                        outcome->stderr_buf.len);
+#endif
     json_t *result;
 
     if (!payload || !stdout_value || !stderr_value)
@@ -1718,6 +1872,12 @@ int mcp_tool_system_shell_exec(struct mcp_server *server,
     }
 
     shell_exec_audit_log(&cfg, &request, &outcome);
+#ifdef _WIN32
+    if (shell_exec_windows_normalize_outcome(&outcome) != 0) {
+        *out_result = mcp_tool_result_text("Failed to normalize shell_exec output as UTF-8.", true);
+        goto cleanup;
+    }
+#endif
     *out_result = shell_exec_build_result(&request,
                                           &outcome,
                                           outcome.timed_out || outcome.exit_code != 0 ||

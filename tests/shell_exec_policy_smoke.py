@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 
 def send(proc, payload):
@@ -42,6 +43,10 @@ def json_content(result):
     return json.loads(text_content(result))
 
 
+def shell_command(command_windows, command_unix):
+    return command_windows if os.name == "nt" else command_unix
+
+
 def main():
     exe = sys.argv[1]
     env = os.environ.copy()
@@ -77,7 +82,12 @@ def main():
         recv(proc)
         send(proc, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
 
-        ok = call_tool(proc, 2, "system.shell_exec", {"command": "echo smoke"})
+        ok = call_tool(
+            proc,
+            2,
+            "system.shell_exec",
+            {"command": shell_command("echo smoke", "echo smoke")},
+        )
         assert ok["isError"] is False, ok
         payload = json_content(ok)
         assert payload["stdout"].strip() == "smoke", payload
@@ -87,25 +97,56 @@ def main():
         assert payload["truncated"] is False, payload
 
         shell_syntax = call_tool(
-            proc, 3, "system.shell_exec", {"command": "echo smoke && echo ok"}
+            proc,
+            3,
+            "system.shell_exec",
+            {"command": shell_command("echo smoke && echo ok", "echo smoke && echo ok")},
         )
         assert shell_syntax["isError"] is False, shell_syntax
         syntax_payload = json_content(shell_syntax)
-        assert syntax_payload["stdout"].splitlines() == ["smoke", "ok"], syntax_payload
+        assert [line.strip() for line in syntax_payload["stdout"].splitlines()] == [
+            "smoke",
+            "ok",
+        ], syntax_payload
 
-        cwd = call_tool(proc, 4, "system.shell_exec", {"command": "pwd"})
+        if os.name == "nt":
+            dir_payload = json_content(
+                call_tool(
+                    proc,
+                    31,
+                    "system.shell_exec",
+                    {"command": "dir"},
+                )
+            )
+            assert dir_payload["stdout"] != "", dir_payload
+            assert dir_payload["stderr"] == "", dir_payload
+            assert dir_payload["exit_code"] == 0, dir_payload
+
+        cwd = call_tool(
+            proc,
+            4,
+            "system.shell_exec",
+            {"command": shell_command("cd", "pwd")},
+        )
         assert cwd["isError"] is False, cwd
         cwd_payload = json_content(cwd)
-        assert cwd_payload["stdout"].strip() == "/tmp", cwd_payload
+        expected_cwd = str(Path(".").resolve())
+        assert cwd_payload["stdout"].strip().lower() == expected_cwd.lower(), cwd_payload
 
         env_clean = call_tool(
-            proc, 5,
+            proc,
+            5,
             "system.shell_exec",
-            {"command": "printf '%s' \"${MCP_SHOULD_NOT_LEAK-unset}\""},
+            {
+                "command": shell_command(
+                    'if defined MCP_SHOULD_NOT_LEAK (echo %MCP_SHOULD_NOT_LEAK%) else (echo unset)',
+                    'printf \'%s\' "${MCP_SHOULD_NOT_LEAK-unset}"',
+                )
+            },
         )
         assert env_clean["isError"] is False, env_clean
         env_payload = json_content(env_clean)
-        assert env_payload["stdout"] == "unset", env_payload
+        assert env_payload["stdout"].strip() == "unset", env_payload
 
         if os.name != "nt":
             marker = f"/tmp/mcp_shell_exec_marker_{os.getpid()}"

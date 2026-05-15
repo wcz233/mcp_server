@@ -9,21 +9,7 @@
   "merge_stderr": false,
   "execution": {
     "mode": "shell",
-    "shell_path": "/bin/sh",
-    "shell_arg": "-c",
-    "working_directory": "/tmp/mcp-shell",
     "clear_environment": true,
-    "allowed_env": [
-      "PATH",
-      "HOME",
-      "LANG",
-      "LC_ALL"
-    ],
-    "env": {
-      "PATH": "/usr/bin:/bin",
-      "HOME": "/tmp/mcp-shell",
-      "LANG": "C"
-    },
     "run_as_user": "",
     "run_as_group": "",
     "kill_process_group_on_timeout": true
