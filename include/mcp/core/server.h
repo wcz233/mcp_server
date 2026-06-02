@@ -8,6 +8,16 @@
 
 struct mcp_server;
 
+struct mcp_server_discovery_config {
+    const char *bind_host;
+    unsigned int discovery_port;
+    unsigned int broadcast_port;
+    const char *tcp_host;
+    unsigned int tcp_port;
+    const char *advertise_host;
+    const char *explicit_hosts;
+};
+
 struct mcp_server_config {
     bool strict_initialized_notification;
     bool stdio_eof_shutdown;
@@ -21,6 +31,8 @@ int mcp_server_start_stdio(struct mcp_server *server, int stdin_fd, int stdout_f
 int mcp_server_start_udp(struct mcp_server *server, const char *bind_host, unsigned int bind_port);
 int mcp_server_start_pipe(struct mcp_server *server, const char *path);
 int mcp_server_start_tcp(struct mcp_server *server, const char *host, unsigned int port);
+int mcp_server_start_discovery(struct mcp_server *server,
+                               const struct mcp_server_discovery_config *config);
 uv_loop_t *mcp_server_loop(struct mcp_server *server);
 
 #endif

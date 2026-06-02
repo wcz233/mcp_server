@@ -1,9 +1,11 @@
 #include "mcp/core/server.h"
 
+#include "common/platform.h"
 #include "core/in_flight.h"
 #include "core/server_internal.h"
 #include "protocol/jsonrpc.h"
 #include "tools/builtin_tools.h"
+#include "tools/tool_result.h"
 
 #include <jansson.h>
 #include <stdbool.h>
@@ -289,6 +291,7 @@ static void maybe_shutdown(struct mcp_server *server)
     if (server->in_flight.size != 0)
         return;
 
+    mcp_server_discovery_close(server->discovery);
 #if MCP_HAS_TRANSPORT_UDP
     mcp_udp_transport_close(server->udp);
 #endif
@@ -299,12 +302,24 @@ static void maybe_shutdown(struct mcp_server *server)
         uv_close((uv_handle_t *)&server->core_async, NULL);
 }
 
+void mcp_server_request_shutdown(struct mcp_server *server)
+{
+    if (!server || server->shutting_down)
+        return;
+
+    server->shutting_down = true;
+    if (server->core_async_initialized &&
+        !uv_is_closing((uv_handle_t *)&server->core_async))
+        uv_async_send(&server->core_async);
+}
+
 static void close_runtime_handles(struct mcp_server *server)
 {
     if (!server)
         return;
 
     server->shutting_down = true;
+    mcp_server_discovery_close(server->discovery);
 #if MCP_HAS_TRANSPORT_UDP
     mcp_udp_transport_close(server->udp);
 #endif
@@ -339,6 +354,11 @@ static bool tool_visible_in_snapshot(const json_t *snapshot, const char *tool_na
     }
 
     return false;
+}
+
+static bool tool_call_is_list_servers(const char *tool_name)
+{
+    return strcmp(tool_name, MCP_SERVER_LIST_SERVERS_TOOL) == 0;
 }
 
 static int extract_tool_call(json_t *params,
@@ -497,6 +517,32 @@ static void handle_request(struct mcp_server *server,
             return;
         }
 
+        if (tool_call_is_list_servers(tool_name)) {
+            json_t *wait_value = json_object_get(arguments, "wait_ms");
+            unsigned int wait_ms = 0;
+
+            if (json_is_integer(wait_value) &&
+                json_integer_value(wait_value) > 0 &&
+                json_integer_value(wait_value) <= 5000)
+                wait_ms = (unsigned int)json_integer_value(wait_value);
+
+            if (mcp_server_discovery_list_async(server->discovery, id_key, wait_ms) == 0) {
+                json_decref(arguments);
+                free(id_key);
+                return;
+            }
+
+            json_decref(arguments);
+            entry = mcp_in_flight_remove(&server->in_flight, id_key);
+            if (entry)
+                free_in_flight_entry(entry);
+            free(id_key);
+            result = mcp_tool_result_text("Server discovery is not enabled.", true);
+            send_result_to(server, reply_to, message->id, result);
+            json_decref(result);
+            return;
+        }
+
         result = NULL;
         error = NULL;
         rc = mcp_gateway_call(server->gateway,
@@ -652,6 +698,13 @@ static void udp_on_datagram(void *arg,
         return;
     }
 
+    if (message->type == MCP_JSONRPC_NOTIFICATION &&
+        strcmp(message->method, MCP_SERVER_DISCOVERY_OFFLINE_METHOD) == 0 &&
+        mcp_server_discovery_handle_offline_notification(server->discovery, message->params)) {
+        mcp_jsonrpc_message_destroy(message);
+        return;
+    }
+
     queue_message(server, message, &reply_to);
 }
 
@@ -682,6 +735,13 @@ static void framed_on_message(void *arg,
     if (mcp_jsonrpc_parse_line(data, len, &message, &error) != 0) {
         send_json_object(server, &reply_to, error);
         json_decref(error);
+        return;
+    }
+
+    if (message->type == MCP_JSONRPC_NOTIFICATION &&
+        strcmp(message->method, MCP_SERVER_DISCOVERY_OFFLINE_METHOD) == 0 &&
+        mcp_server_discovery_handle_offline_notification(server->discovery, message->params)) {
+        mcp_jsonrpc_message_destroy(message);
         return;
     }
 
@@ -759,6 +819,7 @@ int mcp_server_init(struct mcp_server **out, uv_loop_t *loop, struct mcp_server_
 
     if (mcp_tool_registry_create(&server->registry) != 0 ||
         mcp_gateway_create(&server->gateway, server->registry) != 0 ||
+        mcp_server_discovery_create(&server->discovery, server, loop) != 0 ||
         mcp_register_builtin_tools(server, server->registry) != 0) {
         mcp_server_destroy(server);
         return -1;
@@ -793,6 +854,7 @@ void mcp_server_destroy(struct mcp_server *server)
     }
     mcp_gateway_destroy(server->gateway);
     mcp_tool_registry_destroy(server->registry);
+    mcp_server_discovery_destroy(server->discovery);
     mcp_in_flight_destroy(&server->in_flight);
 #if MCP_HAS_TRANSPORT_UDP
     mcp_udp_transport_destroy(server->udp);
@@ -800,6 +862,7 @@ void mcp_server_destroy(struct mcp_server *server)
     mcp_framed_listener_destroy(server->pipe_listener);
     mcp_framed_listener_destroy(server->tcp_listener);
     mcp_stdio_transport_destroy(server->stdio);
+    free(server->tcp_host);
     free(server);
 }
 
@@ -893,6 +956,11 @@ int mcp_server_start_tcp(struct mcp_server *server, const char *host, unsigned i
                                       server) != 0)
         return -1;
 
+    free(server->tcp_host);
+    server->tcp_host = mcp_strdup(host);
+    if (!server->tcp_host)
+        return -1;
+    server->tcp_port = port;
     return 0;
 }
 
@@ -904,4 +972,32 @@ bool mcp_server_pipe_enabled(const struct mcp_server *server)
 bool mcp_server_tcp_enabled(const struct mcp_server *server)
 {
     return server && mcp_framed_listener_is_open(server->tcp_listener);
+}
+
+int mcp_server_start_discovery(struct mcp_server *server,
+                               const struct mcp_server_discovery_config *config)
+{
+    struct mcp_server_discovery_config effective;
+
+    if (!server || !server->discovery || !config || !mcp_server_tcp_enabled(server))
+        return -1;
+
+    effective = *config;
+    if (!effective.tcp_host)
+        effective.tcp_host = server->tcp_host;
+    if (effective.tcp_port == 0)
+        effective.tcp_port = server->tcp_port;
+    if (effective.discovery_port == 0)
+        effective.discovery_port = effective.tcp_port;
+    if (effective.broadcast_port == 0)
+        effective.broadcast_port = effective.tcp_port;
+    if (!effective.bind_host)
+        effective.bind_host = "0.0.0.0";
+
+    return mcp_server_discovery_start(server->discovery, &effective);
+}
+
+bool mcp_server_discovery_enabled(const struct mcp_server *server)
+{
+    return server && mcp_server_discovery_is_open(server->discovery);
 }

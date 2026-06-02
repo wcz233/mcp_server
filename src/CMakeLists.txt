@@ -4,6 +4,7 @@ target_sources(mcp_server
     PRIVATE
         core/in_flight.c
         core/server.c
+        discovery/server_discovery.c
         gateway/gateway.c
         listener/framed_listener.c
         main/main.c
@@ -11,6 +12,7 @@ target_sources(mcp_server
         registry/tool_registry.c
         tools/builtin_tools.c
         tools/shell_exec.c
+        tools/system_status.c
         tools/tool_result.c
         transport/stdio_transport.c
         $<$<BOOL:${MCP_TRANSPORT_UDP}>:transport/udp_transport.c>

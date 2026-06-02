@@ -59,6 +59,42 @@ mcp_server/build/src/mcp_server
 mcp_stdio_proxy_adapter/build/mcp_stdio_proxy_adapter
 ```
 
+### ARM Buildroot 交叉编译
+
+该入口面向 `arm-buildroot-linux-gnueabihf` 工具链，目标系统仍按 Linux
+构建，第三方库默认使用 `external/` 中锁定的 bundled 源码一起交叉编译。
+交叉编译产物不能在宿主机直接运行 smoke tests，因此 ARM 默认配置关闭
+`MCP_BUILD_TESTS`。
+
+在仓库根目录执行：
+
+```bash
+export ARCH=arm
+export CROSS_COMPILE=arm-buildroot-linux-gnueabihf
+export MCP_ARM_BUILDROOT_SDK=/home/alinx/prj/board/100ask_stm32mp157_pro-sdk/ToolChain/arm-buildroot-linux-gnueabihf_sdk-buildroot
+export PATH="$PATH:$MCP_ARM_BUILDROOT_SDK/bin"
+
+repo_root=$(pwd)
+cmake -S mcp_server \
+  -B mcp_server/build-arm \
+  -C "$repo_root/mcp_server/config/arm_buildroot_defconfig.cmake" \
+  -DCMAKE_TOOLCHAIN_FILE="$repo_root/mcp_server/cmake/toolchains/arm-buildroot-linux-gnueabihf.cmake" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build mcp_server/build-arm --parallel
+```
+
+产物路径通常是：
+
+```text
+mcp_server/build-arm/src/mcp_server
+```
+
+可用下面命令确认产物架构：
+
+```bash
+file mcp_server/build-arm/src/mcp_server
+```
+
 ### Windows
 
 在仓库根目录使用 PowerShell 执行：
@@ -190,7 +226,18 @@ int main(void){printf(\"hello world!\\n\");return 0;}' > /home/alinx/prj/hello.c
 - `MCP_ENABLE_TCP=1`：开启 TCP framed listener。
 - `MCP_TCP_HOST=<ip>`：TCP 监听地址。
 - `MCP_TCP_PORT=<port>`：TCP 监听端口，示例使用 `18767`。
+- `MCP_TCP_LISTEN_PORT=<port>`：`MCP_TCP_PORT` 未设置时的兼容别名。
+- `MCP_ENABLE_DISCOVERY=1`：TCP 模式下开启 mcp_server 局域网发现；默认开启。
+- `MCP_DISCOVERY_PORT=<port>`：UDP 发现监听端口；默认等于 `MCP_TCP_PORT`。
+- `MCP_UDP_BROADCAST_LISTEN_PORT=<port>`：UDP 广播目标端口；默认等于 `MCP_TCP_PORT`。
+- `MCP_DISCOVERY_BIND_HOST=<ip>`：UDP 发现监听地址；默认 `0.0.0.0`。
+- `MCP_DISCOVERY_ADVERTISE_HOST=<ip>`：广播中声明给对端连接的地址；默认使用 UDP 来源地址。
+- `MCP_DISCOVERY_HOSTS=<ip[:port],...>`：额外单播发现目标，适合测试或禁止广播的网络。
 - `MCP_ENABLE_SHELL_EXEC=1`：允许 `system.shell_exec` 执行主机命令。
 
 TCP 协议使用 4 字节大端长度头加 JSON body。`mcp_stdio_proxy_adapter`
 负责把 Codex stdio JSON-RPC 转换成该 TCP framed 协议。
+
+`server.list_servers` 工具会主动触发一次发现广播，短暂等待响应后返回 JSON
+文本，结构包含 `total` 和 `servers`；每个 server 记录 `address`、`ip`、`port`
+和 `system_status`。

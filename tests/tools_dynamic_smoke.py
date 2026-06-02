@@ -80,6 +80,12 @@ def verify_tool(proc, request_id, tool_name):
         assert "tcp_transport" in payload, payload
         return
 
+    if tool_name == "server.list_servers":
+        result = call_tool(proc, request_id, tool_name, {"wait_ms": 1})
+        assert result["isError"] is True, result
+        assert "not enabled" in parse_text_content(result), result
+        return
+
     if tool_name == "registry.list_tools":
         result = call_tool(proc, request_id, tool_name, {})
         assert result["isError"] is False, result

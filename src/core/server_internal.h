@@ -5,6 +5,7 @@
 #include "mcp/core/server.h"
 #include "mcp/gateway/gateway.h"
 #include "mcp/registry/tool_registry.h"
+#include "discovery/server_discovery.h"
 #include "listener/framed_listener.h"
 #include "transport/stdio_transport.h"
 #include "transport/udp_transport.h"
@@ -42,6 +43,9 @@ struct mcp_server {
     struct mcp_in_flight_map in_flight;
     struct mcp_tool_registry *registry;
     struct mcp_gateway *gateway;
+    struct mcp_server_discovery *discovery;
+    char *tcp_host;
+    unsigned int tcp_port;
 
     struct mcp_client_session stdio_session;
     struct mcp_client_session *peer_sessions;
@@ -53,9 +57,13 @@ bool mcp_server_udp_enabled(const struct mcp_server *server);
 bool mcp_server_stdio_enabled(const struct mcp_server *server);
 bool mcp_server_pipe_enabled(const struct mcp_server *server);
 bool mcp_server_tcp_enabled(const struct mcp_server *server);
+void mcp_server_request_shutdown(struct mcp_server *server);
 
 void mcp_server_complete_async_ok(struct mcp_server *server,
                                   const char *id_key,
                                   json_t *result);
+int mcp_server_start_discovery(struct mcp_server *server,
+                               const struct mcp_server_discovery_config *config);
+bool mcp_server_discovery_enabled(const struct mcp_server *server);
 
 #endif

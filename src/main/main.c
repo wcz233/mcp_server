@@ -1,5 +1,7 @@
 #include "mcp/core/server.h"
+#include "core/server_internal.h"
 
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,6 +66,95 @@ static int stdout_fileno_value(void)
 #endif
 }
 
+struct shutdown_signal_context {
+    struct mcp_server *server;
+    uv_signal_t sigint_handle;
+    uv_signal_t sigterm_handle;
+    bool sigint_initialized;
+    bool sigterm_initialized;
+    bool closing;
+};
+
+static void shutdown_signal_close_cb(uv_handle_t *handle)
+{
+    (void)handle;
+}
+
+static void close_shutdown_signal(uv_signal_t *handle, bool *initialized)
+{
+    if (!*initialized)
+        return;
+
+    uv_signal_stop(handle);
+    if (!uv_is_closing((uv_handle_t *)handle))
+        uv_close((uv_handle_t *)handle, shutdown_signal_close_cb);
+    *initialized = false;
+}
+
+static void close_shutdown_signals(struct shutdown_signal_context *ctx)
+{
+    close_shutdown_signal(&ctx->sigint_handle, &ctx->sigint_initialized);
+    close_shutdown_signal(&ctx->sigterm_handle, &ctx->sigterm_initialized);
+}
+
+static void shutdown_signal_cb(uv_signal_t *handle, int signum)
+{
+    struct shutdown_signal_context *ctx = handle->data;
+
+    (void)signum;
+    if (!ctx || ctx->closing)
+        return;
+
+    ctx->closing = true;
+    close_shutdown_signals(ctx);
+    mcp_server_request_shutdown(ctx->server);
+}
+
+static int start_shutdown_signal(uv_loop_t *loop,
+                                 uv_signal_t *handle,
+                                 bool *initialized,
+                                 struct shutdown_signal_context *ctx,
+                                 int signum)
+{
+    int rc = uv_signal_init(loop, handle);
+
+    if (rc != 0)
+        return rc;
+
+    *initialized = true;
+    handle->data = ctx;
+
+    rc = uv_signal_start(handle, shutdown_signal_cb, signum);
+    if (rc != 0)
+        return rc;
+
+    uv_unref((uv_handle_t *)handle);
+    return 0;
+}
+
+static int install_shutdown_signals(uv_loop_t *loop, struct shutdown_signal_context *ctx)
+{
+    int rc;
+
+    rc = start_shutdown_signal(loop,
+                               &ctx->sigint_handle,
+                               &ctx->sigint_initialized,
+                               ctx,
+                               SIGINT);
+    if (rc != 0)
+        return rc;
+
+    rc = start_shutdown_signal(loop,
+                               &ctx->sigterm_handle,
+                               &ctx->sigterm_initialized,
+                               ctx,
+                               SIGTERM);
+    if (rc != 0)
+        return rc;
+
+    return 0;
+}
+
 static int prepare_stdio(void)
 {
 #ifdef _WIN32
@@ -91,6 +182,7 @@ int main(void)
 {
     uv_loop_t loop;
     struct mcp_server *server = NULL;
+    struct shutdown_signal_context signal_ctx = {0};
     struct mcp_server_config config = {
         .strict_initialized_notification = env_bool("MCP_STRICT_INIT", true),
         .stdio_eof_shutdown = true,
@@ -100,6 +192,7 @@ int main(void)
     bool udp_enabled = env_bool("MCP_ENABLE_UDP", false);
     bool pipe_enabled = env_bool("MCP_ENABLE_PIPE", false);
     bool tcp_enabled = env_bool("MCP_ENABLE_TCP", false);
+    bool discovery_enabled = env_bool("MCP_ENABLE_DISCOVERY", true);
     const char *udp_host = env_str("MCP_UDP_HOST", "127.0.0.1");
     unsigned int udp_port = env_uint("MCP_UDP_PORT", 8765);
     const char *pipe_path = env_str("MCP_PIPE_PATH",
@@ -110,7 +203,14 @@ int main(void)
 #endif
     );
     const char *tcp_host = env_str("MCP_TCP_HOST", "127.0.0.1");
-    unsigned int tcp_port = env_uint("MCP_TCP_PORT", 8765);
+    unsigned int tcp_port = env_uint("MCP_TCP_PORT",
+                                     env_uint("MCP_TCP_LISTEN_PORT", 8765));
+    const char *discovery_bind_host = env_str("MCP_DISCOVERY_BIND_HOST", "0.0.0.0");
+    unsigned int discovery_port = env_uint("MCP_DISCOVERY_PORT", 0);
+    unsigned int broadcast_port = env_uint("MCP_UDP_BROADCAST_LISTEN_PORT", 0);
+    const char *discovery_advertise_host = env_str("MCP_DISCOVERY_ADVERTISE_HOST", NULL);
+    const char *discovery_hosts = env_str("MCP_DISCOVERY_HOSTS", NULL);
+    bool force_stdio_eof_shutdown = env_bool("MCP_STDIO_EOF_SHUTDOWN", false);
     int stdin_fd;
     int stdout_fd;
     int rc;
@@ -118,7 +218,8 @@ int main(void)
     if (!stdio_enabled && !udp_enabled && !pipe_enabled && !tcp_enabled)
         stdio_enabled = true;
 
-    config.stdio_eof_shutdown = !(pipe_enabled || tcp_enabled || udp_enabled);
+    config.stdio_eof_shutdown = force_stdio_eof_shutdown ||
+                                !(pipe_enabled || tcp_enabled || udp_enabled);
 
     if (stdio_enabled && prepare_stdio() != 0) {
         fprintf(stderr, "prepare_stdio failed\n");
@@ -148,6 +249,7 @@ int main(void)
         close_loop(&loop);
         return 1;
     }
+    signal_ctx.server = server;
 
     if (stdio_enabled) {
         rc = mcp_server_start_stdio(server, stdin_fd, stdout_fd);
@@ -189,6 +291,44 @@ int main(void)
         }
     }
 
+    if (tcp_enabled && discovery_enabled) {
+        unsigned int effective_discovery_port = discovery_port ? discovery_port : tcp_port;
+        unsigned int effective_broadcast_port = broadcast_port ? broadcast_port : tcp_port;
+
+        rc = mcp_server_start_discovery(
+            server,
+            &(struct mcp_server_discovery_config){
+                .bind_host = discovery_bind_host,
+                .discovery_port = effective_discovery_port,
+                .broadcast_port = effective_broadcast_port,
+                .tcp_host = tcp_host,
+                .tcp_port = tcp_port,
+                .advertise_host = discovery_advertise_host,
+                .explicit_hosts = discovery_hosts,
+            });
+        if (rc != 0) {
+            fprintf(stderr, "mcp_server_start_discovery failed for UDP %s:%u\n",
+                    discovery_bind_host,
+                    effective_discovery_port);
+            mcp_server_destroy(server);
+            close_loop(&loop);
+            return 1;
+        }
+    }
+
+    rc = install_shutdown_signals(&loop, &signal_ctx);
+    if (rc != 0) {
+        fprintf(stderr, "install_shutdown_signals: %s\n", uv_strerror(rc));
+        close_shutdown_signals(&signal_ctx);
+        uv_run(&loop, UV_RUN_DEFAULT);
+        mcp_server_destroy(server);
+        close_loop(&loop);
+        return 1;
+    }
+
+    uv_run(&loop, UV_RUN_DEFAULT);
+
+    close_shutdown_signals(&signal_ctx);
     uv_run(&loop, UV_RUN_DEFAULT);
 
     mcp_server_destroy(server);

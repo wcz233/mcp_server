@@ -4,19 +4,13 @@
 #include "core/server_internal.h"
 #include "mcp/embedded/mep.h"
 #include "tools/shell_exec.h"
+#include "tools/system_status.h"
 #include "tools/tool_result.h"
 
 #include <jansson.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <sys/utsname.h>
-#include <unistd.h>
-#endif
 
 static json_t *schema_object(void)
 {
@@ -68,59 +62,16 @@ static int tool_system_get_status(struct mcp_server *server,
                                   const struct mcp_tool_invocation *invocation,
                                   json_t **out_result)
 {
-    json_t *status = json_object();
-    char hostname[256] = {0};
+    json_t *status;
 
     (void)server;
     (void)invocation;
 
-#ifdef _WIN32
-    {
-        DWORD size = sizeof(hostname);
-        OSVERSIONINFOEXA osvi;
-        MEMORYSTATUSEX mem;
-
-        if (!GetComputerNameA(hostname, &size))
-            strcpy(hostname, "unknown");
-
-        memset(&osvi, 0, sizeof(osvi));
-        osvi.dwOSVersionInfoSize = sizeof(osvi);
-        memset(&mem, 0, sizeof(mem));
-        mem.dwLength = sizeof(mem);
-        GlobalMemoryStatusEx(&mem);
-
-        json_object_set_new(status, "os", json_string("windows"));
-        json_object_set_new(status, "hostname", json_string(hostname));
-        json_object_set_new(status, "memory_total_bytes", json_integer((json_int_t)mem.ullTotalPhys));
-        json_object_set_new(status, "memory_available_bytes", json_integer((json_int_t)mem.ullAvailPhys));
+    status = mcp_system_status_json();
+    if (!status) {
+        *out_result = mcp_tool_result_text("Failed to read system status.", true);
+        return -1;
     }
-#else
-    {
-        struct utsname uts;
-        long pages = sysconf(_SC_PHYS_PAGES);
-        long avail_pages = sysconf(_SC_AVPHYS_PAGES);
-        long page_size = sysconf(_SC_PAGE_SIZE);
-
-        if (gethostname(hostname, sizeof(hostname) - 1) != 0)
-            strcpy(hostname, "unknown");
-        if (uname(&uts) == 0) {
-            json_object_set_new(status, "os", json_string(uts.sysname));
-            json_object_set_new(status, "kernel", json_string(uts.release));
-            json_object_set_new(status, "machine", json_string(uts.machine));
-        } else {
-            json_object_set_new(status, "os", json_string("unknown"));
-        }
-        json_object_set_new(status, "hostname", json_string(hostname));
-        if (pages > 0 && page_size > 0)
-            json_object_set_new(status,
-                                "memory_total_bytes",
-                                json_integer((json_int_t)pages * page_size));
-        if (avail_pages > 0 && page_size > 0)
-            json_object_set_new(status,
-                                "memory_available_bytes",
-                                json_integer((json_int_t)avail_pages * page_size));
-    }
-#endif
 
     *out_result = mcp_tool_result_json_text(status, false);
     json_decref(status);
@@ -164,6 +115,21 @@ static int tool_registry_list_tools(struct mcp_server *server,
     tools = mcp_tool_registry_internal_list(server->registry);
     *out_result = mcp_tool_result_json_text(tools, false);
     json_decref(tools);
+    return 0;
+}
+
+static int tool_server_list_servers(struct mcp_server *server,
+                                    const struct mcp_tool_invocation *invocation,
+                                    json_t **out_result)
+{
+    (void)invocation;
+
+    if (!mcp_server_discovery_enabled(server)) {
+        *out_result = mcp_tool_result_text("Server discovery is not enabled.", true);
+        return 0;
+    }
+
+    *out_result = mcp_tool_result_text("Server discovery is handled asynchronously.", true);
     return 0;
 }
 
@@ -337,6 +303,30 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
                       tool_gateway_status) != 0)
         return -1;
 #endif
+
+    if (register_tool(registry,
+                      MCP_SERVER_LIST_SERVERS_TOOL,
+                      "Broadcast-discover online MCP servers and return the current server register.",
+                      schema_with_properties(
+                          json_pack("{s:{s:s,s:s,s:i,s:i}}",
+                                    "wait_ms",
+                                    "type",
+                                    "integer",
+                                    "description",
+                                    "Discovery response wait window in milliseconds.",
+                                    "minimum",
+                                    1,
+                                    "maximum",
+                                    5000),
+                          NULL),
+                      "builtin",
+                      "L0",
+                      "server.read",
+                      true,
+                      true,
+                      5000,
+                      tool_server_list_servers) != 0)
+        return -1;
 
 #if MCP_HAS_TOOL_REGISTRY
     if (register_tool(registry,
