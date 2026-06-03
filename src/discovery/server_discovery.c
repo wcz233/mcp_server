@@ -330,13 +330,22 @@ static int sockaddr_from_host_port(const char *host,
     return -1;
 }
 
-static size_t sockaddr_size(const struct sockaddr_storage *addr)
+static size_t discovery_sockaddr_size(const struct sockaddr_storage *addr)
 {
     if (addr->ss_family == AF_INET)
         return sizeof(struct sockaddr_in);
     if (addr->ss_family == AF_INET6)
         return sizeof(struct sockaddr_in6);
     return 0;
+}
+
+static char *discovery_strtok(char *str, const char *delim, char **save)
+{
+#ifdef _WIN32
+    return strtok_s(str, delim, save);
+#else
+    return strtok_r(str, delim, save);
+#endif
 }
 
 static void udp_send_cb(uv_udp_send_t *req, int status)
@@ -373,7 +382,7 @@ static int discovery_udp_send_json(struct mcp_server_discovery *discovery,
     if (!discovery || !packet || !target || !discovery->opened)
         return -1;
 
-    target_len = sockaddr_size(target);
+    target_len = discovery_sockaddr_size(target);
     if (target_len == 0)
         return -1;
 
@@ -485,7 +494,9 @@ static void send_explicit_hosts(struct mcp_server_discovery *discovery, json_t *
     if (!hosts)
         return;
 
-    for (entry = strtok_r(hosts, ",", &save); entry; entry = strtok_r(NULL, ",", &save)) {
+    for (entry = discovery_strtok(hosts, ",", &save);
+         entry;
+         entry = discovery_strtok(NULL, ",", &save)) {
         char *colon;
         char *end = NULL;
         unsigned long port = discovery->broadcast_port;

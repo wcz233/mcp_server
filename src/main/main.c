@@ -70,8 +70,14 @@ struct shutdown_signal_context {
     struct mcp_server *server;
     uv_signal_t sigint_handle;
     uv_signal_t sigterm_handle;
+#ifdef _WIN32
+    uv_signal_t sigbreak_handle;
+#endif
     bool sigint_initialized;
     bool sigterm_initialized;
+#ifdef _WIN32
+    bool sigbreak_initialized;
+#endif
     bool closing;
 };
 
@@ -95,6 +101,9 @@ static void close_shutdown_signals(struct shutdown_signal_context *ctx)
 {
     close_shutdown_signal(&ctx->sigint_handle, &ctx->sigint_initialized);
     close_shutdown_signal(&ctx->sigterm_handle, &ctx->sigterm_initialized);
+#ifdef _WIN32
+    close_shutdown_signal(&ctx->sigbreak_handle, &ctx->sigbreak_initialized);
+#endif
 }
 
 static void shutdown_signal_cb(uv_signal_t *handle, int signum)
@@ -151,6 +160,16 @@ static int install_shutdown_signals(uv_loop_t *loop, struct shutdown_signal_cont
                                SIGTERM);
     if (rc != 0)
         return rc;
+
+#ifdef _WIN32
+    rc = start_shutdown_signal(loop,
+                               &ctx->sigbreak_handle,
+                               &ctx->sigbreak_initialized,
+                               ctx,
+                               SIGBREAK);
+    if (rc != 0)
+        return rc;
+#endif
 
     return 0;
 }

@@ -53,6 +53,7 @@ def wait_for_tcp(port, proc):
 
 def start_server(exe, tcp_port, discovery_port, peer_discovery_port):
     env = os.environ.copy()
+    creationflags = 0
     env["MCP_ENABLE_STDIO"] = "0"
     env["MCP_ENABLE_TCP"] = "1"
     env["MCP_TCP_HOST"] = "127.0.0.1"
@@ -64,6 +65,8 @@ def start_server(exe, tcp_port, discovery_port, peer_discovery_port):
     env["MCP_DISCOVERY_HOSTS"] = f"127.0.0.1:{peer_discovery_port}"
     env["MCP_STRICT_INIT"] = "0"
     env["MCP_ENABLE_SHELL_EXEC"] = "0"
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
     return subprocess.Popen(
         [exe],
         stdin=subprocess.DEVNULL,
@@ -72,11 +75,19 @@ def start_server(exe, tcp_port, discovery_port, peer_discovery_port):
         env=env,
         text=True,
         encoding="utf-8",
+        creationflags=creationflags,
     )
 
 
 def start_signal_server(exe, tcp_port, discovery_port, peer_discovery_port):
     return start_server(exe, tcp_port, discovery_port, peer_discovery_port)
+
+
+def request_graceful_shutdown(proc):
+    if os.name == "nt":
+        proc.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        proc.send_signal(signal.SIGINT)
 
 
 def initialize(sock):
@@ -207,7 +218,7 @@ def main():
         assert result["isError"] is False, result
         assert result["content"][0]["text"] == "pong", result
 
-        proc_b.send_signal(signal.SIGINT)
+        request_graceful_shutdown(proc_b)
         proc_b.wait(timeout=5)
         proc_b = None
 
