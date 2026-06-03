@@ -547,6 +547,7 @@ static void handle_request(struct mcp_server *server,
         error = NULL;
         rc = mcp_gateway_call(server->gateway,
                               server,
+                              id_key,
                               entry->invocation_id,
                               tool_name,
                               arguments,
@@ -554,6 +555,11 @@ static void handle_request(struct mcp_server *server,
                               &result,
                               &error);
         json_decref(arguments);
+
+        if (rc == MCP_GATEWAY_PENDING) {
+            free(id_key);
+            return;
+        }
 
         if (rc == MCP_GATEWAY_OK || rc == MCP_GATEWAY_TOOL_ERROR) {
             send_result_to(server, reply_to, message->id, result);

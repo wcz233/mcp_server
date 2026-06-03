@@ -12,7 +12,10 @@ enum mcp_gateway_status {
     MCP_GATEWAY_OK = 0,
     MCP_GATEWAY_TOOL_ERROR = 1,
     MCP_GATEWAY_PROTOCOL_ERROR = -1,
+    MCP_GATEWAY_PENDING = 2,
 };
+
+#define MCP_GATEWAY_PROXY_TOOL "gateway.proxy_tool"
 
 struct mcp_gateway;
 
@@ -21,6 +24,7 @@ void mcp_gateway_destroy(struct mcp_gateway *gateway);
 
 int mcp_gateway_call(struct mcp_gateway *gateway,
                      struct mcp_server *server,
+                     const char *id_key,
                      const char *invocation_id,
                      const char *tool_name,
                      json_t *arguments,

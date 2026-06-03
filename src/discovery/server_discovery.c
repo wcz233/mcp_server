@@ -24,6 +24,9 @@
 #define MCP_DISCOVERY_HEARTBEAT_TIMEOUT_MS 3000ull
 #define MCP_DISCOVERY_MAX_DATAGRAM 65536u
 #define MCP_DISCOVERY_MAX_FRAME (1024u * 1024u)
+#define MCP_DISCOVERY_PROXY_TIMEOUT_MS 5000u
+#define MCP_DISCOVERY_INITIALIZE_ID "mcp_gateway_initialize"
+#define MCP_DISCOVERY_REMOTE_REGISTRY_LIST_TOOLS "registry.list_tools"
 
 enum discovery_peer_state {
     DISCOVERY_PEER_ONLINE = 1,
@@ -32,12 +35,15 @@ enum discovery_peer_state {
 };
 
 struct discovery_peer_conn;
+struct discovery_pending_proxy;
 
 struct discovery_peer {
     char *id;
+    unsigned int server_id;
     char ip[64];
     unsigned int port;
     json_t *status;
+    json_t *tools_list;
     unsigned long long last_seen_ms;
     unsigned long long last_heartbeat_ms;
     unsigned long seen_generation;
@@ -67,6 +73,8 @@ struct discovery_peer_conn {
     bool connected;
     bool connecting;
     bool closing;
+    bool mcp_initialize_sent;
+    bool mcp_initialized;
     char *rx_buf;
     size_t rx_len;
     size_t rx_cap;
@@ -79,6 +87,21 @@ struct discovery_pending_list {
     char *id_key;
     unsigned long generation;
     struct discovery_pending_list *next;
+};
+
+struct discovery_pending_proxy {
+    struct mcp_server_discovery *discovery;
+    struct discovery_peer *peer;
+    uv_timer_t timer;
+    bool timer_initialized;
+    bool closing;
+    bool sent;
+    char *id_key;
+    char *remote_id;
+    char *tool_name;
+    json_t *arguments;
+    enum mcp_discovery_proxy_kind kind;
+    struct discovery_pending_proxy *next;
 };
 
 struct mcp_server_discovery {
@@ -95,6 +118,7 @@ struct mcp_server_discovery {
     bool closing;
     bool destroy_on_close;
     unsigned int udp_sends_pending;
+    unsigned int pending_proxy_closes;
     bool close_udp_after_sends;
 
     char *bind_host;
@@ -107,15 +131,25 @@ struct mcp_server_discovery {
     char *instance_id;
     unsigned long current_generation;
     unsigned long long heartbeat_id;
+    unsigned int next_server_id;
 
     struct discovery_peer *peers;
     struct discovery_pending_list *pending_lists;
+    struct discovery_pending_proxy *pending_proxies;
 };
 
 static void discovery_send_announce(struct mcp_server_discovery *discovery, bool reply);
 static void discovery_send_offline(struct mcp_server_discovery *discovery);
 static void discovery_maybe_release(struct mcp_server_discovery *discovery);
 static void udp_close_cb(uv_handle_t *handle);
+static int pending_proxy_send(struct discovery_pending_proxy *ctx);
+static void peer_send_pending_proxies(struct discovery_peer_conn *conn);
+static int peer_send_initialize(struct discovery_peer_conn *conn);
+static void pending_proxy_complete_for_peer(struct mcp_server_discovery *discovery,
+                                            struct discovery_peer *peer,
+                                            const char *message);
+static bool pending_proxy_complete_response(struct discovery_peer_conn *conn, json_t *root);
+static bool peer_handle_initialize_response(struct discovery_peer_conn *conn, json_t *root);
 
 static uint32_t read_u32_be(const char *data)
 {
@@ -600,6 +634,9 @@ static void peer_conn_fail(struct discovery_peer_conn *conn)
         return;
 
     peer_mark_timeout(conn->peer);
+    pending_proxy_complete_for_peer(conn->discovery,
+                                    conn->peer,
+                                    "Remote server connection failed.");
     peer_conn_close(conn);
 }
 
@@ -705,6 +742,10 @@ static void peer_conn_handle_frame(struct discovery_peer_conn *conn, const char 
     if (json_is_string(method) &&
         strcmp(json_string_value(method), MCP_SERVER_DISCOVERY_OFFLINE_METHOD) == 0) {
         mcp_server_discovery_handle_offline_notification(conn->discovery, params);
+    } else if (peer_handle_initialize_response(conn, root)) {
+        /* Handled by gateway client session setup. */
+    } else if (pending_proxy_complete_response(conn, root)) {
+        /* Handled by gateway proxy completion. */
     } else if (result || json_object_get(root, "error")) {
         peer_mark_heartbeat_ok(conn->peer);
     }
@@ -781,6 +822,8 @@ static void peer_connect_cb(uv_connect_t *req, int status)
     conn->connected = true;
     peer_mark_heartbeat_ok(conn->peer);
     if (uv_read_start((uv_stream_t *)&conn->tcp, peer_conn_alloc_cb, peer_conn_read_cb) != 0)
+        peer_conn_fail(conn);
+    else if (peer_send_initialize(conn) != 0)
         peer_conn_fail(conn);
 }
 
@@ -873,6 +916,362 @@ static int peer_send_frame(struct discovery_peer_conn *conn,
     }
 
     return 0;
+}
+
+static void pending_proxy_unlink(struct discovery_pending_proxy *ctx)
+{
+    struct discovery_pending_proxy **current = &ctx->discovery->pending_proxies;
+
+    while (*current) {
+        if (*current == ctx) {
+            *current = ctx->next;
+            ctx->next = NULL;
+            return;
+        }
+        current = &(*current)->next;
+    }
+}
+
+static void pending_proxy_free(struct discovery_pending_proxy *ctx)
+{
+    if (!ctx)
+        return;
+
+    free(ctx->id_key);
+    free(ctx->remote_id);
+    free(ctx->tool_name);
+    json_decref(ctx->arguments);
+    free(ctx);
+}
+
+static void pending_proxy_close_cb(uv_handle_t *handle)
+{
+    struct discovery_pending_proxy *ctx = handle->data;
+    struct mcp_server_discovery *discovery = ctx->discovery;
+
+    ctx->timer_initialized = false;
+    if (discovery->pending_proxy_closes > 0)
+        discovery->pending_proxy_closes--;
+    pending_proxy_free(ctx);
+    discovery_maybe_release(discovery);
+}
+
+static void pending_proxy_close(struct discovery_pending_proxy *ctx)
+{
+    if (!ctx)
+        return;
+    if (ctx->closing)
+        return;
+
+    if (ctx->timer_initialized && !uv_is_closing((uv_handle_t *)&ctx->timer)) {
+        ctx->closing = true;
+        uv_timer_stop(&ctx->timer);
+        ctx->discovery->pending_proxy_closes++;
+        uv_close((uv_handle_t *)&ctx->timer, pending_proxy_close_cb);
+        return;
+    }
+
+    pending_proxy_free(ctx);
+}
+
+static void pending_proxy_finish_result(struct discovery_pending_proxy *ctx, json_t *result)
+{
+    pending_proxy_unlink(ctx);
+    mcp_server_complete_async_ok(ctx->discovery->server, ctx->id_key, result);
+    pending_proxy_close(ctx);
+}
+
+static json_t *proxy_error_result(const char *message)
+{
+    return mcp_tool_result_text(message ? message : "Remote proxy call failed.", true);
+}
+
+static void pending_proxy_timeout_cb(uv_timer_t *timer)
+{
+    struct discovery_pending_proxy *ctx = timer->data;
+    json_t *result = proxy_error_result("Remote proxy call timed out.");
+
+    pending_proxy_finish_result(ctx, result);
+    json_decref(result);
+}
+
+static bool tool_result_is_error(json_t *result)
+{
+    return json_is_true(json_object_get(result, "isError"));
+}
+
+static json_t *parse_tool_result_json_text(json_t *result)
+{
+    json_error_t error;
+    json_t *content;
+    json_t *first;
+    json_t *type;
+    json_t *text;
+
+    content = json_object_get(result, "content");
+    if (!json_is_array(content) || json_array_size(content) == 0)
+        return NULL;
+
+    first = json_array_get(content, 0);
+    type = json_object_get(first, "type");
+    text = json_object_get(first, "text");
+    if (!json_is_string(type) ||
+        strcmp(json_string_value(type), "text") != 0 ||
+        !json_is_string(text))
+        return NULL;
+
+    return json_loads(json_string_value(text), JSON_REJECT_DUPLICATES, &error);
+}
+
+static void peer_store_tools_list_from_result(struct discovery_peer *peer, json_t *result)
+{
+    json_t *tools_list;
+
+    if (!peer || !json_is_object(result) || tool_result_is_error(result))
+        return;
+
+    tools_list = parse_tool_result_json_text(result);
+    if (!tools_list)
+        tools_list = json_deep_copy(result);
+    if (!tools_list)
+        return;
+
+    json_decref(peer->tools_list);
+    peer->tools_list = tools_list;
+}
+
+static bool tools_list_contains_tool(json_t *tools_list, const char *tool_name)
+{
+    json_t *tools;
+    json_t *tool;
+    size_t index;
+
+    if (!json_is_object(tools_list) || !tool_name)
+        return false;
+
+    tools = json_object_get(tools_list, "tools");
+    if (!json_is_array(tools))
+        return false;
+
+    json_array_foreach(tools, index, tool) {
+        json_t *name = json_object_get(tool, "name");
+        if (json_is_string(name) && strcmp(json_string_value(name), tool_name) == 0)
+            return true;
+    }
+
+    return false;
+}
+
+static int pending_proxy_send(struct discovery_pending_proxy *ctx)
+{
+    json_t *request;
+    json_t *params;
+    char *dumped;
+    int rc;
+    const char *remote_tool;
+
+    if (!ctx || !ctx->peer || !ctx->peer->conn || !ctx->peer->conn->connected)
+        return -1;
+    if (ctx->sent)
+        return 0;
+
+    remote_tool = ctx->kind == MCP_DISCOVERY_PROXY_TOOLS_LIST
+        ? MCP_DISCOVERY_REMOTE_REGISTRY_LIST_TOOLS
+        : ctx->tool_name;
+
+    request = json_object();
+    params = json_object();
+    if (!request || !params) {
+        json_decref(params);
+        json_decref(request);
+        return -1;
+    }
+
+    json_object_set_new(request, "jsonrpc", json_string("2.0"));
+    json_object_set_new(request, "id", json_string(ctx->remote_id));
+    json_object_set_new(request, "method", json_string("tools/call"));
+    json_object_set_new(params, "name", json_string(remote_tool));
+    json_object_set(params, "arguments", ctx->arguments);
+    json_object_set_new(request, "params", params);
+
+    dumped = json_dumps(request, JSON_COMPACT | JSON_ENSURE_ASCII);
+    json_decref(request);
+    if (!dumped)
+        return -1;
+
+    rc = peer_send_frame(ctx->peer->conn, dumped, strlen(dumped), false);
+    free(dumped);
+    if (rc == 0)
+        ctx->sent = true;
+    return rc;
+}
+
+static void peer_send_initialized_notification(struct discovery_peer_conn *conn)
+{
+    json_t *notification;
+    char *dumped;
+
+    if (!conn || !conn->connected || conn->closing)
+        return;
+
+    notification = json_object();
+    if (!notification)
+        return;
+
+    json_object_set_new(notification, "jsonrpc", json_string("2.0"));
+    json_object_set_new(notification, "method", json_string("notifications/initialized"));
+    json_object_set_new(notification, "params", json_object());
+
+    dumped = json_dumps(notification, JSON_COMPACT | JSON_ENSURE_ASCII);
+    json_decref(notification);
+    if (!dumped)
+        return;
+
+    if (peer_send_frame(conn, dumped, strlen(dumped), false) != 0)
+        peer_conn_fail(conn);
+    free(dumped);
+}
+
+static int peer_send_initialize(struct discovery_peer_conn *conn)
+{
+    json_t *request;
+    json_t *params;
+    json_t *client_info;
+    char *dumped;
+    int rc;
+
+    if (!conn || !conn->connected || conn->closing)
+        return -1;
+    if (conn->mcp_initialize_sent)
+        return 0;
+
+    request = json_object();
+    params = json_object();
+    client_info = json_object();
+    if (!request || !params || !client_info) {
+        json_decref(client_info);
+        json_decref(params);
+        json_decref(request);
+        return -1;
+    }
+
+    json_object_set_new(request, "jsonrpc", json_string("2.0"));
+    json_object_set_new(request, "id", json_string(MCP_DISCOVERY_INITIALIZE_ID));
+    json_object_set_new(request, "method", json_string("initialize"));
+    json_object_set_new(params, "protocolVersion", json_string("2024-11-05"));
+    json_object_set_new(params, "capabilities", json_object());
+    json_object_set_new(client_info, "name", json_string("mcp_gateway"));
+    json_object_set_new(client_info, "version", json_string(MCP_SERVER_VERSION));
+    json_object_set_new(params, "clientInfo", client_info);
+    json_object_set_new(request, "params", params);
+
+    dumped = json_dumps(request, JSON_COMPACT | JSON_ENSURE_ASCII);
+    json_decref(request);
+    if (!dumped)
+        return -1;
+
+    rc = peer_send_frame(conn, dumped, strlen(dumped), false);
+    free(dumped);
+    if (rc == 0)
+        conn->mcp_initialize_sent = true;
+    return rc;
+}
+
+static void peer_send_pending_proxies(struct discovery_peer_conn *conn)
+{
+    struct discovery_pending_proxy *ctx;
+
+    if (!conn || !conn->connected || !conn->mcp_initialized)
+        return;
+
+    for (ctx = conn->discovery->pending_proxies; ctx; ctx = ctx->next) {
+        if (ctx->peer == conn->peer && !ctx->sent && pending_proxy_send(ctx) != 0) {
+            json_t *result = proxy_error_result("Failed to send remote proxy request.");
+            pending_proxy_finish_result(ctx, result);
+            json_decref(result);
+            peer_conn_fail(conn);
+            return;
+        }
+    }
+}
+
+static void pending_proxy_complete_for_peer(struct mcp_server_discovery *discovery,
+                                            struct discovery_peer *peer,
+                                            const char *message)
+{
+    struct discovery_pending_proxy *ctx = discovery ? discovery->pending_proxies : NULL;
+
+    while (ctx) {
+        struct discovery_pending_proxy *next = ctx->next;
+
+        if (!peer || ctx->peer == peer) {
+            json_t *result = proxy_error_result(message);
+            pending_proxy_finish_result(ctx, result);
+            json_decref(result);
+        }
+        ctx = next;
+    }
+}
+
+static bool pending_proxy_complete_response(struct discovery_peer_conn *conn, json_t *root)
+{
+    struct discovery_pending_proxy *ctx;
+    json_t *id;
+    const char *id_value;
+    json_t *result;
+    json_t *error;
+
+    id = json_object_get(root, "id");
+    if (!json_is_string(id))
+        return false;
+
+    id_value = json_string_value(id);
+    result = json_object_get(root, "result");
+    error = json_object_get(root, "error");
+
+    for (ctx = conn->discovery->pending_proxies; ctx; ctx = ctx->next) {
+        if (ctx->peer != conn->peer || strcmp(ctx->remote_id, id_value) != 0)
+            continue;
+
+        if (result) {
+            if (ctx->kind == MCP_DISCOVERY_PROXY_TOOLS_LIST)
+                peer_store_tools_list_from_result(ctx->peer, result);
+            pending_proxy_finish_result(ctx, result);
+        } else {
+            json_t *message = json_object_get(error, "message");
+            json_t *tool_result = proxy_error_result(
+                json_is_string(message) ? json_string_value(message) : "Remote proxy call failed.");
+            pending_proxy_finish_result(ctx, tool_result);
+            json_decref(tool_result);
+        }
+        peer_mark_heartbeat_ok(conn->peer);
+        return true;
+    }
+
+    return false;
+}
+
+static bool peer_handle_initialize_response(struct discovery_peer_conn *conn, json_t *root)
+{
+    json_t *id = json_object_get(root, "id");
+
+    if (!json_is_string(id) ||
+        strcmp(json_string_value(id), MCP_DISCOVERY_INITIALIZE_ID) != 0)
+        return false;
+
+    if (json_object_get(root, "result")) {
+        conn->mcp_initialized = true;
+        peer_mark_heartbeat_ok(conn->peer);
+        peer_send_initialized_notification(conn);
+        peer_send_pending_proxies(conn);
+    } else {
+        pending_proxy_complete_for_peer(conn->discovery,
+                                        conn->peer,
+                                        "Remote server initialization failed.");
+        peer_conn_fail(conn);
+    }
+
+    return true;
 }
 
 static json_t *build_offline_params(struct mcp_server_discovery *discovery)
@@ -1011,6 +1410,7 @@ static struct discovery_peer *upsert_peer(struct mcp_server_discovery *discovery
         }
 
         peer->id = id;
+        peer->server_id = discovery->next_server_id++;
         snprintf(peer->ip, sizeof(peer->ip), "%s", ip);
         peer->port = port;
         peer->next = discovery->peers;
@@ -1264,6 +1664,11 @@ static bool discovery_has_pending(const struct mcp_server_discovery *discovery)
     return discovery && discovery->pending_lists;
 }
 
+static bool discovery_has_pending_proxies(const struct mcp_server_discovery *discovery)
+{
+    return discovery && (discovery->pending_proxies || discovery->pending_proxy_closes > 0);
+}
+
 static bool discovery_has_peer_connections(const struct mcp_server_discovery *discovery)
 {
     const struct discovery_peer *peer;
@@ -1286,6 +1691,7 @@ static void discovery_maybe_release(struct mcp_server_discovery *discovery)
     if (discovery->udp_initialized ||
         discovery->announce_timer_initialized ||
         discovery->heartbeat_timer_initialized ||
+        discovery_has_pending_proxies(discovery) ||
         discovery_has_pending(discovery) ||
         discovery_has_peer_connections(discovery))
         return;
@@ -1309,6 +1715,7 @@ int mcp_server_discovery_create(struct mcp_server_discovery **out,
 
     discovery->server = server;
     discovery->loop = loop;
+    discovery->next_server_id = 1;
     discovery->instance_id = make_instance_id();
     if (!discovery->instance_id) {
         free(discovery);
@@ -1323,6 +1730,7 @@ void mcp_server_discovery_destroy(struct mcp_server_discovery *discovery)
 {
     struct discovery_peer *peer;
     struct discovery_pending_list *pending;
+    struct discovery_pending_proxy *proxy;
 
     if (!discovery)
         return;
@@ -1330,6 +1738,7 @@ void mcp_server_discovery_destroy(struct mcp_server_discovery *discovery)
     if (discovery->udp_initialized ||
         discovery->announce_timer_initialized ||
         discovery->heartbeat_timer_initialized ||
+        discovery_has_pending_proxies(discovery) ||
         discovery_has_pending(discovery) ||
         discovery_has_peer_connections(discovery)) {
         discovery->destroy_on_close = true;
@@ -1345,10 +1754,18 @@ void mcp_server_discovery_destroy(struct mcp_server_discovery *discovery)
         pending = next;
     }
 
+    proxy = discovery->pending_proxies;
+    while (proxy) {
+        struct discovery_pending_proxy *next = proxy->next;
+        pending_proxy_free(proxy);
+        proxy = next;
+    }
+
     peer = discovery->peers;
     while (peer) {
         struct discovery_peer *next = peer->next;
         json_decref(peer->status);
+        json_decref(peer->tools_list);
         free(peer->id);
         free(peer);
         peer = next;
@@ -1442,6 +1859,9 @@ void mcp_server_discovery_close(struct mcp_server_discovery *discovery)
     for (peer = discovery->peers; peer; peer = peer->next)
         peer_send_offline(peer->conn);
     discovery_send_offline(discovery);
+    pending_proxy_complete_for_peer(discovery,
+                                    NULL,
+                                    "Remote proxy call cancelled because discovery is closing.");
 
     discovery->opened = false;
 
@@ -1492,6 +1912,104 @@ bool mcp_server_discovery_is_open(const struct mcp_server_discovery *discovery)
     return discovery && discovery->opened && !discovery->closing;
 }
 
+static struct discovery_peer *find_peer_by_server_id(struct mcp_server_discovery *discovery,
+                                                     unsigned int server_id)
+{
+    struct discovery_peer *peer;
+
+    if (!discovery || server_id == 0)
+        return NULL;
+
+    for (peer = discovery->peers; peer; peer = peer->next) {
+        if (peer->server_id == server_id)
+            return peer;
+    }
+
+    return NULL;
+}
+
+bool mcp_server_discovery_server_has_tool(struct mcp_server_discovery *discovery,
+                                          unsigned int server_id,
+                                          const char *tool_name)
+{
+    struct discovery_peer *peer = find_peer_by_server_id(discovery, server_id);
+
+    return peer && tools_list_contains_tool(peer->tools_list, tool_name);
+}
+
+int mcp_server_discovery_call_remote_tool(struct mcp_server_discovery *discovery,
+                                          const char *id_key,
+                                          unsigned int server_id,
+                                          enum mcp_discovery_proxy_kind kind,
+                                          const char *tool_name,
+                                          json_t *arguments)
+{
+    struct discovery_pending_proxy *ctx;
+    struct discovery_peer *peer;
+    int len;
+
+    if (!discovery || !id_key || !tool_name || !json_is_object(arguments))
+        return -1;
+    if (!discovery->opened || discovery->closing)
+        return -1;
+
+    peer = find_peer_by_server_id(discovery, server_id);
+    if (!peer || peer->state == DISCOVERY_PEER_OFFLINE)
+        return -1;
+    if (!peer->conn || !peer->conn->connected)
+        return -1;
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx)
+        return -1;
+
+    ctx->discovery = discovery;
+    ctx->peer = peer;
+    ctx->id_key = mcp_strdup(id_key);
+    ctx->tool_name = mcp_strdup(tool_name);
+    ctx->arguments = json_incref(arguments);
+    ctx->kind = kind;
+    len = snprintf(NULL, 0, "gateway:%s", id_key);
+    if (!ctx->id_key || !ctx->tool_name || len < 0) {
+        pending_proxy_free(ctx);
+        return -1;
+    }
+    ctx->remote_id = malloc((size_t)len + 1);
+    if (!ctx->remote_id) {
+        pending_proxy_free(ctx);
+        return -1;
+    }
+    snprintf(ctx->remote_id, (size_t)len + 1, "gateway:%s", id_key);
+
+    if (uv_timer_init(discovery->loop, &ctx->timer) != 0) {
+        pending_proxy_free(ctx);
+        return -1;
+    }
+    ctx->timer_initialized = true;
+    ctx->timer.data = ctx;
+    uv_timer_start(&ctx->timer, pending_proxy_timeout_cb, MCP_DISCOVERY_PROXY_TIMEOUT_MS, 0);
+
+    ctx->next = discovery->pending_proxies;
+    discovery->pending_proxies = ctx;
+
+    if (!peer->conn->mcp_initialized) {
+        if (peer_send_initialize(peer->conn) == 0)
+            return 0;
+
+        pending_proxy_unlink(ctx);
+        pending_proxy_close(ctx);
+        return -1;
+    }
+
+    if (pending_proxy_send(ctx) == 0)
+        return 0;
+
+    pending_proxy_unlink(ctx);
+    pending_proxy_close(ctx);
+    peer_conn_fail(peer->conn);
+    return -1;
+}
+
 int mcp_server_discovery_list_async(struct mcp_server_discovery *discovery,
                                     const char *id_key,
                                     unsigned int wait_ms)
@@ -1535,19 +2053,22 @@ int mcp_server_discovery_list_async(struct mcp_server_discovery *discovery,
 }
 
 static json_t *build_server_entry(const char *scope,
+                                  unsigned int server_id,
                                   const char *address,
                                   const char *ip,
                                   unsigned int port,
                                   const char *state,
                                   bool tcp_connected,
                                   unsigned long long last_seen_ms,
-                                  json_t *status)
+                                  json_t *status,
+                                  json_t *tools_list)
 {
     json_t *entry = json_object();
 
     if (!entry)
         return NULL;
 
+    json_object_set_new(entry, "server_id", json_integer((json_int_t)server_id));
     json_object_set_new(entry, "address", json_string(address));
     json_object_set_new(entry, "ip", json_string(ip));
     json_object_set_new(entry, "port", json_integer((json_int_t)port));
@@ -1559,6 +2080,8 @@ static json_t *build_server_entry(const char *scope,
         json_object_set(entry, "system_status", status);
     else
         json_object_set_new(entry, "system_status", json_object());
+    if (tools_list)
+        json_object_set(entry, "tools_list", tools_list);
 
     return entry;
 }
@@ -1577,13 +2100,15 @@ static json_t *build_local_server_entry(struct mcp_server_discovery *discovery)
 
     status = mcp_system_status_json();
     entry = build_server_entry("local",
+                               0,
                                address,
                                ip,
                                discovery->tcp_port,
                                "online",
                                true,
                                mcp_now_ms(),
-                               status);
+                               status,
+                               NULL);
     json_decref(status);
     free(address);
     return entry;
@@ -1614,13 +2139,15 @@ json_t *mcp_server_discovery_snapshot_json(struct mcp_server_discovery *discover
         json_t *entry;
 
         entry = build_server_entry("remote",
+                                   peer->server_id,
                                    peer->id,
                                    peer->ip,
                                    peer->port,
                                    peer_state_name(peer->state),
                                    peer->conn && peer->conn->connected,
                                    peer->last_seen_ms,
-                                   peer->status);
+                                   peer->status,
+                                   peer->tools_list);
         if (!entry)
             goto fail;
 

@@ -76,8 +76,15 @@ def verify_tool(proc, request_id, tool_name):
         assert result["isError"] is False, result
         payload = assert_json_text(result)
         assert payload["stdio_transport"] == "enabled", payload
+        assert "remote_calls" in payload, payload
         assert "pipe_transport" in payload, payload
         assert "tcp_transport" in payload, payload
+        return
+
+    if tool_name == "gateway.proxy_tool":
+        result = call_tool(proc, request_id, tool_name, {"server_id": 1, "tool_name": "tools_list"})
+        assert result["isError"] is True, result
+        assert "not available" in parse_text_content(result), result
         return
 
     if tool_name == "server.list_servers":

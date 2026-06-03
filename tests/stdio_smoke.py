@@ -51,6 +51,7 @@ def main():
         names = {tool["name"] for tool in tools["result"]["tools"]}
         assert "system.ping" in names
         assert "gateway.status" in names
+        assert "gateway.proxy_tool" in names
         assert "registry.list_tools" in names
 
         send(

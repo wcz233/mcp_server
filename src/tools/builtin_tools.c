@@ -302,6 +302,38 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
                       1000,
                       tool_gateway_status) != 0)
         return -1;
+
+    if (register_tool(registry,
+                      MCP_GATEWAY_PROXY_TOOL,
+                      "Proxy a tool call to a discovered remote MCP server by stable server_id.",
+                      schema_with_properties(
+                          json_pack("{s:{s:s,s:s,s:i},s:{s:s,s:s},s:{s:s,s:s}}",
+                                    "server_id",
+                                    "type",
+                                    "integer",
+                                    "description",
+                                    "Stable server id from server.list_servers.",
+                                    "minimum",
+                                    1,
+                                    "tool_name",
+                                    "type",
+                                    "string",
+                                    "description",
+                                    "Remote tool name, or tools_list to refresh cached remote tools.",
+                                    "args",
+                                    "type",
+                                    "object",
+                                    "description",
+                                    "Arguments passed to the remote tool."),
+                          json_pack("[s,s]", "server_id", "tool_name")),
+                      "builtin",
+                      "L2",
+                      "gateway.proxy",
+                      false,
+                      false,
+                      5000,
+                      tool_gateway_status) != 0)
+        return -1;
 #endif
 
     if (register_tool(registry,

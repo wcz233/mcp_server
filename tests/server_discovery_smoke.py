@@ -129,12 +129,14 @@ def main():
         tools = call(sock_a, 2, "tools/list", {})["result"]["tools"]
         names = {tool["name"] for tool in tools}
         assert "server.list_servers" in names, names
+        assert "gateway.proxy_tool" in names, names
 
         result = call_tool(sock_a, 3, "server.list_servers", {"wait_ms": 100})
         local_payload = parse_text_json(result)
         assert local_payload["total"] == 1, local_payload
         local = local_payload["servers"][0]
         assert local["address"] == f"127.0.0.1:{tcp_a}", local
+        assert local["server_id"] == 0, local
         assert local["ip"] == "127.0.0.1", local
         assert local["port"] == tcp_a, local
         assert local["scope"] == "local", local
@@ -164,13 +166,46 @@ def main():
         assert payload["total"] >= 2, payload
         local = next(server for server in payload["servers"] if server["address"] == f"127.0.0.1:{tcp_a}")
         assert local["scope"] == "local", local
+        assert local["server_id"] == 0, local
         peer = next(server for server in payload["servers"] if server["address"] == f"127.0.0.1:{tcp_b}")
+        peer_server_id = peer["server_id"]
+        assert peer_server_id > 0, peer
         assert peer["ip"] == "127.0.0.1", peer
         assert peer["port"] == tcp_b, peer
         assert peer["scope"] == "remote", peer
         assert peer["state"] == "online", peer
         assert "system_status" in peer, peer
         assert "hostname" in peer["system_status"], peer
+
+        result = call_tool(
+            sock_a,
+            5,
+            "gateway.proxy_tool",
+            {"server_id": peer_server_id, "tool_name": "tools_list", "args": {}},
+        )
+        tools_payload = parse_text_json(result)
+        remote_tool_names = {tool["name"] for tool in tools_payload["tools"]}
+        assert "system.ping" in remote_tool_names, tools_payload
+        assert "gateway.proxy_tool" in remote_tool_names, tools_payload
+
+        result = call_tool(sock_a, 6, "server.list_servers", {"wait_ms": 100})
+        cached_payload = parse_text_json(result)
+        cached_peer = next(
+            server for server in cached_payload["servers"] if server["address"] == f"127.0.0.1:{tcp_b}"
+        )
+        assert cached_peer["server_id"] == peer_server_id, cached_peer
+        assert "tools_list" in cached_peer, cached_peer
+        cached_names = {tool["name"] for tool in cached_peer["tools_list"]["tools"]}
+        assert "system.ping" in cached_names, cached_peer
+
+        result = call_tool(
+            sock_a,
+            7,
+            "gateway.proxy_tool",
+            {"server_id": peer_server_id, "tool_name": "system.ping", "args": {}},
+        )
+        assert result["isError"] is False, result
+        assert result["content"][0]["text"] == "pong", result
 
         proc_b.send_signal(signal.SIGINT)
         proc_b.wait(timeout=5)
@@ -179,7 +214,7 @@ def main():
         offline_payload = None
         deadline = time.time() + 5
         while time.time() < deadline:
-            result = call_tool(sock_a, 5, "server.list_servers", {"wait_ms": 100})
+            result = call_tool(sock_a, 8, "server.list_servers", {"wait_ms": 100})
             offline_payload = parse_text_json(result)
             peer = next(
                 (
@@ -195,6 +230,7 @@ def main():
 
         assert offline_payload is not None, "missing offline response"
         peer = next(server for server in offline_payload["servers"] if server["address"] == f"127.0.0.1:{tcp_b}")
+        assert peer["server_id"] == peer_server_id, peer
         assert peer["state"] == "offline", peer
         assert peer["tcp_connected"] is False, peer
 
@@ -206,7 +242,7 @@ def main():
         restarted_payload = None
         deadline = time.time() + 5
         while time.time() < deadline:
-            result = call_tool(sock_a, 6, "server.list_servers", {"wait_ms": 500})
+            result = call_tool(sock_a, 9, "server.list_servers", {"wait_ms": 500})
             restarted_payload = parse_text_json(result)
             peer = next(
                 (
@@ -222,6 +258,7 @@ def main():
 
         assert restarted_payload is not None, "missing restarted peer response"
         peer = next(server for server in restarted_payload["servers"] if server["address"] == f"127.0.0.1:{tcp_b}")
+        assert peer["server_id"] == peer_server_id, peer
         assert peer["state"] == "online", peer
         assert peer["tcp_connected"] is True, peer
     finally:
