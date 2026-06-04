@@ -132,6 +132,58 @@ int mcp_tool_registry_register(struct mcp_tool_registry *registry,
     return 0;
 }
 
+int mcp_tool_registry_unregister(struct mcp_tool_registry *registry, const char *name)
+{
+    size_t i;
+
+    if (!registry || !name)
+        return -1;
+
+    for (i = 0; i < registry->count; i++) {
+        struct mcp_tool_descriptor *descriptor = &registry->tools[i].descriptor;
+
+        if (strcmp(descriptor->name, name) != 0)
+            continue;
+
+        descriptor_cleanup(descriptor);
+        if (i + 1 < registry->count) {
+            memmove(&registry->tools[i],
+                    &registry->tools[i + 1],
+                    (registry->count - i - 1) * sizeof(registry->tools[i]));
+        }
+        registry->count--;
+        registry->version++;
+        return 0;
+    }
+
+    return -1;
+}
+
+int mcp_tool_registry_set_enabled(struct mcp_tool_registry *registry,
+                                  const char *name,
+                                  bool enabled)
+{
+    size_t i;
+
+    if (!registry || !name)
+        return -1;
+
+    for (i = 0; i < registry->count; i++) {
+        struct mcp_tool_descriptor *descriptor = &registry->tools[i].descriptor;
+
+        if (strcmp(descriptor->name, name) != 0)
+            continue;
+
+        if (descriptor->enabled != enabled) {
+            descriptor->enabled = enabled;
+            registry->version++;
+        }
+        return 0;
+    }
+
+    return -1;
+}
+
 const struct mcp_tool_descriptor *mcp_tool_registry_find(struct mcp_tool_registry *registry,
                                                          const char *name)
 {

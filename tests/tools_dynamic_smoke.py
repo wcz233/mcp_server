@@ -110,13 +110,13 @@ def verify_tool(proc, request_id, tool_name):
     if tool_name == "plugin_tools.insmod":
         result = call_tool(proc, request_id, tool_name, {"package_path": "dummy"})
         assert result["isError"] is True, result
-        assert "not implemented" in parse_text_content(result), result
+        assert "dummy" in parse_text_content(result) or "Failed" in parse_text_content(result), result
         return
 
     if tool_name == "plugin_tools.rmmod":
         result = call_tool(proc, request_id, tool_name, {"plugin_id": "dummy"})
         assert result["isError"] is True, result
-        assert "not implemented" in parse_text_content(result), result
+        assert "not active" in parse_text_content(result), result
         return
 
     if tool_name == "embedded.get_protocol_info":

@@ -356,6 +356,24 @@ static bool tool_visible_in_snapshot(const json_t *snapshot, const char *tool_na
     return false;
 }
 
+static int refresh_tool_snapshot(struct mcp_client_session *session,
+                                 struct mcp_tool_registry *registry)
+{
+    json_t *snapshot = mcp_tool_registry_public_list(registry);
+
+    if (!snapshot)
+        return -1;
+    json_decref(session->tool_snapshot);
+    session->tool_snapshot = snapshot;
+    return 0;
+}
+
+static bool tool_call_mutates_registry(const char *tool_name)
+{
+    return strcmp(tool_name, "plugin_tools.insmod") == 0 ||
+           strcmp(tool_name, "plugin_tools.rmmod") == 0;
+}
+
 static bool tool_call_is_list_servers(const char *tool_name)
 {
     return strcmp(tool_name, MCP_SERVER_LIST_SERVERS_TOOL) == 0;
@@ -466,6 +484,12 @@ static void handle_request(struct mcp_server *server,
     }
 
     if (strcmp(message->method, "initialize") == 0) {
+        json_t *peer_identity = json_object_get(message->params, "mcp_peer_identity");
+
+        if (peer_identity && mcp_server_discovery_enabled(server))
+            session->peer_server_id =
+                mcp_server_discovery_note_peer_identity(server->discovery, peer_identity);
+
         result = build_initialize_result();
         send_result_to(server, reply_to, message->id, result);
         json_decref(result);
@@ -478,8 +502,10 @@ static void handle_request(struct mcp_server *server,
     }
 
     if (strcmp(message->method, "tools/list") == 0) {
-        if (!session->tool_snapshot)
-            session->tool_snapshot = mcp_tool_registry_public_list(server->registry);
+        if (refresh_tool_snapshot(session, server->registry) != 0) {
+            send_error_to(server, reply_to, message->id, -32603, "Internal error");
+            return;
+        }
         send_result_to(server, reply_to, message->id, session->tool_snapshot);
         return;
     }
@@ -496,7 +522,7 @@ static void handle_request(struct mcp_server *server,
         if (!tool_visible_in_snapshot(session->tool_snapshot, tool_name)) {
             json_decref(arguments);
             result = mcp_tool_result_text(
-                "Tool is not visible in current session snapshot. Refresh tools/list or start a new session.",
+                "Tool is not visible in current session snapshot. Call tools/list to refresh this session.",
                 true);
             send_result_to(server, reply_to, message->id, result);
             json_decref(result);
@@ -558,6 +584,20 @@ static void handle_request(struct mcp_server *server,
 
         if (rc == MCP_GATEWAY_PENDING) {
             free(id_key);
+            return;
+        }
+
+        if (tool_call_mutates_registry(tool_name) &&
+            refresh_tool_snapshot(session, server->registry) != 0) {
+            if (result)
+                json_decref(result);
+            if (error)
+                json_decref(error);
+            entry = mcp_in_flight_remove(&server->in_flight, id_key);
+            if (entry)
+                free_in_flight_entry(entry);
+            free(id_key);
+            send_error_to(server, reply_to, message->id, -32603, "Internal error");
             return;
         }
 
@@ -721,6 +761,30 @@ static void udp_on_error(void *arg, int status)
 }
 #endif
 
+static bool framed_maybe_dispatch_binary(struct mcp_server *server,
+                                         struct mcp_framed_connection *conn,
+                                         const char *data,
+                                         size_t len)
+{
+    struct mcp_reply_target reply_to;
+    struct mcp_client_session *session;
+
+    if (!data || len == 0 || data[0] == '{')
+        return false;
+
+    memset(&reply_to, 0, sizeof(reply_to));
+    reply_to.transport = MCP_REPLY_STREAM;
+    reply_to.stream = conn;
+    session = client_session_for_reply(server, &reply_to, false);
+    if (!session || session->peer_server_id == 0)
+        return false;
+
+    return mcp_peer_transport_dispatch_frame(server->peer_transport,
+                                             session->peer_server_id,
+                                             data,
+                                             len) == 0;
+}
+
 static void framed_on_message(void *arg,
                               struct mcp_framed_connection *conn,
                               const char *data,
@@ -732,6 +796,9 @@ static void framed_on_message(void *arg,
     json_t *error = NULL;
 
     if (server->shutting_down)
+        return;
+
+    if (framed_maybe_dispatch_binary(server, conn, data, len))
         return;
 
     memset(&reply_to, 0, sizeof(reply_to));
@@ -824,6 +891,11 @@ int mcp_server_init(struct mcp_server **out, uv_loop_t *loop, struct mcp_server_
     server->core_async.data = server;
 
     if (mcp_tool_registry_create(&server->registry) != 0 ||
+        mcp_peer_transport_create(&server->peer_transport,
+                                  loop,
+                                  config.max_line_bytes,
+                                  4 * config.max_line_bytes) != 0 ||
+        mcp_plugin_manager_create(&server->plugin_manager, server) != 0 ||
         mcp_gateway_create(&server->gateway, server->registry) != 0 ||
         mcp_server_discovery_create(&server->discovery, server, loop) != 0 ||
         mcp_register_builtin_tools(server, server->registry) != 0) {
@@ -859,8 +931,10 @@ void mcp_server_destroy(struct mcp_server *server)
         session = next;
     }
     mcp_gateway_destroy(server->gateway);
-    mcp_tool_registry_destroy(server->registry);
+    mcp_plugin_manager_destroy(server->plugin_manager);
     mcp_server_discovery_destroy(server->discovery);
+    mcp_peer_transport_destroy(server->peer_transport);
+    mcp_tool_registry_destroy(server->registry);
     mcp_in_flight_destroy(&server->in_flight);
 #if MCP_HAS_TRANSPORT_UDP
     mcp_udp_transport_destroy(server->udp);

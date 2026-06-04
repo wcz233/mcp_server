@@ -3,6 +3,7 @@
 #include "common/platform.h"
 #include "core/server_internal.h"
 #include "mcp/embedded/mep.h"
+#include "plugin/plugin_manager.h"
 #include "tools/shell_exec.h"
 #include "tools/system_status.h"
 #include "tools/tool_result.h"
@@ -139,28 +140,68 @@ static int tool_plugin_lsmod(struct mcp_server *server,
 {
     json_t *plugins;
 
-    (void)server;
     (void)invocation;
 
-    plugins = json_pack("{s:[],s:s}",
-                        "plugins",
-                        "note",
-                        "Dynamic plugin loading is reserved for the next implementation stage.");
+    plugins = mcp_plugin_manager_lsmod(server->plugin_manager);
     *out_result = mcp_tool_result_json_text(plugins, false);
     json_decref(plugins);
     return 0;
 }
 
-static int tool_plugin_unsupported(struct mcp_server *server,
-                                   const struct mcp_tool_invocation *invocation,
-                                   json_t **out_result)
+static int tool_plugin_insmod(struct mcp_server *server,
+                              const struct mcp_tool_invocation *invocation,
+                              json_t **out_result)
 {
-    (void)server;
-    (void)invocation;
+    json_t *package_path;
+    json_t *enable;
+    json_t *payload = NULL;
+    const char *error = NULL;
 
-    *out_result = mcp_tool_result_text(
-        "Dynamic plugin load/unload is not implemented in this initial build.",
-        true);
+    package_path = json_object_get(invocation->arguments, "package_path");
+    enable = json_object_get(invocation->arguments, "enable");
+    if (!json_is_string(package_path)) {
+        *out_result = mcp_tool_result_text("plugin_tools.insmod requires package_path.", true);
+        return 0;
+    }
+
+    if (mcp_plugin_manager_insmod(server->plugin_manager,
+                                  json_string_value(package_path),
+                                  !json_is_false(enable),
+                                  &payload,
+                                  &error) != 0) {
+        *out_result = mcp_tool_result_text(error ? error : "Failed to load plugin.", true);
+        return 0;
+    }
+
+    *out_result = mcp_tool_result_json_text(payload, false);
+    json_decref(payload);
+    return 0;
+}
+
+static int tool_plugin_rmmod(struct mcp_server *server,
+                             const struct mcp_tool_invocation *invocation,
+                             json_t **out_result)
+{
+    json_t *plugin_id;
+    json_t *payload = NULL;
+    const char *error = NULL;
+
+    plugin_id = json_object_get(invocation->arguments, "plugin_id");
+    if (!json_is_string(plugin_id)) {
+        *out_result = mcp_tool_result_text("plugin_tools.rmmod requires plugin_id.", true);
+        return 0;
+    }
+
+    if (mcp_plugin_manager_rmmod(server->plugin_manager,
+                                 json_string_value(plugin_id),
+                                 &payload,
+                                 &error) != 0) {
+        *out_result = mcp_tool_result_text(error ? error : "Failed to unload plugin.", true);
+        return 0;
+    }
+
+    *out_result = mcp_tool_result_json_text(payload, false);
+    json_decref(payload);
     return 0;
 }
 
@@ -409,7 +450,7 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
                       false,
                       false,
                       5000,
-                      tool_plugin_unsupported) != 0)
+                      tool_plugin_insmod) != 0)
         return -1;
 
     if (register_tool(registry,
@@ -424,7 +465,7 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
                       false,
                       false,
                       5000,
-                      tool_plugin_unsupported) != 0)
+                      tool_plugin_rmmod) != 0)
         return -1;
 #endif
 

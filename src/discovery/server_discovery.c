@@ -4,6 +4,7 @@
 #include "core/server_internal.h"
 #include "tools/system_status.h"
 #include "tools/tool_result.h"
+#include "transport/peer_transport.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -150,6 +151,10 @@ static void pending_proxy_complete_for_peer(struct mcp_server_discovery *discove
                                             const char *message);
 static bool pending_proxy_complete_response(struct discovery_peer_conn *conn, json_t *root);
 static bool peer_handle_initialize_response(struct discovery_peer_conn *conn, json_t *root);
+static int discovery_external_send_frame(void *arg,
+                                         unsigned int server_id,
+                                         const void *payload,
+                                         size_t len);
 
 static uint32_t read_u32_be(const char *data)
 {
@@ -682,6 +687,9 @@ static void peer_conn_close_cb(uv_handle_t *handle)
     struct discovery_peer_conn *conn = handle->data;
     struct mcp_server_discovery *discovery = conn ? conn->discovery : NULL;
 
+    if (discovery && conn && conn->peer)
+        mcp_peer_transport_notify_closed(discovery->server->peer_transport,
+                                         conn->peer->server_id);
     peer_conn_free(conn);
     discovery_maybe_release(discovery);
 }
@@ -741,6 +749,15 @@ static void peer_conn_handle_frame(struct discovery_peer_conn *conn, const char 
     json_t *method;
     json_t *result;
     json_t *params;
+
+    if (len == 0 || data[0] != '{') {
+        if (mcp_peer_transport_dispatch_frame(conn->discovery->server->peer_transport,
+                                              conn->peer->server_id,
+                                              data,
+                                              len) != 0)
+            peer_conn_fail(conn);
+        return;
+    }
 
     root = json_loadb(data, len, JSON_REJECT_DUPLICATES, &error);
     if (!root)
@@ -832,6 +849,8 @@ static void peer_connect_cb(uv_connect_t *req, int status)
 
     conn->connected = true;
     peer_mark_heartbeat_ok(conn->peer);
+    mcp_peer_transport_notify_connected(conn->discovery->server->peer_transport,
+                                        conn->peer->server_id);
     if (uv_read_start((uv_stream_t *)&conn->tcp, peer_conn_alloc_cb, peer_conn_read_cb) != 0)
         peer_conn_fail(conn);
     else if (peer_send_initialize(conn) != 0)
@@ -927,6 +946,25 @@ static int peer_send_frame(struct discovery_peer_conn *conn,
     }
 
     return 0;
+}
+
+static int discovery_external_send_frame(void *arg,
+                                         unsigned int server_id,
+                                         const void *payload,
+                                         size_t len)
+{
+    struct mcp_server_discovery *discovery = arg;
+    struct discovery_peer *peer;
+
+    if (!discovery || server_id == 0 || !payload || len == 0)
+        return -1;
+
+    for (peer = discovery->peers; peer; peer = peer->next) {
+        if (peer->server_id == server_id)
+            return peer_send_frame(peer->conn, payload, len, false);
+    }
+
+    return -1;
 }
 
 static void pending_proxy_unlink(struct discovery_pending_proxy *ctx)
@@ -1174,6 +1212,11 @@ static int peer_send_initialize(struct discovery_peer_conn *conn)
     json_object_set_new(client_info, "name", json_string("mcp_gateway"));
     json_object_set_new(client_info, "version", json_string(MCP_SERVER_VERSION));
     json_object_set_new(params, "clientInfo", client_info);
+    {
+        json_t *identity = mcp_server_discovery_local_identity(conn->discovery);
+        if (identity)
+            json_object_set_new(params, "mcp_peer_identity", identity);
+    }
     json_object_set_new(request, "params", params);
 
     dumped = json_dumps(request, JSON_COMPACT | JSON_ENSURE_ASCII);
@@ -1495,6 +1538,66 @@ bool mcp_server_discovery_handle_offline_notification(struct mcp_server_discover
                              status);
 }
 
+json_t *mcp_server_discovery_local_identity(struct mcp_server_discovery *discovery)
+{
+    json_t *identity;
+    json_t *status;
+    char ip[64];
+
+    if (!discovery)
+        return NULL;
+
+    identity = json_object();
+    if (!identity)
+        return NULL;
+
+    if (!discovery_local_ip(discovery, ip, sizeof(ip)))
+        snprintf(ip, sizeof(ip), "127.0.0.1");
+    status = mcp_system_status_json();
+    if (!status)
+        status = json_object();
+
+    json_object_set_new(identity, "instance_id", json_string(discovery->instance_id));
+    json_object_set_new(identity, "ip", json_string(ip));
+    json_object_set_new(identity, "port", json_integer((json_int_t)discovery->tcp_port));
+    json_object_set_new(identity, "status", status);
+    return identity;
+}
+
+unsigned int mcp_server_discovery_note_peer_identity(struct mcp_server_discovery *discovery,
+                                                     json_t *identity)
+{
+    json_t *ip;
+    json_t *port;
+    json_t *status;
+    struct discovery_peer *peer;
+
+    if (!discovery || !json_is_object(identity))
+        return 0;
+
+    ip = json_object_get(identity, "ip");
+    port = json_object_get(identity, "port");
+    status = json_object_get(identity, "status");
+    if (!json_is_string(ip) ||
+        !json_is_integer(port) ||
+        json_integer_value(port) < 0 ||
+        json_integer_value(port) > 65535)
+        return 0;
+    if (status && !json_is_object(status))
+        status = NULL;
+
+    peer = upsert_peer(discovery,
+                       json_string_value(ip),
+                       (unsigned int)json_integer_value(port),
+                       status,
+                       DISCOVERY_PEER_ONLINE);
+    if (!peer)
+        return 0;
+
+    mcp_peer_transport_notify_connected(discovery->server->peer_transport, peer->server_id);
+    return peer->server_id;
+}
+
 static void discovery_on_datagram(uv_udp_t *handle,
                                   ssize_t nread,
                                   const uv_buf_t *buf,
@@ -1733,6 +1836,10 @@ int mcp_server_discovery_create(struct mcp_server_discovery **out,
         return -1;
     }
 
+    mcp_peer_transport_set_external_sender(server->peer_transport,
+                                           discovery_external_send_frame,
+                                           discovery);
+
     *out = discovery;
     return 0;
 }
@@ -1745,6 +1852,9 @@ void mcp_server_discovery_destroy(struct mcp_server_discovery *discovery)
 
     if (!discovery)
         return;
+
+    if (discovery->server && discovery->server->peer_transport)
+        mcp_peer_transport_set_external_sender(discovery->server->peer_transport, NULL, NULL);
 
     if (discovery->udp_initialized ||
         discovery->announce_timer_initialized ||

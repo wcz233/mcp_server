@@ -9,6 +9,7 @@
   "merge_stderr": false,
   "execution": {
     "mode": "shell",
+    "working_directory": ".",
     "clear_environment": true,
     "run_as_user": "",
     "run_as_group": "",

@@ -7,6 +7,8 @@
 #include "mcp/registry/tool_registry.h"
 #include "discovery/server_discovery.h"
 #include "listener/framed_listener.h"
+#include "plugin/plugin_manager.h"
+#include "transport/peer_transport.h"
 #include "transport/stdio_transport.h"
 #include "transport/udp_transport.h"
 
@@ -20,6 +22,7 @@ struct mcp_client_session {
     enum mcp_session_state state;
     struct mcp_reply_target reply_to;
     json_t *tool_snapshot;
+    unsigned int peer_server_id;
     struct mcp_client_session *next;
 };
 
@@ -43,6 +46,8 @@ struct mcp_server {
     struct mcp_in_flight_map in_flight;
     struct mcp_tool_registry *registry;
     struct mcp_gateway *gateway;
+    struct mcp_plugin_manager *plugin_manager;
+    struct mcp_peer_transport *peer_transport;
     struct mcp_server_discovery *discovery;
     char *tcp_host;
     unsigned int tcp_port;

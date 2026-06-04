@@ -3,6 +3,7 @@
 #include "core/server_internal.h"
 #include "discovery/server_discovery.h"
 #include "mcp/registry/tool_registry.h"
+#include "plugin/plugin_manager.h"
 #include "protocol/jsonrpc.h"
 #include "tools/tool_result.h"
 
@@ -156,6 +157,7 @@ int mcp_gateway_call(struct mcp_gateway *gateway,
 {
     const struct mcp_tool_descriptor *descriptor;
     struct mcp_tool_invocation invocation;
+    int rc;
 
     *out_result = NULL;
     *out_error = NULL;
@@ -164,7 +166,7 @@ int mcp_gateway_call(struct mcp_gateway *gateway,
     if (!snapshot_contains_tool(session_snapshot, tool_name)) {
         gateway->rejected_calls++;
         *out_result = mcp_tool_result_text(
-            "Tool is not visible in current session snapshot. Refresh tools/list or start a new session.",
+            "Tool is not visible in current session snapshot. Call tools/list to refresh this session.",
             true);
         return MCP_GATEWAY_TOOL_ERROR;
     }
@@ -180,6 +182,26 @@ int mcp_gateway_call(struct mcp_gateway *gateway,
     if (!descriptor) {
         gateway->rejected_calls++;
         *out_result = mcp_tool_result_text("Tool is not loaded or has been disabled.", true);
+        return MCP_GATEWAY_TOOL_ERROR;
+    }
+
+    if (descriptor->route == MCP_TOOL_ROUTE_LOCAL_MODULE) {
+        rc = mcp_plugin_manager_invoke(server->plugin_manager,
+                                       descriptor,
+                                       id_key,
+                                       invocation_id,
+                                       tool_name,
+                                       arguments,
+                                       out_result);
+        if (rc == MCP_PLUGIN_CALL_PENDING) {
+            gateway->local_calls++;
+            return MCP_GATEWAY_PENDING;
+        }
+        if (rc == MCP_PLUGIN_CALL_OK) {
+            gateway->local_calls++;
+            return MCP_GATEWAY_OK;
+        }
+        gateway->rejected_calls++;
         return MCP_GATEWAY_TOOL_ERROR;
     }
 
