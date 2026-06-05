@@ -8,6 +8,7 @@
 #include "plugins/file_transfer/file_transfer_plugin.h"
 #endif
 #include "tools/builtin_tools.h"
+#include "tools/shell_exec.h"
 #include "tools/tool_result.h"
 
 #include <jansson.h>
@@ -329,6 +330,7 @@ static void close_runtime_handles(struct mcp_server *server)
     mcp_framed_listener_close(server->pipe_listener);
     mcp_framed_listener_close(server->tcp_listener);
     mcp_stdio_transport_close(server->stdio);
+    mcp_shell_jobs_shutdown(server->shell_jobs);
     if (server->core_async_initialized &&
         !uv_is_closing((uv_handle_t *)&server->core_async))
         uv_close((uv_handle_t *)&server->core_async, NULL);
@@ -921,6 +923,7 @@ int mcp_server_init(struct mcp_server **out, uv_loop_t *loop, struct mcp_server_
         mcp_plugin_manager_create(&server->plugin_manager, server) != 0 ||
         mcp_gateway_create(&server->gateway, server->registry) != 0 ||
         mcp_server_discovery_create(&server->discovery, server, loop) != 0 ||
+        mcp_shell_jobs_create(&server->shell_jobs, server, loop) != 0 ||
         register_builtin_plugins(server) != 0 ||
         mcp_register_builtin_tools(server, server->registry) != 0) {
         mcp_server_destroy(server);
@@ -954,9 +957,11 @@ void mcp_server_destroy(struct mcp_server *server)
         free(session);
         session = next;
     }
+    mcp_shell_jobs_shutdown(server->shell_jobs);
     mcp_gateway_destroy(server->gateway);
     mcp_plugin_manager_destroy(server->plugin_manager);
     mcp_server_discovery_destroy(server->discovery);
+    mcp_shell_jobs_destroy(server->shell_jobs);
     mcp_peer_transport_destroy(server->peer_transport);
     mcp_tool_registry_destroy(server->registry);
     mcp_in_flight_destroy(&server->in_flight);

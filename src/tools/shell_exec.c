@@ -1,6 +1,7 @@
 #include "tools/shell_exec.h"
 
 #include "common/platform.h"
+#include "core/server_internal.h"
 #include "tools/tool_result.h"
 
 #include <ctype.h>
@@ -50,10 +51,22 @@
 #define MCP_SHELL_EXEC_DEFAULT_FILE_SIZE_BYTES 10485760u
 #define MCP_SHELL_EXEC_DEFAULT_OPEN_FILES 64u
 #define MCP_SHELL_EXEC_DEFAULT_PROCESSES 16u
+#define MCP_SHELL_JOB_POLL_MS 50u
+#define MCP_SHELL_JOB_DEFAULT_RETENTION_MS 600000u
+#define MCP_SHELL_JOB_MAX_RETENTION_MS 3600000u
+#define MCP_SHELL_JOB_WAIT_MAX_MS 5000u
 
 enum shell_exec_mode {
     SHELL_EXEC_MODE_SHELL = 0,
     SHELL_EXEC_MODE_EXEC = 1,
+};
+
+enum shell_job_state {
+    SHELL_JOB_RUNNING = 1,
+    SHELL_JOB_EXITED,
+    SHELL_JOB_TIMED_OUT,
+    SHELL_JOB_KILLED,
+    SHELL_JOB_FAILED,
 };
 
 struct shell_exec_env_var {
@@ -115,7 +128,76 @@ struct shell_exec_outcome {
     char *spawn_error;
 };
 
+struct shell_job {
+    char *job_id;
+    char *command;
+    char *label;
+    enum shell_job_state state;
+    struct shell_exec_buffer stdout_buf;
+    struct shell_exec_buffer stderr_buf;
+    unsigned int timeout_ms;
+    unsigned int output_limit_bytes;
+    unsigned int chunk_size;
+    unsigned long long started_ms;
+    unsigned long long deadline_ms;
+    unsigned long long finished_ms;
+    char started_at[48];
+    char finished_at[48];
+    int exit_code;
+    int signal_number;
+    bool timed_out_requested;
+    bool killed_requested;
+    bool stdout_open;
+    bool stderr_open;
+    bool process_reaped;
+    bool kill_process_group;
+#ifndef _WIN32
+    pid_t pid;
+    pid_t process_group_id;
+    int stdout_fd;
+    int stderr_fd;
+#else
+    int pid;
+    int process_group_id;
+#endif
+    struct shell_job *next;
+};
+
+struct mcp_shell_job_store {
+    struct mcp_server *server;
+    uv_loop_t *loop;
+    uv_timer_t poll_timer;
+    bool poll_timer_initialized;
+    bool poll_timer_running;
+    bool shutting_down;
+    unsigned long long next_job_number;
+    unsigned int retention_ms;
+    struct shell_job *jobs;
+};
+
 static int shell_exec_prepare_working_directory(const struct shell_exec_config *cfg);
+
+static const char *shell_job_state_name(enum shell_job_state state)
+{
+    switch (state) {
+    case SHELL_JOB_RUNNING:
+        return "running";
+    case SHELL_JOB_EXITED:
+        return "exited";
+    case SHELL_JOB_TIMED_OUT:
+        return "timed_out";
+    case SHELL_JOB_KILLED:
+        return "killed";
+    case SHELL_JOB_FAILED:
+        return "failed";
+    }
+    return "failed";
+}
+
+static bool shell_job_is_final(const struct shell_job *job)
+{
+    return job && job->state != SHELL_JOB_RUNNING;
+}
 
 static bool env_bool(const char *name, bool default_value)
 {
@@ -926,6 +1008,58 @@ static unsigned int shell_exec_resolve_timeout(const struct shell_exec_config *c
     return clamp_uint(parsed, cfg->default_timeout_ms, MCP_SHELL_EXEC_MIN_TIMEOUT_MS, cfg->max_timeout_ms);
 }
 
+static unsigned int shell_exec_resolve_output_limit(const struct shell_exec_config *cfg,
+                                                    const struct mcp_tool_invocation *invocation)
+{
+    json_t *value = json_object_get(invocation->arguments, "output_limit_bytes");
+    unsigned long parsed;
+
+    if (!json_is_integer(value))
+        return cfg->max_output_bytes;
+
+    parsed = (unsigned long)json_integer_value(value);
+    return clamp_uint(parsed, cfg->max_output_bytes, 256u, cfg->max_output_bytes);
+}
+
+static bool shell_job_string_arg(json_t *arguments, const char *name, const char **out)
+{
+    json_t *value = json_object_get(arguments, name);
+
+    *out = NULL;
+    if (!value)
+        return true;
+    if (!json_is_string(value))
+        return false;
+
+    *out = json_string_value(value);
+    return true;
+}
+
+static bool shell_job_uint_arg(json_t *arguments,
+                               const char *name,
+                               unsigned int default_value,
+                               unsigned int min_value,
+                               unsigned int max_value,
+                               unsigned int *out)
+{
+    json_t *value = json_object_get(arguments, name);
+    json_int_t raw;
+
+    if (!value) {
+        *out = default_value;
+        return true;
+    }
+    if (!json_is_integer(value))
+        return false;
+
+    raw = json_integer_value(value);
+    if (raw < (json_int_t)min_value || raw > (json_int_t)max_value)
+        return false;
+
+    *out = (unsigned int)raw;
+    return true;
+}
+
 static const char *shell_exec_mode_name(enum shell_exec_mode mode)
 {
     return mode == SHELL_EXEC_MODE_EXEC ? "exec" : "shell";
@@ -1717,6 +1851,618 @@ static int shell_exec_spawn(const struct shell_exec_config *cfg,
 #endif
 }
 
+static int shell_job_make_id(struct mcp_shell_job_store *store, char **out)
+{
+    int len;
+    char *id;
+
+    *out = NULL;
+    len = snprintf(NULL, 0, "job-%llu", ++store->next_job_number);
+    if (len < 0)
+        return -1;
+
+    id = malloc((size_t)len + 1u);
+    if (!id)
+        return -1;
+
+    snprintf(id, (size_t)len + 1u, "job-%llu", store->next_job_number);
+    *out = id;
+    return 0;
+}
+
+static void shell_job_mark_finished(struct shell_job *job, enum shell_job_state state)
+{
+    if (!job || job->finished_ms != 0)
+        return;
+
+    job->state = state;
+    job->finished_ms = mcp_now_ms();
+    if (!mcp_format_utc_now(job->finished_at, sizeof(job->finished_at)))
+        snprintf(job->finished_at, sizeof(job->finished_at), "unknown-time");
+}
+
+static void shell_job_close_pipes(struct shell_job *job)
+{
+#ifndef _WIN32
+    if (!job)
+        return;
+    if (job->stdout_fd >= 0) {
+        close(job->stdout_fd);
+        job->stdout_fd = -1;
+    }
+    if (job->stderr_fd >= 0) {
+        close(job->stderr_fd);
+        job->stderr_fd = -1;
+    }
+    job->stdout_open = false;
+    job->stderr_open = false;
+#else
+    (void)job;
+#endif
+}
+
+static void shell_job_free(struct shell_job *job)
+{
+    if (!job)
+        return;
+
+    shell_job_close_pipes(job);
+    free(job->job_id);
+    free(job->command);
+    free(job->label);
+    shell_exec_buffer_destroy(&job->stdout_buf);
+    shell_exec_buffer_destroy(&job->stderr_buf);
+    free(job);
+}
+
+static struct shell_job *shell_job_find(struct mcp_shell_job_store *store,
+                                        const char *job_id)
+{
+    struct shell_job *job;
+
+    if (!store || !job_id)
+        return NULL;
+    for (job = store->jobs; job; job = job->next) {
+        if (strcmp(job->job_id, job_id) == 0)
+            return job;
+    }
+    return NULL;
+}
+
+static int shell_job_append(struct mcp_shell_job_store *store, struct shell_job *job)
+{
+    if (shell_job_make_id(store, &job->job_id) != 0)
+        return -1;
+
+    job->next = store->jobs;
+    store->jobs = job;
+    return 0;
+}
+
+static bool shell_job_needs_poll(const struct shell_job *job)
+{
+    return job &&
+           (!job->process_reaped || job->stdout_open || job->stderr_open);
+}
+
+static void shell_jobs_cleanup_expired(struct mcp_shell_job_store *store)
+{
+    struct shell_job **current;
+    unsigned long long now;
+
+    if (!store)
+        return;
+
+    now = mcp_now_ms();
+    current = &store->jobs;
+    while (*current) {
+        struct shell_job *job = *current;
+
+        if (shell_job_is_final(job) &&
+            !shell_job_needs_poll(job) &&
+            job->finished_ms > 0 &&
+            now - job->finished_ms > store->retention_ms) {
+            *current = job->next;
+            job->next = NULL;
+            shell_job_free(job);
+            continue;
+        }
+        current = &(*current)->next;
+    }
+}
+
+static json_t *shell_job_status_json(const struct shell_job *job)
+{
+    json_t *payload;
+
+    if (!job)
+        return NULL;
+
+    payload = json_pack("{s:s,s:s,s:i,s:i,s:s,s:s,s:i,s:i,s:i,s:i,s:b,s:b,s:i,s:i}",
+                        "job_id",
+                        job->job_id,
+                        "state",
+                        shell_job_state_name(job->state),
+                        "pid",
+                        (json_int_t)job->pid,
+                        "process_group_id",
+                        (json_int_t)job->process_group_id,
+                        "started_at",
+                        job->started_at,
+                        "command",
+                        job->command ? job->command : "",
+                        "timeout_ms",
+                        (json_int_t)job->timeout_ms,
+                        "deadline_ms",
+                        (json_int_t)job->deadline_ms,
+                        "stdout_bytes",
+                        (json_int_t)job->stdout_buf.len,
+                        "stderr_bytes",
+                        (json_int_t)job->stderr_buf.len,
+                        "stdout_truncated",
+                        job->stdout_buf.truncated,
+                        "stderr_truncated",
+                        job->stderr_buf.truncated,
+                        "exit_code",
+                        (json_int_t)job->exit_code,
+                        "signal",
+                        (json_int_t)job->signal_number);
+    if (!payload)
+        return NULL;
+
+    if (job->label)
+        json_object_set_new(payload, "label", json_string(job->label));
+    if (job->finished_at[0])
+        json_object_set_new(payload, "finished_at", json_string(job->finished_at));
+    if (job->state == SHELL_JOB_RUNNING) {
+        json_t *rollback = json_pack("{s:s,s:{s:s}}",
+                                     "tool_name",
+                                     "system.shell_kill",
+                                     "args",
+                                     "job_id",
+                                     job->job_id);
+        if (rollback)
+            json_object_set_new(payload, "rollback", rollback);
+    }
+
+    return payload;
+}
+
+static json_t *shell_job_result(const struct shell_job *job, bool is_error)
+{
+    json_t *payload = shell_job_status_json(job);
+    json_t *result;
+
+    if (!payload)
+        return mcp_tool_result_text("Failed to encode shell job status.", true);
+
+    result = mcp_tool_result_json_text(payload, is_error);
+    json_decref(payload);
+    return result;
+}
+
+static int shell_job_apply_start_overrides(struct shell_exec_config *cfg,
+                                           json_t *arguments,
+                                           char **out_error)
+{
+    json_t *cwd;
+    json_t *env;
+    const char *key;
+    json_t *value;
+
+    *out_error = NULL;
+
+    cwd = json_object_get(arguments, "cwd");
+    if (cwd) {
+        if (!json_is_string(cwd)) {
+            *out_error = mcp_strdup("Invalid params: cwd must be a string.");
+            return 0;
+        }
+        if (dup_string_field(&cfg->working_directory, json_string_value(cwd)) != 0)
+            return -1;
+    }
+
+    env = json_object_get(arguments, "env");
+    if (!env)
+        return 0;
+    if (!json_is_object(env)) {
+        *out_error = mcp_strdup("Invalid params: env must be an object of string values.");
+        return 0;
+    }
+
+    json_object_foreach(env, key, value) {
+        if (!json_is_string(value)) {
+            *out_error = mcp_strdup("Invalid params: env values must be strings.");
+            return 0;
+        }
+        if (shell_exec_config_set_env_var(cfg, key, json_string_value(value)) != 0)
+            return -1;
+    }
+
+    return 0;
+}
+
+#ifndef _WIN32
+static void shell_job_kill_process(struct shell_job *job, int signal_number)
+{
+    if (!job || job->process_reaped || job->pid <= 0)
+        return;
+
+    if (job->kill_process_group)
+        kill(-job->pid, signal_number);
+    else
+        kill(job->pid, signal_number);
+}
+
+static int shell_job_spawn_unix(const struct shell_exec_config *cfg,
+                                const struct shell_exec_request *request,
+                                struct shell_job *job,
+                                char **out_error)
+{
+    int stdout_pipe[2] = {-1, -1};
+    int stderr_pipe[2] = {-1, -1};
+    char **envp = NULL;
+    pid_t pid;
+
+    *out_error = NULL;
+
+    if (shell_exec_prepare_working_directory(cfg) != 0) {
+        char message[512];
+
+        snprintf(message,
+                 sizeof(message),
+                 "Failed to prepare shell_exec working directory '%s': %s",
+                 cfg->working_directory ? cfg->working_directory : "",
+                 strerror(errno));
+        *out_error = mcp_strdup(message);
+        return 0;
+    }
+
+    if (pipe(stdout_pipe) != 0)
+        return -1;
+    if (cfg->capture_stderr && pipe(stderr_pipe) != 0)
+        goto fail;
+
+    envp = shell_exec_build_envp(cfg);
+    if (!envp)
+        goto fail;
+
+    pid = fork();
+    if (pid < 0)
+        goto fail;
+
+    if (pid == 0) {
+        int null_fd;
+
+        if (cfg->kill_process_group_on_timeout)
+            (void)setsid();
+
+        null_fd = open("/dev/null", O_RDONLY);
+        if (null_fd >= 0) {
+            dup2(null_fd, STDIN_FILENO);
+            close(null_fd);
+        }
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        if (cfg->capture_stderr)
+            dup2(cfg->merge_stderr ? stdout_pipe[1] : stderr_pipe[1], STDERR_FILENO);
+
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
+        if (cfg->capture_stderr) {
+            close(stderr_pipe[0]);
+            close(stderr_pipe[1]);
+        }
+
+        if (chdir(cfg->working_directory) != 0) {
+            perror("shell_job chdir");
+            _exit(126);
+        }
+        if (shell_exec_apply_unix_identity(cfg) != 0) {
+            perror("shell_job setuid/setgid");
+            _exit(126);
+        }
+        if (shell_exec_apply_unix_rlimits(cfg) != 0) {
+            perror("shell_job setrlimit");
+            _exit(126);
+        }
+
+        shell_exec_child_exec(cfg, request, envp);
+        perror("shell_job exec");
+        _exit(127);
+    }
+
+    shell_exec_envp_destroy(envp);
+    envp = NULL;
+
+    close(stdout_pipe[1]);
+    stdout_pipe[1] = -1;
+    job->stdout_fd = stdout_pipe[0];
+    stdout_pipe[0] = -1;
+    job->stdout_open = true;
+    if (set_nonblocking(job->stdout_fd) != 0)
+        goto fail_started;
+
+    if (cfg->capture_stderr && !cfg->merge_stderr) {
+        close(stderr_pipe[1]);
+        stderr_pipe[1] = -1;
+        job->stderr_fd = stderr_pipe[0];
+        stderr_pipe[0] = -1;
+        job->stderr_open = true;
+        if (set_nonblocking(job->stderr_fd) != 0)
+            goto fail_started;
+    } else {
+        if (cfg->capture_stderr) {
+            close(stderr_pipe[0]);
+            close(stderr_pipe[1]);
+            stderr_pipe[0] = -1;
+            stderr_pipe[1] = -1;
+        }
+        job->stderr_fd = -1;
+    }
+
+    job->pid = pid;
+    job->process_group_id = cfg->kill_process_group_on_timeout ? pid : 0;
+    job->kill_process_group = cfg->kill_process_group_on_timeout;
+    return 0;
+
+fail_started:
+    job->pid = pid;
+    job->kill_process_group = cfg->kill_process_group_on_timeout;
+    shell_job_kill_process(job, SIGKILL);
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+        ;
+fail:
+    if (stdout_pipe[0] >= 0)
+        close(stdout_pipe[0]);
+    if (stdout_pipe[1] >= 0)
+        close(stdout_pipe[1]);
+    if (stderr_pipe[0] >= 0)
+        close(stderr_pipe[0]);
+    if (stderr_pipe[1] >= 0)
+        close(stderr_pipe[1]);
+    shell_exec_envp_destroy(envp);
+    return -1;
+}
+
+static void shell_job_poll_one(struct shell_job *job)
+{
+    char *chunk;
+    unsigned long long now;
+
+    if (!job || !shell_job_needs_poll(job))
+        return;
+
+    chunk = malloc(job->chunk_size ? job->chunk_size : MCP_SHELL_EXEC_DEFAULT_CHUNK_SIZE);
+    if (!chunk) {
+        shell_job_mark_finished(job, SHELL_JOB_FAILED);
+        return;
+    }
+
+    if (job->stdout_open) {
+        bool eof = false;
+
+        if (read_fd_into_buffer(job->stdout_fd,
+                                &job->stdout_buf,
+                                job->output_limit_bytes,
+                                chunk,
+                                job->chunk_size,
+                                &eof) != 0) {
+            shell_job_mark_finished(job, SHELL_JOB_FAILED);
+            eof = true;
+        }
+        if (eof) {
+            close(job->stdout_fd);
+            job->stdout_fd = -1;
+            job->stdout_open = false;
+        }
+    }
+
+    if (job->stderr_open) {
+        bool eof = false;
+
+        if (read_fd_into_buffer(job->stderr_fd,
+                                &job->stderr_buf,
+                                job->output_limit_bytes,
+                                chunk,
+                                job->chunk_size,
+                                &eof) != 0) {
+            shell_job_mark_finished(job, SHELL_JOB_FAILED);
+            eof = true;
+        }
+        if (eof) {
+            close(job->stderr_fd);
+            job->stderr_fd = -1;
+            job->stderr_open = false;
+        }
+    }
+
+    free(chunk);
+
+    if (!job->process_reaped) {
+        int wait_status = 0;
+        pid_t waited = waitpid(job->pid, &wait_status, WNOHANG);
+
+        if (waited == job->pid) {
+            job->process_reaped = true;
+            if (WIFEXITED(wait_status))
+                job->exit_code = WEXITSTATUS(wait_status);
+            else if (WIFSIGNALED(wait_status))
+                job->signal_number = WTERMSIG(wait_status);
+
+            if (job->timed_out_requested)
+                shell_job_mark_finished(job, SHELL_JOB_TIMED_OUT);
+            else if (job->killed_requested)
+                shell_job_mark_finished(job, SHELL_JOB_KILLED);
+            else if (job->state == SHELL_JOB_RUNNING)
+                shell_job_mark_finished(job, SHELL_JOB_EXITED);
+        } else if (waited < 0 && errno != EINTR) {
+            job->process_reaped = true;
+            shell_job_mark_finished(job, SHELL_JOB_FAILED);
+        }
+    }
+
+    now = mcp_now_ms();
+    if (job->state == SHELL_JOB_RUNNING && now >= job->deadline_ms) {
+        job->timed_out_requested = true;
+        shell_job_kill_process(job, SIGKILL);
+        shell_job_mark_finished(job, SHELL_JOB_TIMED_OUT);
+    }
+}
+#else
+static int shell_job_spawn_unix(const struct shell_exec_config *cfg,
+                                const struct shell_exec_request *request,
+                                struct shell_job *job,
+                                char **out_error)
+{
+    (void)cfg;
+    (void)request;
+    (void)job;
+    *out_error = mcp_strdup("system.shell_start is not implemented on Windows in this build.");
+    return 0;
+}
+
+static void shell_job_kill_process(struct shell_job *job, int signal_number)
+{
+    (void)job;
+    (void)signal_number;
+}
+
+static void shell_job_poll_one(struct shell_job *job)
+{
+    (void)job;
+}
+#endif
+
+static bool shell_jobs_any_needs_poll(const struct mcp_shell_job_store *store)
+{
+    const struct shell_job *job;
+
+    if (!store)
+        return false;
+
+    for (job = store->jobs; job; job = job->next) {
+        if (shell_job_needs_poll(job))
+            return true;
+    }
+    return false;
+}
+
+static void shell_jobs_poll_all(struct mcp_shell_job_store *store)
+{
+    struct shell_job *job;
+
+    if (!store)
+        return;
+
+    for (job = store->jobs; job; job = job->next)
+        shell_job_poll_one(job);
+    shell_jobs_cleanup_expired(store);
+}
+
+static void shell_jobs_poll_timer_cb(uv_timer_t *timer)
+{
+    struct mcp_shell_job_store *store = timer->data;
+
+    shell_jobs_poll_all(store);
+    if (!shell_jobs_any_needs_poll(store) && store->poll_timer_running) {
+        uv_timer_stop(&store->poll_timer);
+        store->poll_timer_running = false;
+    }
+}
+
+static void shell_jobs_ensure_timer(struct mcp_shell_job_store *store)
+{
+    if (!store || store->shutting_down || !store->poll_timer_initialized || store->poll_timer_running)
+        return;
+
+    if (uv_timer_start(&store->poll_timer,
+                       shell_jobs_poll_timer_cb,
+                       MCP_SHELL_JOB_POLL_MS,
+                       MCP_SHELL_JOB_POLL_MS) == 0)
+        store->poll_timer_running = true;
+}
+
+static void shell_jobs_timer_close_cb(uv_handle_t *handle)
+{
+    struct mcp_shell_job_store *store = handle->data;
+
+    if (store)
+        store->poll_timer_initialized = false;
+}
+
+int mcp_shell_jobs_create(struct mcp_shell_job_store **out,
+                          struct mcp_server *server,
+                          uv_loop_t *loop)
+{
+    struct mcp_shell_job_store *store;
+
+    *out = NULL;
+    if (!server || !loop)
+        return -1;
+
+    store = calloc(1, sizeof(*store));
+    if (!store)
+        return -1;
+
+    store->server = server;
+    store->loop = loop;
+    store->retention_ms = env_uint("MCP_SHELL_JOB_RETENTION_MS",
+                                   MCP_SHELL_JOB_DEFAULT_RETENTION_MS,
+                                   1000u,
+                                   MCP_SHELL_JOB_MAX_RETENTION_MS);
+    if (uv_timer_init(loop, &store->poll_timer) != 0) {
+        free(store);
+        return -1;
+    }
+    store->poll_timer_initialized = true;
+    store->poll_timer.data = store;
+
+    *out = store;
+    return 0;
+}
+
+void mcp_shell_jobs_shutdown(struct mcp_shell_job_store *store)
+{
+    struct shell_job *job;
+
+    if (!store || store->shutting_down)
+        return;
+
+    store->shutting_down = true;
+    for (job = store->jobs; job; job = job->next) {
+        if (!job->process_reaped) {
+            job->killed_requested = true;
+            shell_job_kill_process(job, SIGKILL);
+            shell_job_mark_finished(job, SHELL_JOB_KILLED);
+        }
+    }
+    shell_jobs_poll_all(store);
+
+    if (store->poll_timer_initialized && !uv_is_closing((uv_handle_t *)&store->poll_timer)) {
+        uv_timer_stop(&store->poll_timer);
+        store->poll_timer_running = false;
+        uv_close((uv_handle_t *)&store->poll_timer, shell_jobs_timer_close_cb);
+    }
+}
+
+void mcp_shell_jobs_destroy(struct mcp_shell_job_store *store)
+{
+    struct shell_job *job;
+
+    if (!store)
+        return;
+
+    mcp_shell_jobs_shutdown(store);
+    job = store->jobs;
+    while (job) {
+        struct shell_job *next = job->next;
+
+        shell_job_free(job);
+        job = next;
+    }
+    free(store);
+}
+
 static json_t *shell_exec_build_result(const struct shell_exec_request *request,
                                        const struct shell_exec_outcome *outcome,
                                        bool is_error)
@@ -1890,6 +2636,408 @@ cleanup:
     shell_exec_request_destroy(&request);
     shell_exec_config_destroy(&cfg);
     return rc;
+}
+
+static bool shell_job_id_arg(const struct mcp_tool_invocation *invocation, const char **out_job_id)
+{
+    json_t *value = json_object_get(invocation->arguments, "job_id");
+
+    if (!json_is_string(value))
+        return false;
+
+    *out_job_id = json_string_value(value);
+    return true;
+}
+
+int mcp_tool_system_shell_start(struct mcp_server *server,
+                                const struct mcp_tool_invocation *invocation,
+                                json_t **out_result)
+{
+    struct shell_exec_config cfg;
+    struct shell_exec_request request;
+    struct shell_job *job = NULL;
+    json_t *command_value;
+    const char *command;
+    const char *label;
+    size_t command_length;
+    char *error_message = NULL;
+    int rc = -1;
+
+    memset(&request, 0, sizeof(request));
+    memset(&cfg, 0, sizeof(cfg));
+    *out_result = NULL;
+
+    if (!server || !server->shell_jobs) {
+        *out_result = mcp_tool_result_text("system.shell_start job store is not available.", true);
+        return 0;
+    }
+
+    if (shell_exec_config_load(&cfg) != 0) {
+        *out_result = mcp_tool_result_text("Failed to initialize shell_start configuration.", true);
+        goto cleanup;
+    }
+    if (!cfg.config_loaded) {
+        char message[512];
+
+        snprintf(message,
+                 sizeof(message),
+                 "system.shell_start is disabled because configuration failed to load from %s. %s",
+                 cfg.config_path ? cfg.config_path : "(unknown)",
+                 cfg.load_error ? cfg.load_error : "No details available.");
+        *out_result = mcp_tool_result_text(message, true);
+        rc = 0;
+        goto cleanup;
+    }
+    if (!cfg.enabled) {
+        *out_result = mcp_tool_result_text(
+            "system.shell_start is disabled by policy. Enable it in shell_exec.json or MCP_ENABLE_SHELL_EXEC=1 for a trusted session.",
+            true);
+        rc = 0;
+        goto cleanup;
+    }
+    if (shell_job_apply_start_overrides(&cfg, invocation->arguments, &error_message) != 0) {
+        *out_result = mcp_tool_result_text("Failed to apply shell_start overrides.", true);
+        goto cleanup;
+    }
+    if (error_message) {
+        *out_result = mcp_tool_result_text(error_message, true);
+        rc = 0;
+        goto cleanup;
+    }
+
+    command_value = json_object_get(invocation->arguments, "command");
+    if (!json_is_string(command_value)) {
+        *out_result = mcp_tool_result_text("Invalid params: command must be a string.", true);
+        rc = 0;
+        goto cleanup;
+    }
+
+    command = json_string_value(command_value);
+    command_length = json_string_length(command_value);
+    if (shell_exec_request_parse_command(&request,
+                                         command,
+                                         command_length,
+                                         cfg.max_command_length,
+                                         &error_message) != 0) {
+        *out_result = mcp_tool_result_text("Failed to parse command.", true);
+        goto cleanup;
+    }
+    if (error_message) {
+        *out_result = mcp_tool_result_text(error_message, true);
+        rc = 0;
+        goto cleanup;
+    }
+
+    if (!shell_job_string_arg(invocation->arguments, "label", &label)) {
+        *out_result = mcp_tool_result_text("Invalid params: label must be a string.", true);
+        rc = 0;
+        goto cleanup;
+    }
+
+    request.timeout_ms = shell_exec_resolve_timeout(&cfg, invocation);
+    job = calloc(1, sizeof(*job));
+    if (!job)
+        goto cleanup;
+
+#ifndef _WIN32
+    job->stdout_fd = -1;
+    job->stderr_fd = -1;
+#endif
+    job->command = mcp_strdup(request.command);
+    job->label = label ? mcp_strdup(label) : NULL;
+    if (!job->command || (label && !job->label))
+        goto cleanup;
+    job->state = SHELL_JOB_RUNNING;
+    job->timeout_ms = request.timeout_ms;
+    job->output_limit_bytes = shell_exec_resolve_output_limit(&cfg, invocation);
+    job->chunk_size = cfg.chunk_size;
+    job->started_ms = mcp_now_ms();
+    job->deadline_ms = job->started_ms + job->timeout_ms;
+    job->exit_code = -1;
+    if (!mcp_format_utc_now(job->started_at, sizeof(job->started_at)))
+        snprintf(job->started_at, sizeof(job->started_at), "unknown-time");
+
+    if (shell_job_spawn_unix(&cfg, &request, job, &error_message) != 0) {
+        *out_result = mcp_tool_result_text("Failed to start shell job.", true);
+        goto cleanup;
+    }
+    if (error_message) {
+        *out_result = mcp_tool_result_text(error_message, true);
+        rc = 0;
+        goto cleanup;
+    }
+
+    if (shell_job_append(server->shell_jobs, job) != 0) {
+#ifndef _WIN32
+        shell_job_kill_process(job, SIGKILL);
+#endif
+        *out_result = mcp_tool_result_text("Failed to allocate shell job id.", true);
+        goto cleanup;
+    }
+
+    shell_jobs_ensure_timer(server->shell_jobs);
+    *out_result = shell_job_result(job, false);
+    job = NULL;
+    rc = 0;
+
+cleanup:
+    if (job)
+        shell_job_free(job);
+    free(error_message);
+    shell_exec_request_destroy(&request);
+    shell_exec_config_destroy(&cfg);
+    return rc;
+}
+
+int mcp_tool_system_shell_poll(struct mcp_server *server,
+                               const struct mcp_tool_invocation *invocation,
+                               json_t **out_result)
+{
+    const char *job_id;
+    struct shell_job *job;
+
+    if (!shell_job_id_arg(invocation, &job_id)) {
+        *out_result = mcp_tool_result_text("system.shell_poll requires job_id.", true);
+        return 0;
+    }
+
+    shell_jobs_poll_all(server->shell_jobs);
+    job = shell_job_find(server->shell_jobs, job_id);
+    if (!job) {
+        *out_result = mcp_tool_result_text("Shell job was not found.", true);
+        return 0;
+    }
+
+    *out_result = shell_job_result(job, false);
+    return 0;
+}
+
+static json_t *shell_job_tail_payload(struct shell_job *job,
+                                      unsigned int stdout_offset,
+                                      unsigned int stderr_offset,
+                                      unsigned int max_bytes)
+{
+    size_t stdout_start = stdout_offset > job->stdout_buf.len ? job->stdout_buf.len : stdout_offset;
+    size_t stderr_start = stderr_offset > job->stderr_buf.len ? job->stderr_buf.len : stderr_offset;
+    size_t stdout_len = job->stdout_buf.len - stdout_start;
+    size_t stderr_len = job->stderr_buf.len - stderr_start;
+    json_t *payload;
+    json_t *stdout_value;
+    json_t *stderr_value;
+
+    if (stdout_len > max_bytes)
+        stdout_len = max_bytes;
+    if (stderr_len > max_bytes)
+        stderr_len = max_bytes;
+
+    stdout_value = json_stringn(job->stdout_buf.data ? job->stdout_buf.data + stdout_start : "",
+                                stdout_len);
+    stderr_value = json_stringn(job->stderr_buf.data ? job->stderr_buf.data + stderr_start : "",
+                                stderr_len);
+    payload = shell_job_status_json(job);
+    if (!payload || !stdout_value || !stderr_value) {
+        json_decref(payload);
+        json_decref(stdout_value);
+        json_decref(stderr_value);
+        return NULL;
+    }
+
+    json_object_set_new(payload, "stdout_offset", json_integer((json_int_t)stdout_start));
+    json_object_set_new(payload, "stderr_offset", json_integer((json_int_t)stderr_start));
+    json_object_set_new(payload, "stdout", stdout_value);
+    json_object_set_new(payload, "stderr", stderr_value);
+    json_object_set_new(payload,
+                        "next_stdout_offset",
+                        json_integer((json_int_t)(stdout_start + stdout_len)));
+    json_object_set_new(payload,
+                        "next_stderr_offset",
+                        json_integer((json_int_t)(stderr_start + stderr_len)));
+    return payload;
+}
+
+int mcp_tool_system_shell_tail(struct mcp_server *server,
+                               const struct mcp_tool_invocation *invocation,
+                               json_t **out_result)
+{
+    const char *job_id;
+    struct shell_job *job;
+    unsigned int offset = 0;
+    unsigned int stdout_offset = 0;
+    unsigned int stderr_offset = 0;
+    unsigned int max_bytes = 4096;
+    json_t *payload;
+
+    if (!shell_job_id_arg(invocation, &job_id)) {
+        *out_result = mcp_tool_result_text("system.shell_tail requires job_id.", true);
+        return 0;
+    }
+
+    shell_jobs_poll_all(server->shell_jobs);
+    job = shell_job_find(server->shell_jobs, job_id);
+    if (!job) {
+        *out_result = mcp_tool_result_text("Shell job was not found.", true);
+        return 0;
+    }
+
+    if (!shell_job_uint_arg(invocation->arguments, "offset", 0, 0, job->output_limit_bytes, &offset) ||
+        !shell_job_uint_arg(invocation->arguments,
+                            "stdout_offset",
+                            offset,
+                            0,
+                            job->output_limit_bytes,
+                            &stdout_offset) ||
+        !shell_job_uint_arg(invocation->arguments,
+                            "stderr_offset",
+                            offset,
+                            0,
+                            job->output_limit_bytes,
+                            &stderr_offset) ||
+        !shell_job_uint_arg(invocation->arguments, "max_bytes", 4096, 1, job->output_limit_bytes, &max_bytes)) {
+        *out_result = mcp_tool_result_text(
+            "Invalid params: offsets and max_bytes must be non-negative integers within the job output limit.",
+            true);
+        return 0;
+    }
+
+    payload = shell_job_tail_payload(job, stdout_offset, stderr_offset, max_bytes);
+    if (!payload) {
+        *out_result = mcp_tool_result_text("Failed to encode shell job output.", true);
+        return -1;
+    }
+
+    *out_result = mcp_tool_result_json_text(payload, false);
+    json_decref(payload);
+    return 0;
+}
+
+int mcp_tool_system_shell_wait(struct mcp_server *server,
+                               const struct mcp_tool_invocation *invocation,
+                               json_t **out_result)
+{
+    const char *job_id;
+    struct shell_job *job;
+    unsigned int timeout_ms = 0;
+    unsigned long long deadline;
+    json_t *payload;
+
+    if (!shell_job_id_arg(invocation, &job_id)) {
+        *out_result = mcp_tool_result_text("system.shell_wait requires job_id.", true);
+        return 0;
+    }
+    if (!shell_job_uint_arg(invocation->arguments,
+                            "timeout_ms",
+                            0,
+                            0,
+                            MCP_SHELL_JOB_WAIT_MAX_MS,
+                            &timeout_ms)) {
+        *out_result = mcp_tool_result_text(
+            "Invalid params: timeout_ms must be between 0 and 5000 for system.shell_wait.",
+            true);
+        return 0;
+    }
+
+    deadline = mcp_now_ms() + timeout_ms;
+    for (;;) {
+        shell_jobs_poll_all(server->shell_jobs);
+        job = shell_job_find(server->shell_jobs, job_id);
+        if (!job) {
+            *out_result = mcp_tool_result_text("Shell job was not found.", true);
+            return 0;
+        }
+        if (shell_job_is_final(job) && !shell_job_needs_poll(job))
+            break;
+        if (mcp_now_ms() >= deadline)
+            break;
+        uv_sleep(10);
+    }
+
+    payload = shell_job_status_json(job);
+    if (!payload) {
+        *out_result = mcp_tool_result_text("Failed to encode shell job status.", true);
+        return -1;
+    }
+    json_object_set_new(payload,
+                        "wait_result",
+                        json_string(shell_job_is_final(job) && !shell_job_needs_poll(job)
+                                        ? "finished"
+                                        : "still_running"));
+    *out_result = mcp_tool_result_json_text(payload, false);
+    json_decref(payload);
+    return 0;
+}
+
+int mcp_tool_system_shell_kill(struct mcp_server *server,
+                               const struct mcp_tool_invocation *invocation,
+                               json_t **out_result)
+{
+    const char *job_id;
+    struct shell_job *job;
+    unsigned int signal_number = 15;
+
+    if (!shell_job_id_arg(invocation, &job_id)) {
+        *out_result = mcp_tool_result_text("system.shell_kill requires job_id.", true);
+        return 0;
+    }
+    if (!shell_job_uint_arg(invocation->arguments, "signal", 15, 1, 64, &signal_number)) {
+        *out_result = mcp_tool_result_text("Invalid params: signal must be an integer from 1 to 64.", true);
+        return 0;
+    }
+
+    shell_jobs_poll_all(server->shell_jobs);
+    job = shell_job_find(server->shell_jobs, job_id);
+    if (!job) {
+        *out_result = mcp_tool_result_text("Shell job was not found.", true);
+        return 0;
+    }
+
+    if (!job->process_reaped) {
+        job->killed_requested = true;
+#ifndef _WIN32
+        shell_job_kill_process(job, (int)signal_number);
+#endif
+        shell_job_mark_finished(job, SHELL_JOB_KILLED);
+        shell_jobs_ensure_timer(server->shell_jobs);
+        shell_jobs_poll_all(server->shell_jobs);
+    }
+
+    *out_result = shell_job_result(job, false);
+    return 0;
+}
+
+int mcp_tool_system_shell_list(struct mcp_server *server,
+                               const struct mcp_tool_invocation *invocation,
+                               json_t **out_result)
+{
+    json_t *payload = json_object();
+    json_t *jobs = json_array();
+    struct shell_job *job;
+
+    (void)invocation;
+
+    if (!payload || !jobs) {
+        json_decref(payload);
+        json_decref(jobs);
+        *out_result = mcp_tool_result_text("Failed to encode shell job list.", true);
+        return -1;
+    }
+
+    shell_jobs_poll_all(server->shell_jobs);
+    for (job = server->shell_jobs ? server->shell_jobs->jobs : NULL; job; job = job->next) {
+        json_t *entry = shell_job_status_json(job);
+
+        if (!entry || json_array_append_new(jobs, entry) != 0) {
+            json_decref(entry);
+            json_decref(payload);
+            json_decref(jobs);
+            *out_result = mcp_tool_result_text("Failed to encode shell job list.", true);
+            return -1;
+        }
+    }
+
+    json_object_set_new(payload, "jobs", jobs);
+    *out_result = mcp_tool_result_json_text(payload, false);
+    json_decref(payload);
+    return 0;
 }
 
 uint32_t mcp_shell_exec_registration_timeout_ms(void)

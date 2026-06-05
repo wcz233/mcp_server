@@ -279,6 +279,12 @@ mcp.system.shell_exec "gcc /home/alinx/prj/hello.c -o /home/alinx/prj/hello.out"
 mcp.system.shell_exec({"command":"/home/alinx/prj/hello.out","timeout_ms":1000})
 ```
 
+长时间运行或阻塞命令使用异步 job 工具：
+
+```text
+system.shell_start -> system.shell_poll/system.shell_tail/system.shell_wait/system.shell_kill/system.shell_list
+```
+
 也可以使用更短的单行写法：
 
 ```text

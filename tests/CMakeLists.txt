@@ -17,6 +17,11 @@ if(Python3_Interpreter_FOUND)
     )
 
     add_test(
+        NAME mcp_shell_job_smoke
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/shell_job_smoke.py" "$<TARGET_FILE:mcp_server>"
+    )
+
+    add_test(
         NAME mcp_startup_failure_cleanup_smoke
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/startup_failure_cleanup_smoke.py" "$<TARGET_FILE:mcp_server>"
     )
