@@ -46,6 +46,7 @@ int mcp_server_discovery_call_remote_tool(struct mcp_server_discovery *discovery
                                           unsigned int server_id,
                                           enum mcp_discovery_proxy_kind kind,
                                           const char *tool_name,
-                                          json_t *arguments);
+                                          json_t *arguments,
+                                          unsigned int proxy_timeout_ms);
 
 #endif

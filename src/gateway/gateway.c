@@ -34,6 +34,16 @@ static bool json_integer_in_uint_range(json_t *value, unsigned int *out)
     return true;
 }
 
+static bool json_optional_integer_in_uint_range(json_t *value, unsigned int *out)
+{
+    if (!value) {
+        *out = 0;
+        return true;
+    }
+
+    return json_integer_in_uint_range(value, out);
+}
+
 static bool snapshot_contains_tool(const json_t *snapshot, const char *tool_name)
 {
     json_t *tools;
@@ -65,14 +75,17 @@ static int gateway_proxy_tool_call(struct mcp_gateway *gateway,
     json_t *server_id_value;
     json_t *tool_name_value;
     json_t *tool_args;
+    json_t *proxy_timeout_value;
     bool created_tool_args = false;
     unsigned int server_id;
+    unsigned int proxy_timeout_ms;
     const char *tool_name;
     enum mcp_discovery_proxy_kind kind = MCP_DISCOVERY_PROXY_TOOL;
     int rc;
 
     server_id_value = json_object_get(arguments, "server_id");
     tool_name_value = json_object_get(arguments, "tool_name");
+    proxy_timeout_value = json_object_get(arguments, "proxy_timeout_ms");
     tool_args = json_object_get(arguments, "args");
     if (!tool_args)
         tool_args = json_object_get(arguments, "arguments");
@@ -84,10 +97,12 @@ static int gateway_proxy_tool_call(struct mcp_gateway *gateway,
     if (!json_integer_in_uint_range(server_id_value, &server_id) ||
         server_id == 0 ||
         !json_is_string(tool_name_value) ||
-        !json_is_object(tool_args)) {
+        !json_is_object(tool_args) ||
+        !json_optional_integer_in_uint_range(proxy_timeout_value, &proxy_timeout_ms) ||
+        (proxy_timeout_value && proxy_timeout_ms == 0)) {
         gateway->rejected_calls++;
         *out_result = mcp_tool_result_text(
-            "gateway.proxy_tool requires server_id > 0, tool_name, and object args.",
+            "gateway.proxy_tool requires server_id > 0, tool_name, object args, and optional proxy_timeout_ms > 0.",
             true);
         if (created_tool_args)
             json_decref(tool_args);
@@ -112,7 +127,8 @@ static int gateway_proxy_tool_call(struct mcp_gateway *gateway,
                                                server_id,
                                                kind,
                                                tool_name,
-                                               tool_args);
+                                               tool_args,
+                                               proxy_timeout_ms);
     if (created_tool_args)
         json_decref(tool_args);
 

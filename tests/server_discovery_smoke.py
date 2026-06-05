@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import socket
 import struct
 import subprocess
@@ -51,7 +52,7 @@ def wait_for_tcp(port, proc):
     raise RuntimeError(f"tcp listener did not become ready: {last_error}")
 
 
-def start_server(exe, tcp_port, discovery_port, peer_discovery_port):
+def start_server(exe, tcp_port, discovery_port, peer_discovery_port, shell_exec="0"):
     env = os.environ.copy()
     creationflags = 0
     env["MCP_ENABLE_STDIO"] = "0"
@@ -64,7 +65,7 @@ def start_server(exe, tcp_port, discovery_port, peer_discovery_port):
     env["MCP_DISCOVERY_ADVERTISE_HOST"] = "127.0.0.1"
     env["MCP_DISCOVERY_HOSTS"] = f"127.0.0.1:{peer_discovery_port}"
     env["MCP_STRICT_INIT"] = "0"
-    env["MCP_ENABLE_SHELL_EXEC"] = "0"
+    env["MCP_ENABLE_SHELL_EXEC"] = shell_exec
     if os.name == "nt":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
     return subprocess.Popen(
@@ -121,6 +122,13 @@ def parse_text_json(result):
     return json.loads(result["content"][0]["text"])
 
 
+def slow_python_command(seconds, text):
+    code = f"import time; time.sleep({seconds}); print({text!r})"
+    if os.name == "nt":
+        return subprocess.list2cmdline([sys.executable, "-c", code])
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+
 def main():
     exe = sys.argv[1]
     tcp_a = int(sys.argv[2])
@@ -156,7 +164,7 @@ def main():
         assert "system_status" in local, local
         assert "hostname" in local["system_status"], local
 
-        proc_b = start_signal_server(exe, tcp_b, discovery_b, discovery_a)
+        proc_b = start_server(exe, tcp_b, discovery_b, discovery_a, shell_exec="1")
         sock_b = wait_for_tcp(tcp_b, proc_b)
         sock_b.settimeout(3.0)
         initialize(sock_b)
@@ -217,6 +225,36 @@ def main():
         )
         assert result["isError"] is False, result
         assert result["content"][0]["text"] == "pong", result
+
+        timed_out = call_tool(
+            sock_a,
+            71,
+            "gateway.proxy_tool",
+            {
+                "server_id": peer_server_id,
+                "tool_name": "system.shell_exec",
+                "args": {"command": slow_python_command(0.3, "too-late"), "timeout_ms": 1500},
+                "proxy_timeout_ms": 100,
+            },
+        )
+        assert timed_out["isError"] is True, timed_out
+        assert "gateway_proxy_timed_out" in timed_out["content"][0]["text"], timed_out
+
+        completed = call_tool(
+            sock_a,
+            72,
+            "gateway.proxy_tool",
+            {
+                "server_id": peer_server_id,
+                "tool_name": "system.shell_exec",
+                "args": {"command": slow_python_command(0.3, "proxy-ok"), "timeout_ms": 1500},
+                "proxy_timeout_ms": 2000,
+            },
+        )
+        assert completed["isError"] is False, completed
+        completed_payload = parse_text_json(completed)
+        assert completed_payload["stdout"].strip() == "proxy-ok", completed_payload
+        assert completed_payload["timed_out"] is False, completed_payload
 
         request_graceful_shutdown(proc_b)
         proc_b.wait(timeout=5)

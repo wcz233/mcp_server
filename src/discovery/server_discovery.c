@@ -25,7 +25,8 @@
 #define MCP_DISCOVERY_HEARTBEAT_TIMEOUT_MS 3000ull
 #define MCP_DISCOVERY_MAX_DATAGRAM 65536u
 #define MCP_DISCOVERY_MAX_FRAME (1024u * 1024u)
-#define MCP_DISCOVERY_PROXY_TIMEOUT_MS 5000u
+#define MCP_DISCOVERY_PROXY_TIMEOUT_MS_DEFAULT 5000u
+#define MCP_DISCOVERY_PROXY_TIMEOUT_MS_MAX 300000u
 #define MCP_DISCOVERY_INITIALIZE_ID "mcp_gateway_initialize"
 #define MCP_DISCOVERY_REMOTE_REGISTRY_LIST_TOOLS "registry.list_tools"
 
@@ -102,6 +103,7 @@ struct discovery_pending_proxy {
     char *tool_name;
     json_t *arguments;
     enum mcp_discovery_proxy_kind kind;
+    unsigned int timeout_ms;
     struct discovery_pending_proxy *next;
 };
 
@@ -351,6 +353,33 @@ static char *discovery_strtok(char *str, const char *delim, char **save)
 #else
     return strtok_r(str, delim, save);
 #endif
+}
+
+static unsigned int env_uint_range(const char *name,
+                                   unsigned int default_value,
+                                   unsigned int min_value,
+                                   unsigned int max_value)
+{
+    const char *value = getenv(name);
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!value || value[0] == '\0')
+        return default_value;
+
+    parsed = strtoul(value, &end, 10);
+    if (!end || *end != '\0' || parsed < min_value || parsed > max_value)
+        return default_value;
+
+    return (unsigned int)parsed;
+}
+
+static unsigned int discovery_proxy_timeout_default_ms(void)
+{
+    return env_uint_range("MCP_DISCOVERY_PROXY_TIMEOUT_MS",
+                          MCP_DISCOVERY_PROXY_TIMEOUT_MS_DEFAULT,
+                          1u,
+                          MCP_DISCOVERY_PROXY_TIMEOUT_MS_MAX);
 }
 
 static void udp_send_cb(uv_udp_send_t *req, int status)
@@ -1038,7 +1067,14 @@ static json_t *proxy_error_result(const char *message)
 static void pending_proxy_timeout_cb(uv_timer_t *timer)
 {
     struct discovery_pending_proxy *ctx = timer->data;
-    json_t *result = proxy_error_result("Remote proxy call timed out.");
+    char message[160];
+    json_t *result;
+
+    snprintf(message,
+             sizeof(message),
+             "gateway_proxy_timed_out: remote proxy call exceeded %u ms.",
+             ctx ? ctx->timeout_ms : 0u);
+    result = proxy_error_result(message);
 
     pending_proxy_finish_result(ctx, result);
     json_decref(result);
@@ -2063,7 +2099,8 @@ int mcp_server_discovery_call_remote_tool(struct mcp_server_discovery *discovery
                                           unsigned int server_id,
                                           enum mcp_discovery_proxy_kind kind,
                                           const char *tool_name,
-                                          json_t *arguments)
+                                          json_t *arguments,
+                                          unsigned int proxy_timeout_ms)
 {
     struct discovery_pending_proxy *ctx;
     struct discovery_peer *peer;
@@ -2090,6 +2127,7 @@ int mcp_server_discovery_call_remote_tool(struct mcp_server_discovery *discovery
     ctx->tool_name = mcp_strdup(tool_name);
     ctx->arguments = json_incref(arguments);
     ctx->kind = kind;
+    ctx->timeout_ms = proxy_timeout_ms ? proxy_timeout_ms : discovery_proxy_timeout_default_ms();
     len = snprintf(NULL, 0, "gateway:%s", id_key);
     if (!ctx->id_key || !ctx->tool_name || len < 0) {
         pending_proxy_free(ctx);
@@ -2108,7 +2146,7 @@ int mcp_server_discovery_call_remote_tool(struct mcp_server_discovery *discovery
     }
     ctx->timer_initialized = true;
     ctx->timer.data = ctx;
-    uv_timer_start(&ctx->timer, pending_proxy_timeout_cb, MCP_DISCOVERY_PROXY_TIMEOUT_MS, 0);
+    uv_timer_start(&ctx->timer, pending_proxy_timeout_cb, ctx->timeout_ms, 0);
 
     ctx->next = discovery->pending_proxies;
     discovery->pending_proxies = ctx;
