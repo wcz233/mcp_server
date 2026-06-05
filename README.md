@@ -14,7 +14,7 @@ Codex <stdio> mcp_stdio_proxy_adapter <tcp> mcp_server
 
 - `src/`：服务端源码。
 - `include/`：公开头文件。
-- `config/`：构建配置，只保留 Linux/Windows 两版。
+- `config/`：构建配置，包含 Linux 风格 `defconfig` 和平台 CMake 初始配置。
 - `external/`：锁定的第三方源码，默认使用 bundled libuv 和 jansson。
 - `tests/`：smoke tests。
 
@@ -40,6 +40,40 @@ Windows PowerShell：
 
 ## 编译
 
+### Linux 风格 defconfig
+
+`mcp_server` 支持类似 Linux 内核的 `CONFIG_*` 配置文件：
+
+```config
+CONFIG_MCP_FILE_TRANSFER_PLUGIN=y
+CONFIG_MCP_FILE_TRANSFER_PLUGIN=m
+# CONFIG_MCP_FILE_TRANSFER_PLUGIN is not set
+```
+
+其中 `y` 表示编进 `mcp_server`，`m` 表示生成可通过
+`plugin_tools.insmod` 加载的动态插件，未设置表示不编译该插件。默认配置为
+`m`：
+
+`.config` 只有在显式传入 `-DMCP_KCONFIG_CONFIG=...` 时才参与 CMake 配置；
+使用 `-C config/*.cmake` 时，以对应 `.cmake` 文件中的 `MCP_*` 设置为准。
+
+```bash
+cd mcp_server
+make defconfig
+make build
+```
+
+等价 CMake 入口：
+
+```bash
+cmake -S mcp_server -B mcp_server/build -DMCP_KCONFIG_CONFIG=mcp_server/config/defconfig -DCMAKE_BUILD_TYPE=Release
+cmake --build mcp_server/build --parallel
+```
+
+`Kconfig` 中 `MCP_SERVER_CORE`、`MCP_PLUGIN_MANAGER_CORE` 和
+`MCP_TOOL_SERVER_DISCOVERY` 对应必须内建的核心功能，显示为 `CONFIG_*=y`，
+语义上类似 Linux 内核里被 `select` 拉起、不能模块化的核心项。
+
 ### Linux
 
 在仓库根目录执行：
@@ -59,25 +93,57 @@ mcp_server/build/src/mcp_server
 mcp_stdio_proxy_adapter/build/mcp_stdio_proxy_adapter
 ```
 
-### ARM Buildroot 交叉编译
+### AArch64 交叉编译
 
-该入口面向 `arm-buildroot-linux-gnueabihf` 工具链，目标系统仍按 Linux
+该入口以下面的 `aarch64-none-linux-gnu` 工具链为例，目标系统仍按 Linux
 构建，第三方库默认使用 `external/` 中锁定的 bundled 源码一起交叉编译。
 交叉编译产物不能在宿主机直接运行 smoke tests，因此 ARM 默认配置关闭
 `MCP_BUILD_TESTS`。
+当前复用的 toolchain 文件名仍保留旧的 Buildroot triplet，但配置时会读取
+`CROSS_COMPILE`，并在 `MCP_ARM_BUILDROOT_SDK/bin` 下查找对应编译器。
 
 在仓库根目录执行：
 
 ```bash
 export ARCH=arm
-export CROSS_COMPILE=arm-buildroot-linux-gnueabihf
-export MCP_ARM_BUILDROOT_SDK=/home/alinx/prj/board/100ask_stm32mp157_pro-sdk/ToolChain/arm-buildroot-linux-gnueabihf_sdk-buildroot
+export CROSS_COMPILE=aarch64-none-linux-gnu
+export MCP_ARM_BUILDROOT_SDK=/opt/buildtools/gcc-arm-11.2-2022.02-x86_64-aarch64-none-linux-gnu
 export PATH="$PATH:$MCP_ARM_BUILDROOT_SDK/bin"
 
 repo_root=$(pwd)
 cmake -S mcp_server \
   -B mcp_server/build-arm \
   -C "$repo_root/mcp_server/config/arm_buildroot_defconfig.cmake" \
+  -DCMAKE_TOOLCHAIN_FILE="$repo_root/mcp_server/cmake/toolchains/arm-buildroot-linux-gnueabihf.cmake" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build mcp_server/build-arm --parallel
+```
+
+修改 `arm_buildroot_defconfig.cmake` 后，需要重新执行上面的 `cmake -S ... -B ...`
+配置命令，再执行 `cmake --build ...`；构建输出会显示
+`MCP file transfer plugin mode: y/m/n`，可用它确认实际生效的插件模式。
+
+如果使用 Linux 风格 Kconfig/defconfig 配置，先生成并按需编辑 `.config`：
+
+```bash
+cd mcp_server
+make defconfig
+# 编辑 .config，例如 CONFIG_MCP_FILE_TRANSFER_PLUGIN=y/m/not set
+cd ..
+```
+
+然后用同一套交叉工具链配置 CMake：
+
+```bash
+export ARCH=arm
+export CROSS_COMPILE=aarch64-none-linux-gnu
+export MCP_ARM_BUILDROOT_SDK=/opt/buildtools/gcc-arm-11.2-2022.02-x86_64-aarch64-none-linux-gnu
+export PATH="$PATH:$MCP_ARM_BUILDROOT_SDK/bin"
+
+repo_root=$(pwd)
+cmake -S mcp_server \
+  -B mcp_server/build-arm \
+  -DMCP_KCONFIG_CONFIG="$repo_root/mcp_server/.config" \
   -DCMAKE_TOOLCHAIN_FILE="$repo_root/mcp_server/cmake/toolchains/arm-buildroot-linux-gnueabihf.cmake" \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build mcp_server/build-arm --parallel

@@ -128,6 +128,12 @@ def verify_tool(proc, request_id, tool_name):
         assert "commands" in payload, payload
         return
 
+    if tool_name in ("server.send", "server.recv"):
+        result = call_tool(proc, request_id, tool_name, {})
+        assert result["isError"] is True, result
+        assert "server_id" in parse_text_content(result), result
+        return
+
     raise AssertionError(f"Unhandled tool for smoke verification: {tool_name}")
 
 
@@ -167,8 +173,24 @@ def main():
         assert tools_response["id"] == 2, tools_response
         tools = tools_response["result"]["tools"]
         assert tools, tools_response
+        tool_names = {tool["name"] for tool in tools}
         shell_exec = next(tool for tool in tools if tool["name"] == "system.shell_exec")
         assert shell_exec["annotations"]["timeout_ms"] == 5000, shell_exec
+
+        if "server.send" in tool_names or "server.recv" in tool_names:
+            assert {"server.send", "server.recv"}.issubset(tool_names), tool_names
+            result = call_tool(proc, 1000, "plugin_tools.lsmod", {})
+            payload = assert_json_text(result)
+            plugin = next(
+                item
+                for item in payload["plugins"]
+                if item["plugin_id"] == "mcp_file_transfer_plugin"
+            )
+            assert plugin["builtin"] is True, plugin
+            assert sorted(plugin["tools"]) == ["server.recv", "server.send"], plugin
+            result = call_tool(proc, 1001, "plugin_tools.rmmod", {"plugin_id": "mcp_file_transfer_plugin"})
+            assert result["isError"] is True, result
+            assert "built into" in parse_text_content(result), result
 
         for index, tool in enumerate(tools, start=3):
             verify_tool(proc, index, tool["name"])

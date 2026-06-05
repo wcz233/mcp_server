@@ -1,0 +1,23 @@
+# Required built-in features.  These mirror Linux kernel core infrastructure
+# symbols that are visible as forced built-ins in Kconfig.
+CONFIG_MCP_SERVER_CORE=y
+CONFIG_MCP_PLUGIN_MANAGER_CORE=y
+CONFIG_MCP_TOOL_SERVER_DISCOVERY=y
+
+# Transports and build switches.
+CONFIG_MCP_TRANSPORT_STDIO=y
+# CONFIG_MCP_TRANSPORT_UDP is not set
+CONFIG_MCP_BUILD_TESTS=y
+# CONFIG_MCP_BUILD_EMBEDDED_EXAMPLES is not set
+
+# Built-in tool families.
+CONFIG_MCP_TOOL_SYSTEM=y
+CONFIG_MCP_TOOL_GATEWAY=y
+CONFIG_MCP_TOOL_REGISTRY=y
+CONFIG_MCP_TOOL_PLUGIN_MANAGER=y
+CONFIG_MCP_TOOL_EMBEDDED=y
+# CONFIG_MCP_TOOL_REMOTE is not set
+# CONFIG_MCP_TOOL_AGENT is not set
+
+# Plugins: y = built into mcp_server, m = loadable module, not set = omitted.
+CONFIG_MCP_FILE_TRANSFER_PLUGIN=y

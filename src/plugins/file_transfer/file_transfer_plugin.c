@@ -14,7 +14,18 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
-#include <uv.h>
+
+#ifdef MCP_FILE_TRANSFER_PLUGIN_BUILTIN
+#define MFT_PLUGIN_EXPORT
+#define MFT_PLUGIN_INIT mcp_file_transfer_plugin_init
+#define MFT_PLUGIN_INVOKE mcp_file_transfer_plugin_invoke
+#define MFT_PLUGIN_SHUTDOWN mcp_file_transfer_plugin_shutdown
+#else
+#define MFT_PLUGIN_EXPORT MCP_PLUGIN_EXPORT
+#define MFT_PLUGIN_INIT mcp_plugin_init
+#define MFT_PLUGIN_INVOKE mcp_plugin_invoke
+#define MFT_PLUGIN_SHUTDOWN mcp_plugin_shutdown
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -1153,7 +1164,7 @@ struct transfer_context {
     unsigned int server_id;
     uint32_t timeout_ms;
     unsigned long long started_ms;
-    uv_timer_t *timer;
+    unsigned long long deadline_ms;
     struct manifest_entry *entries;
     size_t entry_count;
     json_t *accept;
@@ -1173,20 +1184,10 @@ static struct transfer_context *find_transfer(const char *transfer_id)
     return NULL;
 }
 
-static void timer_free_cb(uv_handle_t *handle)
-{
-    free(handle);
-}
-
 static void free_transfer(struct transfer_context *ctx)
 {
     if (!ctx)
         return;
-    if (ctx->timer) {
-        uv_timer_stop(ctx->timer);
-        if (!uv_is_closing((uv_handle_t *)ctx->timer))
-            uv_close((uv_handle_t *)ctx->timer, timer_free_cb);
-    }
     free(ctx->invocation_id);
     free(ctx->transfer_id);
     free(ctx->local_path);
@@ -1258,16 +1259,6 @@ static void complete_transfer_error(struct transfer_context *ctx,
     free_transfer(ctx);
 }
 
-static void transfer_timeout_cb(uv_timer_t *timer)
-{
-    struct transfer_context *ctx = timer ? timer->data : NULL;
-
-    if (ctx)
-        ctx->timer = NULL;
-    complete_transfer_error(ctx, "File transfer timed out.", true);
-    uv_close((uv_handle_t *)timer, timer_free_cb);
-}
-
 static void abort_transfers_for_peer(unsigned int server_id)
 {
     struct transfer_context *ctx = g_transfers;
@@ -1292,28 +1283,33 @@ static uint32_t clamp_timeout_ms(unsigned long long value)
 
 static int start_transfer_timer(struct transfer_context *ctx)
 {
-    uv_loop_t *loop;
+    unsigned long long now;
 
-    if (!ctx || !g_plugin.host->get_loop || ctx->timeout_ms == 0)
+    if (!ctx || !g_plugin.host || !g_plugin.host->now_ms || ctx->timeout_ms == 0)
         return -1;
-    loop = g_plugin.host->get_loop(g_plugin.host->host_context);
-    if (!loop)
-        return -1;
-    ctx->timer = calloc(1, sizeof(*ctx->timer));
-    if (!ctx->timer)
-        return -1;
-    if (uv_timer_init(loop, ctx->timer) != 0) {
-        free(ctx->timer);
-        ctx->timer = NULL;
-        return -1;
-    }
-    ctx->timer->data = ctx;
-    if (uv_timer_start(ctx->timer, transfer_timeout_cb, ctx->timeout_ms, 0) != 0) {
-        uv_close((uv_handle_t *)ctx->timer, timer_free_cb);
-        ctx->timer = NULL;
-        return -1;
-    }
+    now = g_plugin.host->now_ms(g_plugin.host->host_context);
+    ctx->deadline_ms = now > (unsigned long long)-1 - ctx->timeout_ms ?
+                           (unsigned long long)-1 :
+                           now + ctx->timeout_ms;
     return 0;
+}
+
+static void expire_due_transfers(void)
+{
+    struct transfer_context *ctx;
+    unsigned long long now;
+
+    if (!g_plugin.host || !g_plugin.host->now_ms)
+        return;
+    now = g_plugin.host->now_ms(g_plugin.host->host_context);
+    ctx = g_transfers;
+    while (ctx) {
+        struct transfer_context *next = ctx->next;
+
+        if (ctx->deadline_ms && now >= ctx->deadline_ms)
+            complete_transfer_error(ctx, "File transfer timed out.", true);
+        ctx = next;
+    }
 }
 
 static uint32_t payload_timeout_ms(json_t *payload)
@@ -1735,6 +1731,8 @@ static void handle_data(unsigned int server_id,
     char transfer_id[256];
     struct transfer_context *ctx;
 
+    (void)server_id;
+
     if (len < 24)
         return;
     tid_len = read_u16_be(payload + 6);
@@ -1869,6 +1867,7 @@ static void on_frame(void *user_data,
     (void)user_data;
     if (payload_len < 8 || memcmp(payload, MFT_MAGIC, 4) != 0 || payload[4] != MFT_VERSION)
         return;
+    expire_due_transfers();
     if (payload[5] == MFT_FRAME_DATA) {
         handle_data(server_id, payload, payload_len);
         return;
@@ -1965,7 +1964,7 @@ static int register_tools(void)
            g_plugin.host->register_tool(g_plugin.host->host_context, &recv_desc) == 0 ? 0 : -1;
 }
 
-MCP_PLUGIN_EXPORT int mcp_plugin_init(const struct mcp_plugin_host_api *host,
+MFT_PLUGIN_EXPORT int MFT_PLUGIN_INIT(const struct mcp_plugin_host_api *host,
                                       const char *config_json,
                                       char *result_json,
                                       unsigned int result_size)
@@ -1993,7 +1992,7 @@ MCP_PLUGIN_EXPORT int mcp_plugin_init(const struct mcp_plugin_host_api *host,
     return 0;
 }
 
-MCP_PLUGIN_EXPORT int mcp_plugin_invoke(const char *invocation_id,
+MFT_PLUGIN_EXPORT int MFT_PLUGIN_INVOKE(const char *invocation_id,
                                         const char *tool_name,
                                         const char *arguments_json,
                                         char *result_json,
@@ -2007,6 +2006,7 @@ MCP_PLUGIN_EXPORT int mcp_plugin_invoke(const char *invocation_id,
     uint32_t timeout_ms;
     int rc;
 
+    expire_due_transfers();
     if (!args) {
         snprintf(result_json, result_size, "Invalid arguments JSON.");
         return MCP_PLUGIN_CALL_ERROR;
@@ -2047,7 +2047,7 @@ MCP_PLUGIN_EXPORT int mcp_plugin_invoke(const char *invocation_id,
     return MCP_PLUGIN_CALL_ERROR;
 }
 
-MCP_PLUGIN_EXPORT int mcp_plugin_shutdown(void)
+MFT_PLUGIN_EXPORT int MFT_PLUGIN_SHUTDOWN(void)
 {
     while (g_transfers) {
         struct transfer_context *ctx = g_transfers;

@@ -11,8 +11,21 @@ struct mcp_plugin_manager;
 struct mcp_server;
 struct mcp_tool_descriptor;
 
+struct mcp_builtin_plugin_descriptor {
+    const char *plugin_id;
+    const char *path;
+    mcp_plugin_init_fn init;
+    mcp_plugin_invoke_fn invoke;
+    mcp_plugin_shutdown_fn shutdown;
+};
+
 int mcp_plugin_manager_create(struct mcp_plugin_manager **out, struct mcp_server *server);
 void mcp_plugin_manager_destroy(struct mcp_plugin_manager *manager);
+
+int mcp_plugin_manager_register_builtin(
+    struct mcp_plugin_manager *manager,
+    const struct mcp_builtin_plugin_descriptor *descriptor,
+    const char *config_json);
 
 int mcp_plugin_manager_insmod(struct mcp_plugin_manager *manager,
                               const char *package_path,

@@ -20,6 +20,7 @@ include(MCPInstall)
 
 mcp_detect_platform()
 mcp_load_default_options()
+mcp_load_kconfig_options()
 mcp_setup_third_party()
 
 add_subdirectory(external)

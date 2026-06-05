@@ -1,0 +1,93 @@
+mainmenu "MCP Server Configuration"
+
+config MCP_SERVER
+    bool
+    default y
+    select MCP_SERVER_CORE
+    select MCP_PLUGIN_MANAGER_CORE
+    select MCP_TOOL_SERVER_DISCOVERY
+
+menu "Required built-in features"
+
+config MCP_SERVER_CORE
+    bool "MCP server core"
+    help
+      Required server runtime. It is selected by the hidden MCP_SERVER symbol
+      and is intended to appear as a forced built-in, similar to required Linux
+      kernel core infrastructure.
+
+config MCP_PLUGIN_MANAGER_CORE
+    bool "Plugin manager core"
+    help
+      Required plugin manager runtime used by dynamic and built-in plugins.
+
+config MCP_TOOL_SERVER_DISCOVERY
+    bool "server.list_servers built-in tool"
+    help
+      Required built-in discovery tool. It is always compiled into mcp_server.
+
+endmenu
+
+menu "Transports and build switches"
+
+config MCP_TRANSPORT_STDIO
+    bool "stdio transport"
+    default y
+
+config MCP_TRANSPORT_UDP
+    bool "UDP transport placeholder"
+    default n
+
+config MCP_BUILD_TESTS
+    bool "Build smoke tests"
+    default y
+
+config MCP_BUILD_EMBEDDED_EXAMPLES
+    bool "Build embedded examples"
+    default n
+
+endmenu
+
+menu "Built-in tool families"
+
+config MCP_TOOL_SYSTEM
+    bool "System built-in tools"
+    default y
+
+config MCP_TOOL_GATEWAY
+    bool "Gateway built-in tools"
+    default y
+
+config MCP_TOOL_REGISTRY
+    bool "Registry built-in tools"
+    default y
+
+config MCP_TOOL_PLUGIN_MANAGER
+    bool "Plugin manager built-in tools"
+    default y
+
+config MCP_TOOL_EMBEDDED
+    bool "Embedded protocol built-in tools"
+    default y
+
+config MCP_TOOL_REMOTE
+    bool "Remote proxy built-in tools"
+    default n
+
+config MCP_TOOL_AGENT
+    bool "Agent built-in tools"
+    default n
+
+endmenu
+
+menu "Plugins"
+
+config MCP_FILE_TRANSFER_PLUGIN
+    tristate "MFT1 file transfer plugin"
+    default m
+    help
+      Build the file transfer plugin that provides server.send and server.recv.
+      Set to y to build it into mcp_server, m to build a loadable module, or
+      leave it unset to omit it.
+
+endmenu

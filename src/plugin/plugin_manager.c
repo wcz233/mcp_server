@@ -51,6 +51,7 @@ struct plugin_module {
     enum plugin_state state;
     uv_lib_t library;
     bool library_open;
+    bool is_builtin;
     mcp_plugin_init_fn init;
     mcp_plugin_invoke_fn invoke;
     mcp_plugin_shutdown_fn shutdown;
@@ -655,6 +656,29 @@ int mcp_plugin_manager_create(struct mcp_plugin_manager **out, struct mcp_server
     return 0;
 }
 
+static int init_linked_plugin(struct mcp_plugin_manager *manager,
+                              struct plugin_module *plugin,
+                              const char *config_json,
+                              const char **out_error)
+{
+    char result_json[4096] = {0};
+    int init_rc;
+
+    build_host_api(manager, plugin);
+    init_rc = plugin->init(&plugin->host_api,
+                           config_json ? config_json : "{}",
+                           result_json,
+                           sizeof(result_json));
+    if (init_rc != 0) {
+        *out_error = result_json[0] ? result_json : "Plugin initialization failed.";
+        plugin->state = PLUGIN_STATE_FAILED;
+        return -1;
+    }
+
+    plugin->state = PLUGIN_STATE_ACTIVE;
+    return 0;
+}
+
 static void unload_plugin(struct mcp_plugin_manager *manager, struct plugin_module *plugin)
 {
     struct plugin_tool *tool;
@@ -715,6 +739,57 @@ static void unlink_plugin(struct mcp_plugin_manager *manager, struct plugin_modu
     }
 }
 
+int mcp_plugin_manager_register_builtin(
+    struct mcp_plugin_manager *manager,
+    const struct mcp_builtin_plugin_descriptor *descriptor,
+    const char *config_json)
+{
+    struct plugin_module *plugin;
+    const char *error = NULL;
+
+    if (!manager || !descriptor || !descriptor->plugin_id ||
+        !descriptor->init || !descriptor->invoke || !descriptor->shutdown)
+        return -1;
+
+    if (find_plugin(manager, descriptor->plugin_id))
+        return -1;
+
+    plugin = calloc(1, sizeof(*plugin));
+    if (!plugin)
+        return -1;
+
+    plugin->plugin_id = mcp_strdup(descriptor->plugin_id);
+    plugin->path = mcp_strdup(descriptor->path ? descriptor->path : "builtin");
+    plugin->state = PLUGIN_STATE_LOADING;
+    plugin->is_builtin = true;
+    plugin->init = descriptor->init;
+    plugin->invoke = descriptor->invoke;
+    plugin->shutdown = descriptor->shutdown;
+    if (!plugin->plugin_id || !plugin->path)
+        goto fail;
+
+    plugin->next = manager->plugins;
+    manager->plugins = plugin;
+
+    if (init_linked_plugin(manager, plugin, config_json, &error) != 0)
+        goto fail_linked;
+
+    return 0;
+
+fail_linked:
+    unload_plugin(manager, plugin);
+    unlink_plugin(manager, plugin);
+fail:
+    tool_list_free(plugin->tools);
+    frame_adapter_list_free(plugin->frame_adapters);
+    pending_call_list_free(plugin->pending_calls);
+    free(plugin->plugin_id);
+    free(plugin->path);
+    free(plugin);
+    (void)error;
+    return -1;
+}
+
 int mcp_plugin_manager_insmod(struct mcp_plugin_manager *manager,
                               const char *package_path,
                               bool enable,
@@ -722,8 +797,6 @@ int mcp_plugin_manager_insmod(struct mcp_plugin_manager *manager,
                               const char **out_error)
 {
     struct plugin_module *plugin;
-    char result_json[4096] = {0};
-    int init_rc;
 
     (void)enable;
     *out_payload = NULL;
@@ -765,15 +838,8 @@ int mcp_plugin_manager_insmod(struct mcp_plugin_manager *manager,
         goto fail_linked;
     }
 
-    build_host_api(manager, plugin);
-    init_rc = plugin->init(&plugin->host_api, "{}", result_json, sizeof(result_json));
-    if (init_rc != 0) {
-        *out_error = result_json[0] ? result_json : "Plugin initialization failed.";
-        plugin->state = PLUGIN_STATE_FAILED;
+    if (init_linked_plugin(manager, plugin, "{}", out_error) != 0)
         goto fail_linked;
-    }
-
-    plugin->state = PLUGIN_STATE_ACTIVE;
     *out_payload = json_pack("{s:s,s:[],s:s}",
                              "plugin_id",
                              plugin->plugin_id,
@@ -821,6 +887,10 @@ int mcp_plugin_manager_rmmod(struct mcp_plugin_manager *manager,
         *out_error = "Plugin is not active.";
         return -1;
     }
+    if (plugin->is_builtin) {
+        *out_error = "Plugin is built into mcp_server.";
+        return -1;
+    }
     if (plugin->in_flight != 0) {
         *out_error = "Plugin still has in-flight calls.";
         return -1;
@@ -860,6 +930,7 @@ json_t *mcp_plugin_manager_lsmod(struct mcp_plugin_manager *manager)
         json_object_set_new(item, "plugin_id", json_string(plugin->plugin_id));
         json_object_set_new(item, "path", json_string(plugin->path));
         json_object_set_new(item, "state", json_string(plugin_state_name(plugin->state)));
+        json_object_set_new(item, "builtin", json_boolean(plugin->is_builtin));
         json_object_set_new(item, "abi_version", json_string(MCP_PLUGIN_ABI_VERSION));
         json_object_set_new(item, "in_flight", json_integer((json_int_t)plugin->in_flight));
         for (tool = plugin->tools; tool; tool = tool->next)

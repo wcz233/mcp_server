@@ -14,6 +14,8 @@ Testing/
 .ninja_*
 *.ninja
 Makefile
+!/Makefile
+/.config
 
 *.o
 *.obj

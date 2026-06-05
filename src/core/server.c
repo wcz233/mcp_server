@@ -4,6 +4,9 @@
 #include "core/in_flight.h"
 #include "core/server_internal.h"
 #include "protocol/jsonrpc.h"
+#if MCP_HAS_FILE_TRANSFER_PLUGIN_BUILTIN
+#include "plugins/file_transfer/file_transfer_plugin.h"
+#endif
 #include "tools/builtin_tools.h"
 #include "tools/tool_result.h"
 
@@ -377,6 +380,26 @@ static bool tool_call_mutates_registry(const char *tool_name)
 static bool tool_call_is_list_servers(const char *tool_name)
 {
     return strcmp(tool_name, MCP_SERVER_LIST_SERVERS_TOOL) == 0;
+}
+
+static int register_builtin_plugins(struct mcp_server *server)
+{
+#if MCP_HAS_FILE_TRANSFER_PLUGIN_BUILTIN
+    static const struct mcp_builtin_plugin_descriptor file_transfer = {
+        "mcp_file_transfer_plugin",
+        "builtin:mcp_file_transfer_plugin",
+        mcp_file_transfer_plugin_init,
+        mcp_file_transfer_plugin_invoke,
+        mcp_file_transfer_plugin_shutdown,
+    };
+
+    if (mcp_plugin_manager_register_builtin(server->plugin_manager, &file_transfer, "{}") != 0)
+        return -1;
+#else
+    (void)server;
+#endif
+
+    return 0;
 }
 
 static int extract_tool_call(json_t *params,
@@ -898,6 +921,7 @@ int mcp_server_init(struct mcp_server **out, uv_loop_t *loop, struct mcp_server_
         mcp_plugin_manager_create(&server->plugin_manager, server) != 0 ||
         mcp_gateway_create(&server->gateway, server->registry) != 0 ||
         mcp_server_discovery_create(&server->discovery, server, loop) != 0 ||
+        register_builtin_plugins(server) != 0 ||
         mcp_register_builtin_tools(server, server->registry) != 0) {
         mcp_server_destroy(server);
         return -1;

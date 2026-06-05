@@ -41,10 +41,12 @@ if(Python3_Interpreter_FOUND)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/server_discovery_liveness_smoke.py" "$<TARGET_FILE:mcp_server>" 18772 18773 18774 18775 18776 18777 18778 18779
     )
 
-    add_test(
-        NAME mcp_file_transfer_d_smoke
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/file_transfer_d_smoke.py" "$<TARGET_FILE:mcp_server>" "$<TARGET_FILE:mcp_file_transfer_plugin>" 18780 18781 18782 18783
-    )
+    if(TARGET mcp_file_transfer_plugin)
+        add_test(
+            NAME mcp_file_transfer_d_smoke
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/file_transfer_d_smoke.py" "$<TARGET_FILE:mcp_server>" "$<TARGET_FILE:mcp_file_transfer_plugin>" 18780 18781 18782 18783
+        )
+    endif()
 
     if(MCP_TRANSPORT_UDP)
         add_test(
