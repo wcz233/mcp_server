@@ -59,6 +59,13 @@ def initialize(proc):
     send(proc, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
 
 
+def list_tools(proc, request_id):
+    send(proc, {"jsonrpc": "2.0", "id": request_id, "method": "tools/list", "params": {}})
+    response = recv(proc)
+    assert response["id"] == request_id, response
+    return response["result"]["tools"]
+
+
 def start_server(exe):
     env = os.environ.copy()
     env["MCP_ENABLE_SHELL_EXEC"] = "1"
@@ -98,13 +105,27 @@ def main():
     try:
         initialize(proc)
 
-        tools = call_tool(proc, 2, "system.shell_list", {})
+        tool_schemas = {tool["name"]: tool["inputSchema"] for tool in list_tools(proc, 2)}
+        start_properties = tool_schemas["system.shell_start"]["properties"]
+        assert "command" in start_properties, start_properties
+        assert "label" in start_properties, start_properties
+        assert "env" in start_properties, start_properties
+        assert "args" not in start_properties, start_properties
+        assert start_properties["timeout_ms"]["maximum"] == 5000, start_properties
+        assert start_properties["output_limit_bytes"]["maximum"] == 16384, start_properties
+        assert start_properties["env"]["additionalProperties"]["type"] == "string", start_properties
+        tail_properties = tool_schemas["system.shell_tail"]["properties"]
+        assert "offset" not in tail_properties, tail_properties
+        assert "stdout_offset" in tail_properties, tail_properties
+        assert "stderr_offset" in tail_properties, tail_properties
+
+        tools = call_tool(proc, 3, "system.shell_list", {})
         assert tools["isError"] is False, tools
         assert "jobs" in json_content(tools), tools
 
         started = call_tool(
             proc,
-            3,
+            4,
             "system.shell_start",
             {"command": "sh -c 'printf start; sleep 0.2; printf done'", "timeout_ms": 2000},
         )
@@ -117,15 +138,67 @@ def main():
         assert start_payload["rollback"]["tool_name"] == "system.shell_kill", start_payload
 
         wait_payload = json_content(
-            call_tool(proc, 4, "system.shell_wait", {"job_id": job_id, "timeout_ms": 3000})
+            call_tool(proc, 5, "system.shell_wait", {"job_id": job_id, "timeout_ms": 3000})
         )
         assert wait_payload["wait_result"] == "finished", wait_payload
         assert wait_payload["state"] == "exited", wait_payload
         assert wait_payload["exit_code"] == 0, wait_payload
 
-        tail_payload = json_content(call_tool(proc, 5, "system.shell_tail", {"job_id": job_id}))
+        tail_payload = json_content(call_tool(proc, 6, "system.shell_tail", {"job_id": job_id}))
         assert tail_payload["stdout"] == "startdone", tail_payload
         assert tail_payload["next_stdout_offset"] == len("startdone"), tail_payload
+
+        env_started = json_content(
+            call_tool(
+                proc,
+                7,
+                "system.shell_start",
+                {
+                    "command": "printf '%s:%s' \"$MCP_TEST_ENV\" \"$LANG\"",
+                    "env": {"MCP_TEST_ENV": "from-env"},
+                    "label": "env-check",
+                },
+            )
+        )
+        assert env_started["label"] == "env-check", env_started
+        env_job_id = env_started["job_id"]
+        env_wait = json_content(call_tool(proc, 8, "system.shell_wait", {"job_id": env_job_id, "timeout_ms": 3000}))
+        assert env_wait["state"] == "exited", env_wait
+        env_tail = json_content(call_tool(proc, 9, "system.shell_tail", {"job_id": env_job_id}))
+        assert env_tail["stdout"] == "from-env:C", env_tail
+
+        truncated_started = json_content(
+            call_tool(
+                proc,
+                10,
+                "system.shell_start",
+                {"command": "printf abcdef", "output_limit_bytes": 256},
+            )
+        )
+        truncated_job_id = truncated_started["job_id"]
+        truncated_wait = json_content(
+            call_tool(proc, 11, "system.shell_wait", {"job_id": truncated_job_id, "timeout_ms": 3000})
+        )
+        assert truncated_wait["state"] == "exited", truncated_wait
+        truncated_tail = json_content(call_tool(proc, 12, "system.shell_tail", {"job_id": truncated_job_id}))
+        assert truncated_tail["stdout"] == "abcdef", truncated_tail
+        assert truncated_tail["stdout_truncated"] is False, truncated_tail
+
+        bad_timeout = call_tool(proc, 13, "system.shell_start", {"command": "true", "timeout_ms": 5001})
+        assert bad_timeout["isError"] is True, bad_timeout
+        assert "timeout_ms" in bad_timeout["content"][0]["text"], bad_timeout
+        bad_output_limit = call_tool(proc, 14, "system.shell_start", {"command": "true", "output_limit_bytes": 255})
+        assert bad_output_limit["isError"] is True, bad_output_limit
+        assert "output_limit_bytes" in bad_output_limit["content"][0]["text"], bad_output_limit
+        bad_args = call_tool(proc, 15, "system.shell_start", {"command": "true", "args": {}})
+        assert bad_args["isError"] is True, bad_args
+        assert "args" in bad_args["content"][0]["text"], bad_args
+        bad_env = call_tool(proc, 16, "system.shell_start", {"command": "true", "env": {"BAD=NAME": "x"}})
+        assert bad_env["isError"] is True, bad_env
+        assert "env names" in bad_env["content"][0]["text"], bad_env
+        bad_offset = call_tool(proc, 17, "system.shell_tail", {"job_id": job_id, "offset": 0})
+        assert bad_offset["isError"] is True, bad_offset
+        assert "offset" in bad_offset["content"][0]["text"], bad_offset
 
         marker = Path(f"/tmp/mcp_shell_job_marker_{os.getpid()}")
         try:
@@ -135,7 +208,7 @@ def main():
         kill_started = json_content(
             call_tool(
                 proc,
-                6,
+                18,
                 "system.shell_start",
                 {
                     "command": f"sh -c 'sleep 2; touch {marker}'",
@@ -145,9 +218,8 @@ def main():
             )
         )
         kill_job_id = kill_started["job_id"]
-        killed = json_content(call_tool(proc, 7, "system.shell_kill", {"job_id": kill_job_id, "signal": signal.SIGTERM}))
+        killed = json_content(call_tool(proc, 19, "system.shell_kill", {"job_id": kill_job_id, "signal": signal.SIGTERM}))
         assert killed["state"] == "killed", killed
-        killed = wait_for_state(proc, kill_job_id, "killed")
         assert killed["signal"] in (signal.SIGTERM, signal.SIGKILL), killed
         time.sleep(2.2)
         assert not marker.exists(), marker
@@ -155,7 +227,7 @@ def main():
         timed_started = json_content(
             call_tool(
                 proc,
-                8,
+                20,
                 "system.shell_start",
                 {"command": "sh -c 'sleep 2'", "timeout_ms": 100},
             )
@@ -163,9 +235,10 @@ def main():
         timed = wait_for_state(proc, timed_started["job_id"], "timed_out")
         assert timed["signal"] != 0, timed
 
-        jobs = json_content(call_tool(proc, 9, "system.shell_list", {}))["jobs"]
+        jobs = json_content(call_tool(proc, 21, "system.shell_list", {}))["jobs"]
         ids = {job["job_id"] for job in jobs}
         assert job_id in ids and kill_job_id in ids and timed_started["job_id"] in ids, jobs
+        assert env_job_id in ids and truncated_job_id in ids, jobs
     finally:
         if proc.stdin:
             proc.stdin.close()

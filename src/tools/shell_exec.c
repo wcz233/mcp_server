@@ -9,7 +9,6 @@
 #include <jansson.h>
 #include <limits.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -307,6 +306,11 @@ static int set_config_error(struct shell_exec_config *cfg, const char *message)
     return cfg->load_error ? 0 : -1;
 }
 
+static bool shell_exec_env_name_is_valid(const char *name)
+{
+    return name && name[0] != '\0' && !strchr(name, '=');
+}
+
 static int shell_exec_config_set_env_var(struct shell_exec_config *cfg,
                                          const char *name,
                                          const char *value)
@@ -316,7 +320,7 @@ static int shell_exec_config_set_env_var(struct shell_exec_config *cfg,
     char *value_copy;
     size_t i;
 
-    if (!name || name[0] == '\0' || strchr(name, '='))
+    if (!shell_exec_env_name_is_valid(name))
         return set_config_error(cfg, "shell_exec env names must be non-empty and must not contain '='.");
     if (!value)
         value = "";
@@ -1008,19 +1012,6 @@ static unsigned int shell_exec_resolve_timeout(const struct shell_exec_config *c
     return clamp_uint(parsed, cfg->default_timeout_ms, MCP_SHELL_EXEC_MIN_TIMEOUT_MS, cfg->max_timeout_ms);
 }
 
-static unsigned int shell_exec_resolve_output_limit(const struct shell_exec_config *cfg,
-                                                    const struct mcp_tool_invocation *invocation)
-{
-    json_t *value = json_object_get(invocation->arguments, "output_limit_bytes");
-    unsigned long parsed;
-
-    if (!json_is_integer(value))
-        return cfg->max_output_bytes;
-
-    parsed = (unsigned long)json_integer_value(value);
-    return clamp_uint(parsed, cfg->max_output_bytes, 256u, cfg->max_output_bytes);
-}
-
 static bool shell_job_string_arg(json_t *arguments, const char *name, const char **out)
 {
     json_t *value = json_object_get(arguments, name);
@@ -1416,7 +1407,7 @@ static int shell_exec_spawn_unix(const struct shell_exec_config *cfg,
 
     if (pid == 0) {
         if (cfg->kill_process_group_on_timeout)
-            (void)setsid();
+            (void)setpgid(0, 0);
 
         dup2(stdout_pipe[1], STDOUT_FILENO);
         if (cfg->capture_stderr) {
@@ -1447,6 +1438,9 @@ static int shell_exec_spawn_unix(const struct shell_exec_config *cfg,
         perror("shell_exec exec");
         _exit(127);
     }
+
+    if (cfg->kill_process_group_on_timeout)
+        (void)setpgid(pid, pid);
 
     shell_exec_envp_destroy(envp);
     envp = NULL;
@@ -2071,6 +2065,10 @@ static int shell_job_apply_start_overrides(struct shell_exec_config *cfg,
     }
 
     json_object_foreach(env, key, value) {
+        if (!shell_exec_env_name_is_valid(key)) {
+            *out_error = mcp_strdup("Invalid params: env names must be non-empty and must not contain '='.");
+            return 0;
+        }
         if (!json_is_string(value)) {
             *out_error = mcp_strdup("Invalid params: env values must be strings.");
             return 0;
@@ -2135,7 +2133,7 @@ static int shell_job_spawn_unix(const struct shell_exec_config *cfg,
         int null_fd;
 
         if (cfg->kill_process_group_on_timeout)
-            (void)setsid();
+            (void)setpgid(0, 0);
 
         null_fd = open("/dev/null", O_RDONLY);
         if (null_fd >= 0) {
@@ -2170,6 +2168,9 @@ static int shell_job_spawn_unix(const struct shell_exec_config *cfg,
         perror("shell_job exec");
         _exit(127);
     }
+
+    if (cfg->kill_process_group_on_timeout)
+        (void)setpgid(pid, pid);
 
     shell_exec_envp_destroy(envp);
     envp = NULL;
@@ -2305,6 +2306,7 @@ static void shell_job_poll_one(struct shell_job *job)
     if (job->state == SHELL_JOB_RUNNING && now >= job->deadline_ms) {
         job->timed_out_requested = true;
         shell_job_kill_process(job, SIGKILL);
+        job->signal_number = SIGKILL;
         shell_job_mark_finished(job, SHELL_JOB_TIMED_OUT);
     }
 }
@@ -2519,26 +2521,6 @@ fail:
     return mcp_tool_result_text("Failed to encode shell_exec result.", true);
 }
 
-json_t *mcp_shell_exec_input_schema(void)
-{
-    return json_pack("{s:s,s:{s:{s:s,s:s},s:{s:s,s:s}},s:[s]}",
-                     "type",
-                     "object",
-                     "properties",
-                     "command",
-                     "type",
-                     "string",
-                     "description",
-                     "Command string passed to the configured OS-isolated shell executor without content filtering.",
-                     "timeout_ms",
-                     "type",
-                     "integer",
-                     "description",
-                     "Optional timeout override in milliseconds.",
-                     "required",
-                     "command");
-}
-
 int mcp_tool_system_shell_exec(struct mcp_server *server,
                                const struct mcp_tool_invocation *invocation,
                                json_t **out_result)
@@ -2660,6 +2642,8 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
     const char *command;
     const char *label;
     size_t command_length;
+    unsigned int timeout_ms;
+    unsigned int output_limit_bytes;
     char *error_message = NULL;
     int rc = -1;
 
@@ -2692,6 +2676,11 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
         *out_result = mcp_tool_result_text(
             "system.shell_start is disabled by policy. Enable it in shell_exec.json or MCP_ENABLE_SHELL_EXEC=1 for a trusted session.",
             true);
+        rc = 0;
+        goto cleanup;
+    }
+    if (json_object_get(invocation->arguments, "args")) {
+        *out_result = mcp_tool_result_text("Invalid params: args is not supported by system.shell_start.", true);
         rc = 0;
         goto cleanup;
     }
@@ -2734,7 +2723,40 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
         goto cleanup;
     }
 
-    request.timeout_ms = shell_exec_resolve_timeout(&cfg, invocation);
+    if (!shell_job_uint_arg(invocation->arguments,
+                            "timeout_ms",
+                            cfg.default_timeout_ms,
+                            MCP_SHELL_EXEC_MIN_TIMEOUT_MS,
+                            cfg.max_timeout_ms,
+                            &timeout_ms)) {
+        char message[128];
+
+        snprintf(message,
+                 sizeof(message),
+                 "Invalid params: timeout_ms must be between 1 and %u for system.shell_start.",
+                 cfg.max_timeout_ms);
+        *out_result = mcp_tool_result_text(message, true);
+        rc = 0;
+        goto cleanup;
+    }
+    if (!shell_job_uint_arg(invocation->arguments,
+                            "output_limit_bytes",
+                            cfg.max_output_bytes,
+                            256u,
+                            cfg.max_output_bytes,
+                            &output_limit_bytes)) {
+        char message[160];
+
+        snprintf(message,
+                 sizeof(message),
+                 "Invalid params: output_limit_bytes must be between 256 and %u for system.shell_start.",
+                 cfg.max_output_bytes);
+        *out_result = mcp_tool_result_text(message, true);
+        rc = 0;
+        goto cleanup;
+    }
+
+    request.timeout_ms = timeout_ms;
     job = calloc(1, sizeof(*job));
     if (!job)
         goto cleanup;
@@ -2749,7 +2771,7 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
         goto cleanup;
     job->state = SHELL_JOB_RUNNING;
     job->timeout_ms = request.timeout_ms;
-    job->output_limit_bytes = shell_exec_resolve_output_limit(&cfg, invocation);
+    job->output_limit_bytes = output_limit_bytes;
     job->chunk_size = cfg.chunk_size;
     job->started_ms = mcp_now_ms();
     job->deadline_ms = job->started_ms + job->timeout_ms;
@@ -2861,7 +2883,6 @@ int mcp_tool_system_shell_tail(struct mcp_server *server,
 {
     const char *job_id;
     struct shell_job *job;
-    unsigned int offset = 0;
     unsigned int stdout_offset = 0;
     unsigned int stderr_offset = 0;
     unsigned int max_bytes = 4096;
@@ -2879,16 +2900,20 @@ int mcp_tool_system_shell_tail(struct mcp_server *server,
         return 0;
     }
 
-    if (!shell_job_uint_arg(invocation->arguments, "offset", 0, 0, job->output_limit_bytes, &offset) ||
-        !shell_job_uint_arg(invocation->arguments,
+    if (json_object_get(invocation->arguments, "offset")) {
+        *out_result = mcp_tool_result_text("Invalid params: offset is not supported by system.shell_tail.", true);
+        return 0;
+    }
+
+    if (!shell_job_uint_arg(invocation->arguments,
                             "stdout_offset",
-                            offset,
+                            0,
                             0,
                             job->output_limit_bytes,
                             &stdout_offset) ||
         !shell_job_uint_arg(invocation->arguments,
                             "stderr_offset",
-                            offset,
+                            0,
                             0,
                             job->output_limit_bytes,
                             &stderr_offset) ||
@@ -2995,6 +3020,7 @@ int mcp_tool_system_shell_kill(struct mcp_server *server,
 #ifndef _WIN32
         shell_job_kill_process(job, (int)signal_number);
 #endif
+        job->signal_number = (int)signal_number;
         shell_job_mark_finished(job, SHELL_JOB_KILLED);
         shell_jobs_ensure_timer(server->shell_jobs);
         shell_jobs_poll_all(server->shell_jobs);
@@ -3038,16 +3064,4 @@ int mcp_tool_system_shell_list(struct mcp_server *server,
     *out_result = mcp_tool_result_json_text(payload, false);
     json_decref(payload);
     return 0;
-}
-
-uint32_t mcp_shell_exec_registration_timeout_ms(void)
-{
-    struct shell_exec_config cfg;
-    uint32_t timeout_ms = MCP_SHELL_EXEC_DEFAULT_TIMEOUT_MS;
-
-    memset(&cfg, 0, sizeof(cfg));
-    if (shell_exec_config_load(&cfg) == 0 && cfg.config_loaded)
-        timeout_ms = cfg.default_timeout_ms;
-    shell_exec_config_destroy(&cfg);
-    return timeout_ms;
 }

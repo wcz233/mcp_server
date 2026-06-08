@@ -71,6 +71,25 @@ def verify_tool(proc, request_id, tool_name):
         assert "disabled" in parse_text_content(result), result
         return
 
+    if tool_name == "system.shell_start":
+        result = call_tool(proc, request_id, tool_name, {"command": "echo unsafe"})
+        assert result["isError"] is True, result
+        assert "disabled" in parse_text_content(result), result
+        return
+
+    if tool_name in ("system.shell_poll", "system.shell_tail", "system.shell_wait", "system.shell_kill"):
+        result = call_tool(proc, request_id, tool_name, {})
+        assert result["isError"] is True, result
+        assert "job_id" in parse_text_content(result), result
+        return
+
+    if tool_name == "system.shell_list":
+        result = call_tool(proc, request_id, tool_name, {})
+        assert result["isError"] is False, result
+        payload = assert_json_text(result)
+        assert "jobs" in payload and isinstance(payload["jobs"], list), payload
+        return
+
     if tool_name == "gateway.status":
         result = call_tool(proc, request_id, tool_name, {})
         assert result["isError"] is False, result

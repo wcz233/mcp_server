@@ -19,6 +19,7 @@ target_sources(mcp_server
         protocol/jsonrpc.c
         registry/tool_registry.c
         tools/builtin_tools.c
+        tools/schema.c
         tools/shell_exec.c
         tools/system_status.c
         tools/tool_result.c
