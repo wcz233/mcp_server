@@ -79,6 +79,30 @@ def main():
         shell = recv(proc)
         assert shell["result"]["isError"] is True
         assert "disabled" in shell["result"]["content"][0]["text"]
+
+        send(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {"name": "system.get_status", "arguments": {}},
+            },
+        )
+        status_response = recv(proc)
+        status_result = status_response["result"]
+        assert status_result["isError"] is False, status_result
+        status = json.loads(status_result["content"][0]["text"])
+        assert status["hostname"], status
+        assert "commands" in status and isinstance(status["commands"], dict), status
+        assert "cwd" not in status, status
+        assert "path" not in status, status
+        assert "shell" not in status, status
+        assert "network_interfaces" not in status, status
+        if sys.platform != "win32":
+            assert isinstance(status["uid"], int), status
+            assert isinstance(status["gid"], int), status
+            assert "sh" in status["commands"], status
     finally:
         proc.stdin.close()
         proc.wait(timeout=5)
