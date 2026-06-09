@@ -1,6 +1,18 @@
 find_package(Python3 COMPONENTS Interpreter)
 
 if(Python3_Interpreter_FOUND)
+    set(_mcp_file_transfer_path_plugin "-")
+    if(TARGET mcp_file_transfer_plugin)
+        set(_mcp_file_transfer_path_plugin "$<TARGET_FILE:mcp_file_transfer_plugin>")
+    endif()
+
+    if(NOT "${MCP_FILE_TRANSFER_PLUGIN}" STREQUAL "n")
+        add_test(
+            NAME mcp_file_transfer_path_smoke
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/file_transfer_path_smoke.py" "$<TARGET_FILE:mcp_server>" "${_mcp_file_transfer_path_plugin}" 18784 18785 18786 18787
+        )
+    endif()
+
     add_test(
         NAME mcp_stdio_smoke
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/stdio_smoke.py" "$<TARGET_FILE:mcp_server>"

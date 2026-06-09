@@ -465,13 +465,91 @@ static bool manifest_is_single_file_root(struct manifest_entry *entries, size_t 
            strcmp(entries[0].relpath, ".") == 0;
 }
 
-static bool path_is_separator(char ch)
+enum mft_path_separator_mode {
+    MFT_PATH_SEPARATOR_POSIX = 0,
+    MFT_PATH_SEPARATOR_WINDOWS = 1,
+};
+
+static bool path_is_windows_drive_letter(char ch)
+{
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+}
+
+static bool path_has_windows_drive_prefix(const char *path)
+{
+    return path &&
+           path_is_windows_drive_letter(path[0]) &&
+           path[1] == ':';
+}
+
+static enum mft_path_separator_mode path_native_separator_mode(void)
 {
 #ifdef _WIN32
-    return ch == '/' || ch == '\\';
+    return MFT_PATH_SEPARATOR_WINDOWS;
 #else
-    return ch == '/';
+    return MFT_PATH_SEPARATOR_POSIX;
 #endif
+}
+
+static enum mft_path_separator_mode path_remote_separator_mode(const char *path)
+{
+    if (path_has_windows_drive_prefix(path) || (path && strchr(path, '\\')))
+        return MFT_PATH_SEPARATOR_WINDOWS;
+    return MFT_PATH_SEPARATOR_POSIX;
+}
+
+static bool path_separators_are_consistent(const char *path,
+                                           enum mft_path_separator_mode mode)
+{
+    bool saw_forward = false;
+    bool saw_back = false;
+
+    if (mode != MFT_PATH_SEPARATOR_WINDOWS)
+        return true;
+    for (; path && *path; path++) {
+        if (*path == '/')
+            saw_forward = true;
+        else if (*path == '\\')
+            saw_back = true;
+        if (saw_forward && saw_back)
+            return false;
+    }
+    return true;
+}
+
+static bool path_is_separator_for_mode(char ch, enum mft_path_separator_mode mode)
+{
+    if (mode == MFT_PATH_SEPARATOR_WINDOWS)
+        return ch == '/' || ch == '\\';
+    return ch == '/';
+}
+
+static bool path_is_separator(char ch)
+{
+    return path_is_separator_for_mode(ch, path_native_separator_mode());
+}
+
+static char path_join_separator_for_mode(const char *root,
+                                         enum mft_path_separator_mode mode)
+{
+    if (mode == MFT_PATH_SEPARATOR_WINDOWS && root && strchr(root, '\\'))
+        return '\\';
+    return '/';
+}
+
+static int copy_relpath_with_separator(char *out,
+                                       size_t out_len,
+                                       const char *rel,
+                                       char separator)
+{
+    size_t i;
+
+    if (!out || out_len == 0 || !rel || strlen(rel) >= out_len)
+        return -1;
+    for (i = 0; rel[i]; i++)
+        out[i] = rel[i] == '/' ? separator : rel[i];
+    out[i] = '\0';
+    return 0;
 }
 
 static bool path_has_trailing_slash(const char *path)
@@ -484,22 +562,23 @@ static bool path_has_trailing_slash(const char *path)
     return len > 0 && path_is_separator(path[len - 1]);
 }
 
-static char *path_basename_dup(const char *path)
+static char *path_basename_dup_for_mode(const char *path,
+                                        enum mft_path_separator_mode mode)
 {
     const char *end;
     const char *start;
     char name[PATH_MAX];
     size_t len;
 
-    if (!path || path[0] == '\0')
+    if (!path || path[0] == '\0' || !path_separators_are_consistent(path, mode))
         return NULL;
     end = path + strlen(path);
-    while (end > path && path_is_separator(end[-1]))
+    while (end > path && path_is_separator_for_mode(end[-1], mode))
         end--;
     if (end == path)
         return NULL;
     start = end;
-    while (start > path && !path_is_separator(start[-1]))
+    while (start > path && !path_is_separator_for_mode(start[-1], mode))
         start--;
     len = (size_t)(end - start);
     if (len == 0 || len >= sizeof(name))
@@ -511,34 +590,46 @@ static char *path_basename_dup(const char *path)
     return mft_strdup(name);
 }
 
-static char *path_dirname_dup(const char *path)
+static char *path_basename_dup(const char *path)
+{
+    return path_basename_dup_for_mode(path, path_native_separator_mode());
+}
+
+static char *path_remote_basename_dup(const char *path)
+{
+    return path_basename_dup_for_mode(path, path_remote_separator_mode(path));
+}
+
+static char *path_dirname_dup_for_mode(const char *path,
+                                       enum mft_path_separator_mode mode)
 {
     const char *end;
     const char *slash;
     size_t len;
     char dir[PATH_MAX];
 
-    if (!path || path[0] == '\0')
+    if (!path || path[0] == '\0' || !path_separators_are_consistent(path, mode))
         return NULL;
     end = path + strlen(path);
-    while (end > path && path_is_separator(end[-1]))
+    while (end > path && path_is_separator_for_mode(end[-1], mode))
         end--;
     if (end == path)
         return NULL;
     slash = end;
-    while (slash > path && !path_is_separator(slash[-1]))
+    while (slash > path && !path_is_separator_for_mode(slash[-1], mode))
         slash--;
     if (slash == path)
         return mft_strdup(".");
     if (slash == path + 1 && path[0] == '/')
         return mft_strdup("/");
-#ifdef _WIN32
-    if (slash == path + 3 && path[1] == ':' && path_is_separator(path[2])) {
+    if (mode == MFT_PATH_SEPARATOR_WINDOWS &&
+        slash == path + 3 &&
+        path_has_windows_drive_prefix(path) &&
+        path_is_separator_for_mode(path[2], mode)) {
         memcpy(dir, path, 3);
         dir[3] = '\0';
         return mft_strdup(dir);
     }
-#endif
     len = (size_t)(slash - path - 1);
     if (len == 0 || len >= sizeof(dir))
         return NULL;
@@ -547,32 +638,59 @@ static char *path_dirname_dup(const char *path)
     return mft_strdup(dir);
 }
 
+static char *path_dirname_dup(const char *path)
+{
+    return path_dirname_dup_for_mode(path, path_native_separator_mode());
+}
+
 static int join_path(char *out, size_t out_len, const char *root, const char *rel)
 {
+    enum mft_path_separator_mode mode = path_native_separator_mode();
+    char rel_path[PATH_MAX];
+    char separator;
+    const char *infix;
+    char sep_text[2] = {0, 0};
     int len;
 
     if (!root || !rel)
         return -1;
     if (strcmp(rel, ".") == 0)
         len = snprintf(out, out_len, "%s", root);
-    else if (path_is_safe_rel(rel))
-        len = snprintf(out, out_len, "%s/%s", root, rel);
-    else
+    else if (path_is_safe_rel(rel)) {
+        separator = path_join_separator_for_mode(root, mode);
+        sep_text[0] = separator;
+        infix = path_has_trailing_slash(root) ? "" : sep_text;
+        if (copy_relpath_with_separator(rel_path, sizeof(rel_path), rel, separator) != 0)
+            return -1;
+        len = snprintf(out,
+                       out_len,
+                       "%s%s%s",
+                       root,
+                       infix,
+                       rel_path);
+    } else {
         return -1;
+    }
     return len >= 0 && (size_t)len < out_len ? 0 : -1;
 }
 
 static int append_path_component(char *out, size_t out_len, const char *root, const char *name)
 {
+    char separator;
+    const char *infix;
+    char sep_text[2] = {0, 0};
     int len;
 
     if (!root || !name || !path_is_safe_rel(name) || strcmp(name, ".") == 0)
         return -1;
+    separator = path_join_separator_for_mode(root, path_native_separator_mode());
+    sep_text[0] = separator;
+    infix = path_has_trailing_slash(root) ? "" : sep_text;
     len = snprintf(out,
                    out_len,
                    "%s%s%s",
                    root,
-                   path_has_trailing_slash(root) ? "" : "/",
+                   infix,
                    name);
     return len >= 0 && (size_t)len < out_len ? 0 : -1;
 }
@@ -593,7 +711,7 @@ static int ensure_parent_dirs(const char *path)
         return -1;
     strcpy(tmp, path);
     for (p = tmp + 1; *p; p++) {
-        if (*p != '/')
+        if (!path_is_separator(*p))
             continue;
         *p = '\0';
         if (mkdir(tmp, 0777) != 0 && errno != EEXIST)
@@ -1598,7 +1716,7 @@ static int start_recv(const char *invocation_id,
     ctx->transfer_id = make_transfer_id();
     ctx->local_path = mft_strdup(local_path);
     ctx->remote_path = mft_strdup(remote_path);
-    ctx->source_name = path_basename_dup(remote_path);
+    ctx->source_name = path_remote_basename_dup(remote_path);
     ctx->server_id = server_id;
     ctx->timeout_ms = timeout_ms;
     ctx->started_ms = g_plugin.host->now_ms(g_plugin.host->host_context);
