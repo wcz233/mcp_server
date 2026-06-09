@@ -1,19 +1,144 @@
 #include "mcp/plugin/plugin_abi.h"
 
 #include <errno.h>
-#include <dirent.h>
 #include <fcntl.h>
 #include <jansson.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#include <windows.h>
+#else
+#include <dirent.h>
+#include <sys/select.h>
 #include <unistd.h>
+#endif
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+#ifdef _WIN32
+#ifndef S_ISDIR
+#define S_ISDIR(mode) (((mode) & _S_IFMT) == _S_IFDIR)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(mode) (((mode) & _S_IFMT) == _S_IFREG)
+#endif
+#define stat _stat64
+
+struct dirent {
+    char d_name[PATH_MAX];
+};
+
+typedef struct mft_win_dir {
+    HANDLE handle;
+    WIN32_FIND_DATAA data;
+    int first;
+    struct dirent entry;
+} DIR;
+
+static int mft_win_path_has_trailing_separator(const char *path)
+{
+    size_t len;
+
+    if (!path)
+        return 0;
+    len = strlen(path);
+    return len > 0 && (path[len - 1] == '/' || path[len - 1] == '\\');
+}
+
+static DIR *opendir(const char *path)
+{
+    char pattern[PATH_MAX];
+    DIR *dir;
+    int len;
+
+    if (!path) {
+        errno = EINVAL;
+        return NULL;
+    }
+    len = snprintf(pattern,
+                   sizeof(pattern),
+                   "%s%s*",
+                   path,
+                   mft_win_path_has_trailing_separator(path) ? "" : "\\");
+    if (len < 0 || (size_t)len >= sizeof(pattern)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+
+    dir = calloc(1, sizeof(*dir));
+    if (!dir)
+        return NULL;
+    dir->handle = FindFirstFileA(pattern, &dir->data);
+    if (dir->handle == INVALID_HANDLE_VALUE) {
+        free(dir);
+        errno = ENOENT;
+        return NULL;
+    }
+    dir->first = 1;
+    return dir;
+}
+
+static struct dirent *readdir(DIR *dir)
+{
+    size_t len;
+
+    if (!dir) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (dir->first) {
+        dir->first = 0;
+    } else if (!FindNextFileA(dir->handle, &dir->data)) {
+        return NULL;
+    }
+
+    len = strlen(dir->data.cFileName);
+    if (len >= sizeof(dir->entry.d_name)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    memcpy(dir->entry.d_name, dir->data.cFileName, len + 1);
+    return &dir->entry;
+}
+
+static int closedir(DIR *dir)
+{
+    int rc = 0;
+
+    if (!dir) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!FindClose(dir->handle))
+        rc = -1;
+    free(dir);
+    return rc;
+}
+#define chmod(path, mode) _chmod((path), (int)(mode))
+#define close(fd) _close(fd)
+#define mkdir(path, mode) _mkdir(path)
+#define open _open
+#define write _write
+#define lseek _lseeki64
+#ifndef ssize_t
+typedef intptr_t ssize_t;
+#endif
+#ifndef mode_t
+typedef int mode_t;
+#endif
+#endif
 
 #ifdef MCP_FILE_TRANSFER_PLUGIN_BUILTIN
 #define MFT_PLUGIN_EXPORT
@@ -25,10 +150,6 @@
 #define MFT_PLUGIN_INIT mcp_plugin_init
 #define MFT_PLUGIN_INVOKE mcp_plugin_invoke
 #define MFT_PLUGIN_SHUTDOWN mcp_plugin_shutdown
-#endif
-
-#ifndef PATH_MAX
-#define PATH_MAX 4096
 #endif
 
 #define MFT_MAGIC "MFT1"
@@ -228,6 +349,19 @@ static void hash_to_hex(const unsigned char hash[32], char out[65])
         out[i * 2 + 1] = hex[hash[i] & 0x0f];
     }
     out[64] = '\0';
+}
+
+static void mft_sleep_ms(unsigned int milliseconds)
+{
+#ifdef _WIN32
+    Sleep(milliseconds);
+#else
+    struct timeval delay;
+
+    delay.tv_sec = (long)(milliseconds / 1000u);
+    delay.tv_usec = (long)((milliseconds % 1000u) * 1000u);
+    select(0, NULL, NULL, NULL, &delay);
+#endif
 }
 
 static int file_sha256(const char *path, char out[65])
@@ -549,7 +683,16 @@ static int write_all_at(const char *path,
             close(fd);
             return -1;
         }
+#ifdef _WIN32
+        {
+            size_t remaining = len - done;
+            unsigned int chunk = remaining > UINT_MAX ? UINT_MAX : (unsigned int)remaining;
+
+            written = write(fd, data + done, chunk);
+        }
+#else
         written = write(fd, data + done, len - done);
+#endif
         if (written <= 0) {
             close(fd);
             return -1;
@@ -929,7 +1072,6 @@ static void handle_hello(unsigned int server_id, json_t *payload)
 static int ensure_capability(unsigned int server_id)
 {
     unsigned int i;
-    struct timeval delay;
 
     if (g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
                                                      server_id,
@@ -941,9 +1083,7 @@ static int ensure_capability(unsigned int server_id)
                                                          server_id,
                                                          MFT_CAP_WHOLE_FILE))
             return 0;
-        delay.tv_sec = 0;
-        delay.tv_usec = 20000;
-        select(0, NULL, NULL, NULL, &delay);
+        mft_sleep_ms(20);
     }
     return -1;
 }
