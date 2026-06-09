@@ -35,7 +35,12 @@
 #define S_ISREG(mode) (((mode) & _S_IFMT) == _S_IFREG)
 #endif
 #define stat _stat64
+#define MFT_OPEN_BINARY _O_BINARY
+#else
+#define MFT_OPEN_BINARY 0
+#endif
 
+#ifdef _WIN32
 struct dirent {
     char d_name[PATH_MAX];
 };
@@ -460,6 +465,15 @@ static bool manifest_is_single_file_root(struct manifest_entry *entries, size_t 
            strcmp(entries[0].relpath, ".") == 0;
 }
 
+static bool path_is_separator(char ch)
+{
+#ifdef _WIN32
+    return ch == '/' || ch == '\\';
+#else
+    return ch == '/';
+#endif
+}
+
 static bool path_has_trailing_slash(const char *path)
 {
     size_t len;
@@ -467,7 +481,7 @@ static bool path_has_trailing_slash(const char *path)
     if (!path)
         return false;
     len = strlen(path);
-    return len > 0 && path[len - 1] == '/';
+    return len > 0 && path_is_separator(path[len - 1]);
 }
 
 static char *path_basename_dup(const char *path)
@@ -480,12 +494,12 @@ static char *path_basename_dup(const char *path)
     if (!path || path[0] == '\0')
         return NULL;
     end = path + strlen(path);
-    while (end > path && end[-1] == '/')
+    while (end > path && path_is_separator(end[-1]))
         end--;
     if (end == path)
         return NULL;
     start = end;
-    while (start > path && start[-1] != '/')
+    while (start > path && !path_is_separator(start[-1]))
         start--;
     len = (size_t)(end - start);
     if (len == 0 || len >= sizeof(name))
@@ -507,17 +521,24 @@ static char *path_dirname_dup(const char *path)
     if (!path || path[0] == '\0')
         return NULL;
     end = path + strlen(path);
-    while (end > path && end[-1] == '/')
+    while (end > path && path_is_separator(end[-1]))
         end--;
     if (end == path)
         return NULL;
     slash = end;
-    while (slash > path && slash[-1] != '/')
+    while (slash > path && !path_is_separator(slash[-1]))
         slash--;
     if (slash == path)
         return mft_strdup(".");
     if (slash == path + 1 && path[0] == '/')
         return mft_strdup("/");
+#ifdef _WIN32
+    if (slash == path + 3 && path[1] == ':' && path_is_separator(path[2])) {
+        memcpy(dir, path, 3);
+        dir[3] = '\0';
+        return mft_strdup(dir);
+    }
+#endif
     len = (size_t)(slash - path - 1);
     if (len == 0 || len >= sizeof(dir))
         return NULL;
@@ -675,7 +696,7 @@ static int write_all_at(const char *path,
 
     if (ensure_parent_dirs(path) != 0)
         return -1;
-    fd = open(path, O_CREAT | O_WRONLY, 0666);
+    fd = open(path, O_CREAT | O_WRONLY | MFT_OPEN_BINARY | (offset == 0 ? O_TRUNC : 0), 0666);
     if (fd < 0)
         return -1;
     while (done < len) {

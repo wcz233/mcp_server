@@ -197,7 +197,8 @@ def main():
         (src / "sub" / "file2.bin").write_bytes(b"b" * 70000)
         (src / "root.txt").write_text("root\n", encoding="utf-8")
         (file_src_dir / "single.txt").write_text("single\n", encoding="utf-8")
-        (remote_fetch_dir / "fetched.txt").write_text("fetched\n", encoding="utf-8")
+        fetched_bytes = b"fetched\nbinary\x00tail\n"
+        (remote_fetch_dir / "fetched.txt").write_bytes(fetched_bytes)
 
         send_result = json_text(
             call_tool(
@@ -274,7 +275,7 @@ def main():
             )
         )
         assert recv_file_result["files_transferred"] == 1, recv_file_result
-        assert (Path(tmp) / "fetched.txt").read_text(encoding="utf-8") == "fetched\n"
+        assert (Path(tmp) / "fetched.txt").read_bytes() == fetched_bytes
 
         missing_recv = call_tool(
             sock_a,
