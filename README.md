@@ -197,6 +197,42 @@ MCP_ENABLE_SHELL_EXEC=1 \
 ./mcp_server/build/src/mcp_server
 ```
 
+开机自启脚本:
+
+```shell
+sudo vim /etc/systemd/system/mcp_server.service
+```
+
+```shell
+[Unit]
+Description=MCP Server
+After=network.target
+
+[Service]
+Type=simple
+Environment=MCP_ENABLE_STDIO=0
+Environment=MCP_ENABLE_TCP=1
+Environment=MCP_TCP_HOST=192.168.16.3
+Environment=MCP_TCP_PORT=18767
+Environment=MCP_ENABLE_SHELL_EXEC=1
+ExecStart=/home/alinx/prj/mcp/mcp_server/build/src/mcp_server
+WorkingDirectory=/home/alinx/prj/mcp/mcp_server/build/src
+Restart=always
+RestartSec=3
+
+# 如果你想指定用户运行，取消下面注释并改成实际用户名
+# User=alinx
+# Group=alinx
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```shell
+sudo systemctl enable mcp_server.service
+sudo systemctl restart mcp_server.service
+```
+
 ### Windows
 
 PowerShell：
@@ -204,13 +240,80 @@ PowerShell：
 ```powershell
 $env:MCP_ENABLE_STDIO = "0"
 $env:MCP_ENABLE_TCP = "1"
-$env:MCP_TCP_HOST = "192.168.222.1"
+$env:MCP_TCP_HOST = "192.168.16.2"
 $env:MCP_TCP_PORT = "18767"
 $env:MCP_ENABLE_SHELL_EXEC = "1"
 .\build\src\Release\mcp_server.exe
 ```
 
+CMD:
+
+```cmd
+set MCP_ENABLE_STDIO=0
+set MCP_ENABLE_TCP=1
+set MCP_TCP_HOST=192.168.16.2
+set MCP_TCP_PORT=18767
+set MCP_ENABLE_SHELL_EXEC=1
+.\build\src\Release\mcp_server.exe
+```
+
 如果只允许本机访问，可以把 `MCP_TCP_HOST` 设为 `127.0.0.1`。
+
+开机自启服务：
+下载 nssm- the Non-Sucking Service Manager，并加入 path:
+
+```web-idl
+https://nssm.cc/release/nssm-2.24.zip
+```
+
+创建 start_mcp_server.bat :
+
+```bat
+@echo off
+set MCP_ENABLE_STDIO=0
+set MCP_ENABLE_TCP=1
+set MCP_TCP_HOST=192.168.16.2
+set MCP_TCP_PORT=18767
+set MCP_ENABLE_SHELL_EXEC=1
+
+cd /d D:\Project\2025-12-02\mcp\mcp_server
+.\build\src\Release\mcp_server.exe
+```
+
+```cmd
+nssm install mcp_server
+```
+
+在弹出来的图形界面中:
+
+```cmd
+Path
+C:\Windows\System32\cmd.exe
+
+Startup directory
+D:\Project\2025-12-02\mcp\mcp_server
+
+Arguments
+/c "D:\Project\2025-12-02\mcp\start_mcp_server.bat"
+
+Service name
+mcp_server
+```
+配置好 nssm 之后，打开一个 cmd 配置开机自启:
+
+```cmd
+#开机自启
+sc config mcp_server start= auto
+#sc config mcp_server start= delayed-auto
+#立即启动
+net start mcp_server
+#查看当前状态
+sc query mcp_server
+#从开机自启改为手动启动
+sc config mcp_server start= demand
+```
+
+
 
 ## 配置 Codex
 
@@ -223,7 +326,7 @@ adapter 通常由 Codex 按 `config.toml` 自动启动，不需要单独常驻�
 command = "D:\\Project\\2025-12-02\\mcp\\mcp_stdio_proxy_adapter\\build\\Release\\mcp_stdio_proxy_adapter.exe"
 args = [
   "--transport", "tcp",
-  "--host", "192.168.222.128",
+  "--host", "192.168.16.3",
   "--port", "18767",
   "--timeout-ms", "3000"
 ]
@@ -236,7 +339,7 @@ Linux 路径示例：
 command = "/home/alinx/prj/mcp/mcp_stdio_proxy_adapter/build/mcp_stdio_proxy_adapter"
 args = [
   "--transport", "tcp",
-  "--host", "192.168.222.128",
+  "--host", "192.168.16.3",
   "--port", "18767",
   "--timeout-ms", "3000"
 ]
