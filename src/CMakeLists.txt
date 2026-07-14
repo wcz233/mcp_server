@@ -66,6 +66,8 @@ else()
 endif()
 
 if(MCP_FILE_TRANSFER_PLUGIN STREQUAL "m")
+    find_package(Threads REQUIRED)
+
     add_library(mcp_file_transfer_plugin MODULE
         plugins/file_transfer/file_transfer_plugin.c
     )
@@ -84,6 +86,7 @@ if(MCP_FILE_TRANSFER_PLUGIN STREQUAL "m")
     target_link_libraries(mcp_file_transfer_plugin
         PRIVATE
             MCP::jansson
+            Threads::Threads
     )
 
     set_target_properties(mcp_file_transfer_plugin PROPERTIES

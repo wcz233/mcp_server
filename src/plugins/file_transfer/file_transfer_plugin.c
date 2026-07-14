@@ -19,6 +19,7 @@
 #include <windows.h>
 #else
 #include <dirent.h>
+#include <pthread.h>
 #include <sys/select.h>
 #include <unistd.h>
 #endif
@@ -161,8 +162,15 @@ typedef int mode_t;
 #define MFT_VERSION 1u
 #define MFT_CAP_WHOLE_FILE "mft.v1.whole_file"
 #define MFT_CAP_RESUME "mft.v1.resume"
+#define MFT_CAP_BLOCK_ACK "mft.v1.block_ack"
+#define MFT_LOGICAL_BLOCK_SIZE (64u * 1024u * 1024u)
 #define MFT_MAX_CHUNK 32768u
 #define MFT_MAX_CONCURRENT_STREAMS 4u
+#define MFT_MAX_BLOCK_RETRIES 3u
+#define MFT_BLOCK_TIMEOUT_MS 10000u
+#define MFT_PUMP_RETRY_MS 50u
+#define MFT_PUMP_MAX_BLOCKS 4u
+#define MFT_MAX_IN_FLIGHT_BLOCKS 4u
 #define MFT_DEFAULT_TIMEOUT_MS 30000u
 #define MFT_MIN_TIMEOUT_MS 1000u
 #define MFT_MAX_TIMEOUT_MS 600000u
@@ -186,6 +194,30 @@ struct sha256_ctx {
     size_t datalen;
 };
 
+struct transfer_context;
+static int touch_transfer_activity(struct transfer_context *ctx);
+
+struct block_entry {
+    uint64_t offset;
+    uint64_t size;
+    unsigned int retries;
+    char hash[65];
+    bool sent;
+    bool ack_waiting;
+    bool acked;
+    bool resend_pending;
+    bool received_ok;
+    bool receive_waiting;
+    bool receive_failed;
+    bool receive_hash_started;
+    bool receive_hash_failed;
+    uint64_t send_next_offset;
+    uint64_t receive_next_offset;
+    unsigned long long ack_deadline_ms;
+    unsigned long long receive_deadline_ms;
+    struct sha256_ctx receive_hash_ctx;
+};
+
 struct manifest_entry {
     char *relpath;
     char type;
@@ -193,14 +225,132 @@ struct manifest_entry {
     uint64_t mtime_ns;
     unsigned int mode;
     char hash[65];
+    struct block_entry *blocks;
+    size_t block_count;
 };
 
 struct mft_plugin {
     const struct mcp_plugin_host_api *host;
     unsigned long long next_transfer;
+#ifdef _WIN32
+    CRITICAL_SECTION lock;
+    CONDITION_VARIABLE timer_cv;
+    HANDLE timer_thread;
+#else
+    pthread_mutex_t lock;
+    pthread_cond_t timer_cond;
+    pthread_t timer_thread;
+#endif
+    bool sync_initialized;
+    bool timer_started;
+    bool timer_stop;
+};
+
+struct transfer_context {
+    char *invocation_id;
+    char *transfer_id;
+    char *local_path;
+    char *remote_path;
+    char *source_name;
+    char direction[8];
+    unsigned int server_id;
+    uint32_t timeout_ms;
+    unsigned long long started_ms;
+    unsigned long long deadline_ms;
+    FILE *send_fp;
+    size_t send_entry_index;
+    size_t send_block_index;
+    size_t recv_entry_index;
+    size_t recv_block_index;
+    uint64_t bytes_total;
+    uint64_t bytes_transferred;
+    unsigned int files_skipped;
+    unsigned int files_transferred;
+    bool send_complete_sent;
+    bool send_paused;
+    bool pumping;
+    bool cancelled;
+    bool free_after_pump;
+    bool completed;
+    unsigned long long send_pump_deadline_ms;
+    struct manifest_entry *entries;
+    size_t entry_count;
+    json_t *accept;
+    struct transfer_context *next;
+};
+
+struct pending_block_ack {
+    unsigned int server_id;
+    char *transfer_id;
+    uint32_t stream_id;
+    size_t block_index;
+    uint64_t offset;
+    uint64_t size;
+    bool ok;
+    struct pending_block_ack *next;
+};
+
+struct pending_transfer_error {
+    struct transfer_context *ctx;
+    const char *message;
+    bool notify_peer;
+    struct pending_transfer_error *next;
+};
+
+struct pending_pump {
+    char *transfer_id;
+    struct pending_pump *next;
 };
 
 static struct mft_plugin g_plugin;
+
+static struct transfer_context *find_transfer(const char *transfer_id);
+static void unlink_transfer(struct transfer_context *ctx);
+static void release_transfer_after_unlink(struct transfer_context *ctx);
+static void complete_transfer_error_unlinked(struct transfer_context *ctx,
+                                             const char *message,
+                                             bool notify_peer);
+static int send_pump(struct transfer_context *ctx);
+static void schedule_send_pump(struct transfer_context *ctx, unsigned int delay_ms);
+static bool accept_item_is_receive(json_t *accept, size_t index);
+
+#ifdef _WIN32
+static void mft_lock(void)
+{
+    if (g_plugin.sync_initialized)
+        EnterCriticalSection(&g_plugin.lock);
+}
+
+static void mft_unlock(void)
+{
+    if (g_plugin.sync_initialized)
+        LeaveCriticalSection(&g_plugin.lock);
+}
+
+static void mft_signal_timer(void)
+{
+    if (g_plugin.sync_initialized)
+        WakeConditionVariable(&g_plugin.timer_cv);
+}
+#else
+static void mft_lock(void)
+{
+    if (g_plugin.sync_initialized)
+        pthread_mutex_lock(&g_plugin.lock);
+}
+
+static void mft_unlock(void)
+{
+    if (g_plugin.sync_initialized)
+        pthread_mutex_unlock(&g_plugin.lock);
+}
+
+static void mft_signal_timer(void)
+{
+    if (g_plugin.sync_initialized)
+        pthread_cond_signal(&g_plugin.timer_cond);
+}
+#endif
 
 static char *mft_strdup(const char *value)
 {
@@ -391,6 +541,71 @@ static int file_sha256(const char *path, char out[65])
     fclose(fp);
     sha256_final(&ctx, hash);
     hash_to_hex(hash, out);
+    return 0;
+}
+
+static void bytes_sha256(const unsigned char *data, size_t len, char out[65])
+{
+    unsigned char hash[32];
+    struct sha256_ctx ctx;
+
+    sha256_init(&ctx);
+    sha256_update(&ctx, data, len);
+    sha256_final(&ctx, hash);
+    hash_to_hex(hash, out);
+}
+
+static int fill_file_hashes(FILE *fp, struct manifest_entry *entry)
+{
+    unsigned char buf[32768];
+    unsigned char hash[32];
+    struct sha256_ctx file_ctx;
+    struct sha256_ctx block_ctx;
+    uint64_t remaining = entry->size;
+    uint64_t block_remaining = 0;
+    size_t block_index = 0;
+    bool block_active = false;
+
+    if (fseek(fp, 0, SEEK_SET) != 0)
+        return -1;
+    sha256_init(&file_ctx);
+    while (remaining > 0) {
+        size_t want = remaining > sizeof(buf) ? sizeof(buf) : (size_t)remaining;
+        size_t n = fread(buf, 1, want, fp);
+        size_t used = 0;
+
+        if (n == 0)
+            return -1;
+        sha256_update(&file_ctx, buf, n);
+        remaining -= n;
+        while (used < n) {
+            size_t take;
+
+            if (!block_active) {
+                if (block_index >= entry->block_count)
+                    return -1;
+                sha256_init(&block_ctx);
+                block_remaining = entry->blocks[block_index].size;
+                block_active = true;
+            }
+            take = n - used;
+            if (take > block_remaining)
+                take = (size_t)block_remaining;
+            sha256_update(&block_ctx, buf + used, take);
+            used += take;
+            block_remaining -= take;
+            if (block_remaining == 0) {
+                sha256_final(&block_ctx, hash);
+                hash_to_hex(hash, entry->blocks[block_index].hash);
+                block_index++;
+                block_active = false;
+            }
+        }
+    }
+    if (ferror(fp) || block_active || block_index != entry->block_count)
+        return -1;
+    sha256_final(&file_ctx, hash);
+    hash_to_hex(hash, entry->hash);
     return 0;
 }
 
@@ -710,7 +925,12 @@ static int ensure_parent_dirs(const char *path)
     if (!path || strlen(path) >= sizeof(tmp))
         return -1;
     strcpy(tmp, path);
-    for (p = tmp + 1; *p; p++) {
+    p = tmp + 1;
+#ifdef _WIN32
+    if (path_has_windows_drive_prefix(tmp) && path_is_separator_for_mode(tmp[2], MFT_PATH_SEPARATOR_WINDOWS))
+        p = tmp + 3;
+#endif
+    for (; *p; p++) {
         if (!path_is_separator(*p))
             continue;
         *p = '\0';
@@ -792,15 +1012,23 @@ static uint64_t validated_resume_offset(const char *final_path,
                                         const struct manifest_entry *entry)
 {
     char path[PATH_MAX];
+    char hash[65];
     struct stat st;
+    uint64_t size;
 
     if (part_path(path, sizeof(path), final_path) != 0)
         return 0;
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
         return 0;
-    if ((uint64_t)st.st_size >= entry->size)
+    size = (uint64_t)st.st_size;
+    if (size > entry->size)
         return 0;
-    return (uint64_t)st.st_size;
+    if (size == entry->size) {
+        if (file_sha256(path, hash) == 0 && strcmp(hash, entry->hash) == 0)
+            return entry->size;
+        return 0;
+    }
+    return 0;
 }
 
 static int write_all_at(const char *path,
@@ -814,7 +1042,7 @@ static int write_all_at(const char *path,
 
     if (ensure_parent_dirs(path) != 0)
         return -1;
-    fd = open(path, O_CREAT | O_WRONLY | MFT_OPEN_BINARY | (offset == 0 ? O_TRUNC : 0), 0666);
+    fd = open(path, O_CREAT | O_WRONLY | MFT_OPEN_BINARY, 0666);
     if (fd < 0)
         return -1;
     while (done < len) {
@@ -842,28 +1070,51 @@ static int write_all_at(const char *path,
     return 0;
 }
 
+static int truncate_file(const char *path)
+{
+    int fd;
+
+    if (ensure_parent_dirs(path) != 0)
+        return -1;
+    fd = open(path, O_CREAT | O_WRONLY | O_TRUNC | MFT_OPEN_BINARY, 0666);
+    if (fd < 0)
+        return -1;
+    close(fd);
+    return 0;
+}
+
 static int copy_file_range_chunks(FILE *fp,
                                   uint64_t offset,
-                                  uint64_t size,
+                                  uint64_t end_offset,
                                   unsigned int server_id,
                                   const char *transfer_id,
-                                  uint32_t stream_id)
+                                  struct transfer_context *ctx,
+                                  uint32_t stream_id,
+                                  uint64_t *out_next_offset)
 {
     unsigned char *frame;
     unsigned char buf[MFT_MAX_CHUNK];
     uint64_t pos = offset;
+    uint16_t tid_len;
+    int rc;
+
+    if (!transfer_id)
+        return -1;
+    tid_len = (uint16_t)strlen(transfer_id);
 
     if (fseek(fp, (long)offset, SEEK_SET) != 0)
         return -1;
 
-    while (pos < size) {
-        size_t want = (size_t)((size - pos) > MFT_MAX_CHUNK ? MFT_MAX_CHUNK : (size - pos));
+    while (pos < end_offset) {
+        size_t want = (size_t)((end_offset - pos) > MFT_MAX_CHUNK ? MFT_MAX_CHUNK :
+                                                              (end_offset - pos));
         size_t n = fread(buf, 1, want, fp);
-        uint16_t tid_len = (uint16_t)strlen(transfer_id);
-        size_t header_len = 4 + 1 + 1 + 2 + 4 + 8 + 4 + tid_len;
+        char chunk_hash[65];
+        size_t header_len = 4 + 1 + 1 + 2 + 4 + 8 + 4 + 64 + tid_len;
 
         if (n == 0)
             return -1;
+        bytes_sha256(buf, n, chunk_hash);
         frame = malloc(header_len + n);
         if (!frame)
             return -1;
@@ -875,17 +1126,31 @@ static int copy_file_range_chunks(FILE *fp,
         write_u32_be(frame + 8, stream_id);
         write_u64_be(frame + 12, pos);
         write_u32_be(frame + 20, (uint32_t)n);
-        memcpy(frame + 24, transfer_id, tid_len);
+        memcpy(frame + 24, chunk_hash, 64);
+        memcpy(frame + 88, transfer_id, tid_len);
         memcpy(frame + header_len, buf, n);
-        if (g_plugin.host->peer_transport_send_frame(g_plugin.host->host_context,
-                                                     server_id,
-                                                     frame,
-                                                     (uint32_t)(header_len + n)) != 0) {
-            free(frame);
-            return -1;
-        }
+        mft_unlock();
+        rc = g_plugin.host->peer_transport_send_frame(g_plugin.host->host_context,
+                                                      server_id,
+                                                      frame,
+                                                      (uint32_t)(header_len + n));
+        mft_lock();
         free(frame);
+        if (ctx->cancelled || ctx->free_after_pump) {
+            if (out_next_offset)
+                *out_next_offset = pos;
+            return -3;
+        }
+        if (rc != 0) {
+            if (out_next_offset)
+                *out_next_offset = pos;
+            return rc == -2 ? -2 : -1;
+        }
+        if (touch_transfer_activity(ctx) != 0)
+            return -1;
         pos += n;
+        if (out_next_offset)
+            *out_next_offset = pos;
     }
     return 0;
 }
@@ -945,8 +1210,10 @@ static void free_entries(struct manifest_entry *entries, size_t count)
 {
     size_t i;
 
-    for (i = 0; i < count; i++)
+    for (i = 0; i < count; i++) {
         free(entries[i].relpath);
+        free(entries[i].blocks);
+    }
     free(entries);
 }
 
@@ -975,6 +1242,8 @@ static int build_entry(const char *path,
                        struct manifest_entry *entry)
 {
     struct stat st;
+    FILE *fp = NULL;
+    size_t i;
 
     if (stat(path, &st) != 0)
         return -1;
@@ -996,11 +1265,47 @@ static int build_entry(const char *path,
     }
     entry->type = 'f';
     entry->size = (uint64_t)st.st_size;
-    if (file_sha256(path, entry->hash) != 0) {
+    entry->block_count = entry->size == 0 ? 0 :
+                             (size_t)((entry->size + MFT_LOGICAL_BLOCK_SIZE - 1) /
+                                      MFT_LOGICAL_BLOCK_SIZE);
+    if (entry->block_count == 0) {
+        if (file_sha256(path, entry->hash) != 0) {
+            free(entry->relpath);
+            memset(entry, 0, sizeof(*entry));
+            return -1;
+        }
+        return 0;
+    }
+    entry->blocks = calloc(entry->block_count, sizeof(*entry->blocks));
+    if (!entry->blocks) {
         free(entry->relpath);
         memset(entry, 0, sizeof(*entry));
         return -1;
     }
+    fp = fopen(path, "rb");
+    if (!fp) {
+        free(entry->blocks);
+        free(entry->relpath);
+        memset(entry, 0, sizeof(*entry));
+        return -1;
+    }
+    for (i = 0; i < entry->block_count; i++) {
+        uint64_t offset = (uint64_t)i * MFT_LOGICAL_BLOCK_SIZE;
+        uint64_t remaining = entry->size - offset;
+
+        entry->blocks[i].offset = offset;
+        entry->blocks[i].size = remaining > MFT_LOGICAL_BLOCK_SIZE ?
+                                    MFT_LOGICAL_BLOCK_SIZE :
+                                    remaining;
+    }
+    if (fill_file_hashes(fp, entry) != 0) {
+        fclose(fp);
+        free(entry->blocks);
+        free(entry->relpath);
+        memset(entry, 0, sizeof(*entry));
+        return -1;
+    }
+    fclose(fp);
     return 0;
 }
 
@@ -1073,8 +1378,28 @@ static json_t *entries_to_manifest(struct manifest_entry *entries, size_t count)
                                  (json_int_t)entry->mtime_ns,
                                  "mode",
                                  (int)entry->mode);
-        if (entry->type == 'f')
+        if (entry->type == 'f') {
+            json_t *blocks = json_array();
+            size_t block_index;
+
             json_object_set_new(item, "hash", json_string(entry->hash));
+            json_object_set_new(item,
+                                "block_size",
+                                json_integer((json_int_t)MFT_LOGICAL_BLOCK_SIZE));
+            for (block_index = 0; block_index < entry->block_count; block_index++) {
+                struct block_entry *block = &entry->blocks[block_index];
+
+                json_array_append_new(blocks,
+                                      json_pack("{s:I,s:I,s:s}",
+                                                "offset",
+                                                (json_int_t)block->offset,
+                                                "size",
+                                                (json_int_t)block->size,
+                                                "hash",
+                                                block->hash));
+            }
+            json_object_set_new(item, "blocks", blocks);
+        }
         json_array_append_new(array, item);
     }
     json_object_set_new(manifest, "entries", array);
@@ -1108,6 +1433,7 @@ static int manifest_to_entries(json_t *manifest,
         json_t *mtime_ns = json_object_get(item, "mtime_ns");
         json_t *mode = json_object_get(item, "mode");
         json_t *hash = json_object_get(item, "hash");
+        json_t *blocks = json_object_get(item, "blocks");
         struct manifest_entry *entry = &entries[count];
 
         if (!json_is_string(relpath) ||
@@ -1129,11 +1455,61 @@ static int manifest_to_entries(json_t *manifest,
         entry->mtime_ns = (uint64_t)json_integer_value(mtime_ns);
         entry->mode = (unsigned int)json_integer_value(mode);
         if (entry->type == 'f') {
+            size_t block_index;
+            uint64_t expected_offset = 0;
+
             if (!json_is_string(hash) || strlen(json_string_value(hash)) != 64) {
                 free_entries(entries, count + 1);
                 return -1;
             }
             snprintf(entry->hash, sizeof(entry->hash), "%s", json_string_value(hash));
+            if (!json_is_array(blocks)) {
+                free_entries(entries, count + 1);
+                return -1;
+            }
+            entry->block_count = json_array_size(blocks);
+            if ((entry->size == 0 && entry->block_count != 0) ||
+                (entry->size != 0 && entry->block_count == 0)) {
+                free_entries(entries, count + 1);
+                return -1;
+            }
+            if (entry->block_count > 0) {
+                entry->blocks = calloc(entry->block_count, sizeof(*entry->blocks));
+                if (!entry->blocks) {
+                    free_entries(entries, count + 1);
+                    return -1;
+                }
+            }
+            for (block_index = 0; block_index < entry->block_count; block_index++) {
+                json_t *block_item = json_array_get(blocks, block_index);
+                json_t *offset = json_object_get(block_item, "offset");
+                json_t *block_size = json_object_get(block_item, "size");
+                json_t *block_hash = json_object_get(block_item, "hash");
+                struct block_entry *block = &entry->blocks[block_index];
+
+                if (!json_is_integer(offset) ||
+                    !json_is_integer(block_size) ||
+                    !json_is_string(block_hash) ||
+                    strlen(json_string_value(block_hash)) != 64) {
+                    free_entries(entries, count + 1);
+                    return -1;
+                }
+                block->offset = (uint64_t)json_integer_value(offset);
+                block->size = (uint64_t)json_integer_value(block_size);
+                if (block->offset != expected_offset ||
+                    block->size == 0 ||
+                    block->size > MFT_LOGICAL_BLOCK_SIZE ||
+                    block->offset + block->size > entry->size) {
+                    free_entries(entries, count + 1);
+                    return -1;
+                }
+                snprintf(block->hash, sizeof(block->hash), "%s", json_string_value(block_hash));
+                expected_offset += block->size;
+            }
+            if (expected_offset != entry->size) {
+                free_entries(entries, count + 1);
+                return -1;
+            }
         }
         count++;
     }
@@ -1145,12 +1521,13 @@ static int manifest_to_entries(json_t *manifest,
 
 static int send_hello(unsigned int server_id)
 {
-    json_t *payload = json_pack("{s:i,s:[s,s],s:i,s:i,s:i,s:i}",
+    json_t *payload = json_pack("{s:i,s:[s,s,s],s:i,s:i,s:i,s:i}",
                                 "version",
                                 1,
                                 "capabilities",
                                 MFT_CAP_WHOLE_FILE,
                                 MFT_CAP_RESUME,
+                                MFT_CAP_BLOCK_ACK,
                                 "max_frame_size",
                                 1024 * 1024,
                                 "initial_session_window",
@@ -1193,7 +1570,8 @@ static void handle_hello(unsigned int server_id, json_t *payload)
             continue;
         name = json_string_value(cap);
         if (strcmp(name, MFT_CAP_WHOLE_FILE) == 0 ||
-            strcmp(name, MFT_CAP_RESUME) == 0) {
+            strcmp(name, MFT_CAP_RESUME) == 0 ||
+            strcmp(name, MFT_CAP_BLOCK_ACK) == 0) {
             if (!g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
                                                               server_id,
                                                               name))
@@ -1214,13 +1592,13 @@ static int ensure_capability(unsigned int server_id)
 
     if (g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
                                                      server_id,
-                                                     MFT_CAP_WHOLE_FILE))
+                                                     MFT_CAP_BLOCK_ACK))
         return 0;
     send_hello(server_id);
     for (i = 0; i < 50; i++) {
         if (g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
                                                          server_id,
-                                                         MFT_CAP_WHOLE_FILE))
+                                                         MFT_CAP_BLOCK_ACK))
             return 0;
         mft_sleep_ms(20);
     }
@@ -1262,6 +1640,10 @@ static int prepare_accept(const char *target_root,
                     json_decref(accept);
                     return -1;
                 }
+                if (resume_offset == 0 && truncate_file(tmp_part) != 0) {
+                    json_decref(accept);
+                    return -1;
+                }
             }
         }
         json_array_append_new(accept,
@@ -1280,31 +1662,235 @@ static int prepare_accept(const char *target_root,
     return 0;
 }
 
-static int receive_entry_data(const char *target_root,
-                              struct manifest_entry *entries,
-                              size_t count,
-                              const char *relpath,
-                              const unsigned char *data,
-                              size_t len,
-                              uint64_t offset)
+static int part_path_for_relpath(const char *target_root,
+                                 const char *relpath,
+                                 char *out,
+                                 size_t out_len)
+{
+    char final_path[PATH_MAX];
+
+    if (!target_root || !relpath ||
+        join_path(final_path, sizeof(final_path), target_root, relpath) != 0 ||
+        part_path(out, out_len, final_path) != 0)
+        return -1;
+    return 0;
+}
+
+static int send_block_ack_raw(unsigned int server_id,
+                              const char *transfer_id,
+                              uint32_t stream_id,
+                              size_t block_index,
+                              uint64_t offset,
+                              uint64_t size,
+                              bool ok)
+{
+    json_t *payload;
+    int rc;
+
+    payload = json_pack("{s:s,s:i,s:i,s:I,s:I,s:b}",
+                        "transfer_id",
+                        transfer_id,
+                        "stream_id",
+                        (int)stream_id,
+                        "block_index",
+                        (int)block_index,
+                        "offset",
+                        (json_int_t)offset,
+                        "size",
+                        (json_int_t)size,
+                        "ok",
+                        ok);
+    if (!payload)
+        return -1;
+    if (!ok) {
+        json_t *missing = json_array();
+
+        if (!missing) {
+            json_decref(payload);
+            return -1;
+        }
+        json_array_append_new(missing,
+                              json_pack("{s:i,s:i,s:I,s:I}",
+                                        "stream_id",
+                                        (int)stream_id,
+                                        "block_index",
+                                        (int)block_index,
+                                        "offset",
+                                        (json_int_t)offset,
+                                        "size",
+                                        (json_int_t)size));
+        json_object_set_new(payload, "missing", missing);
+    }
+    rc = send_json_frame(server_id, MFT_FRAME_ACK, payload);
+    json_decref(payload);
+    return rc;
+}
+
+static void free_pending_acks(struct pending_block_ack *ack)
+{
+    while (ack) {
+        struct pending_block_ack *next = ack->next;
+
+        free(ack->transfer_id);
+        free(ack);
+        ack = next;
+    }
+}
+
+static int mark_block_nack(struct transfer_context *ctx,
+                           uint32_t stream_id,
+                           size_t block_index)
+{
+    struct manifest_entry *entry;
+    struct block_entry *block;
+
+    if (!ctx || stream_id == 0 || stream_id > ctx->entry_count)
+        return -1;
+    entry = &ctx->entries[stream_id - 1];
+    if (block_index >= entry->block_count)
+        return -1;
+    block = &entry->blocks[block_index];
+    if (block->retries >= MFT_MAX_BLOCK_RETRIES)
+        return -2;
+    block->retries++;
+    block->receive_waiting = true;
+    block->receive_hash_started = false;
+    block->receive_hash_failed = true;
+    block->receive_next_offset = block->offset;
+    block->receive_deadline_ms =
+        g_plugin.host->now_ms(g_plugin.host->host_context) + MFT_BLOCK_TIMEOUT_MS;
+    return 0;
+}
+
+static void handle_ack(unsigned int server_id, json_t *payload)
+{
+    json_t *transfer_id = json_object_get(payload, "transfer_id");
+    json_t *stream_id_json = json_object_get(payload, "stream_id");
+    json_t *block_index_json = json_object_get(payload, "block_index");
+    json_t *ok_json = json_object_get(payload, "ok");
+    struct transfer_context *ctx;
+    struct manifest_entry *entry;
+    struct block_entry *block;
+    uint32_t stream_id;
+    size_t block_index;
+
+    (void)server_id;
+    if (!json_is_string(transfer_id) ||
+        !json_is_integer(stream_id_json) ||
+        !json_is_integer(block_index_json) ||
+        !json_is_boolean(ok_json))
+        return;
+    mft_lock();
+    ctx = find_transfer(json_string_value(transfer_id));
+    if (!ctx || strcmp(ctx->direction, "send") != 0) {
+        mft_unlock();
+        return;
+    }
+    stream_id = (uint32_t)json_integer_value(stream_id_json);
+    if (stream_id == 0 || stream_id > ctx->entry_count) {
+        mft_unlock();
+        return;
+    }
+    entry = &ctx->entries[stream_id - 1];
+    block_index = (size_t)json_integer_value(block_index_json);
+    if (entry->type != 'f' || block_index >= entry->block_count) {
+        mft_unlock();
+        return;
+    }
+    block = &entry->blocks[block_index];
+    if (json_boolean_value(ok_json)) {
+        if (!block->acked) {
+            block->acked = true;
+            block->ack_waiting = false;
+            block->resend_pending = false;
+            block->ack_deadline_ms = 0;
+            ctx->bytes_transferred += block->size;
+        }
+    } else {
+        block->ack_waiting = false;
+        block->ack_deadline_ms = 0;
+        if (block->retries >= MFT_MAX_BLOCK_RETRIES) {
+            unlink_transfer(ctx);
+            mft_unlock();
+            complete_transfer_error_unlinked(ctx,
+                                             "File transfer block retry limit exceeded.",
+                                             true);
+            return;
+        }
+        block->retries++;
+        block->resend_pending = true;
+        block->send_next_offset = block->offset;
+        if (block_index < ctx->send_block_index || stream_id - 1 < ctx->send_entry_index) {
+            ctx->send_entry_index = stream_id - 1;
+            ctx->send_block_index = block_index;
+        }
+    }
+    touch_transfer_activity(ctx);
+    schedule_send_pump(ctx, MFT_PUMP_RETRY_MS);
+    mft_unlock();
+    mft_signal_timer();
+}
+
+static bool entry_should_receive(struct transfer_context *ctx, size_t index)
+{
+    return ctx && ctx->entries[index].type == 'f' && accept_item_is_receive(ctx->accept, index);
+}
+
+static int advance_receive_wait(struct transfer_context *ctx)
+{
+    unsigned long long now;
+
+    if (!ctx || strcmp(ctx->direction, "receive") != 0)
+        return -1;
+    now = g_plugin.host->now_ms(g_plugin.host->host_context);
+    while (ctx->recv_entry_index < ctx->entry_count) {
+        struct manifest_entry *entry = &ctx->entries[ctx->recv_entry_index];
+
+        if (!entry_should_receive(ctx, ctx->recv_entry_index)) {
+            ctx->recv_entry_index++;
+            ctx->recv_block_index = 0;
+            continue;
+        }
+        while (ctx->recv_block_index < entry->block_count &&
+               entry->blocks[ctx->recv_block_index].received_ok)
+            ctx->recv_block_index++;
+        if (ctx->recv_block_index < entry->block_count) {
+            struct block_entry *block = &entry->blocks[ctx->recv_block_index];
+
+            if (!block->receive_waiting) {
+                block->receive_waiting = true;
+                block->receive_deadline_ms = now + MFT_BLOCK_TIMEOUT_MS;
+            }
+            return 0;
+        }
+        ctx->recv_entry_index++;
+        ctx->recv_block_index = 0;
+    }
+    return 0;
+}
+
+static void mark_receive_resume_blocks(struct transfer_context *ctx)
 {
     size_t i;
 
-    for (i = 0; i < count; i++) {
-        struct manifest_entry *entry = &entries[i];
-        char final_path[PATH_MAX];
-        char tmp_part[PATH_MAX];
+    if (!ctx || !ctx->accept)
+        return;
+    for (i = 0; i < ctx->entry_count; i++) {
+        struct manifest_entry *entry = &ctx->entries[i];
+        json_t *accept_item = json_array_get(ctx->accept, i);
+        json_t *resume = accept_item ? json_object_get(accept_item, "resume_offset") : NULL;
+        uint64_t resume_offset = json_is_integer(resume) ? (uint64_t)json_integer_value(resume) : 0;
+        size_t block_index;
 
-        if (strcmp(entry->relpath, relpath) != 0)
+        if (!entry_should_receive(ctx, i))
             continue;
-        if (entry->type != 'f')
-            return -1;
-        if (join_path(final_path, sizeof(final_path), target_root, relpath) != 0 ||
-            part_path(tmp_part, sizeof(tmp_part), final_path) != 0)
-            return -1;
-        return write_all_at(tmp_part, data, len, offset);
+        for (block_index = 0; block_index < entry->block_count; block_index++) {
+            struct block_entry *block = &entry->blocks[block_index];
+
+            if (resume_offset >= block->offset + block->size)
+                block->received_ok = true;
+        }
     }
-    return -1;
 }
 
 static int finalize_received(const char *target_root,
@@ -1322,7 +1908,7 @@ static int finalize_received(const char *target_root,
         struct manifest_entry *entry = &entries[i];
         char final_path[PATH_MAX];
         char tmp_part[PATH_MAX];
-        char hash[65];
+        struct stat st;
         json_t *decision_item = json_array_get(accept, i);
         json_t *decision = decision_item ? json_object_get(decision_item, "decision") : NULL;
 
@@ -1335,7 +1921,8 @@ static int finalize_received(const char *target_root,
         if (join_path(final_path, sizeof(final_path), target_root, entry->relpath) != 0 ||
             part_path(tmp_part, sizeof(tmp_part), final_path) != 0)
             return -1;
-        if (file_sha256(tmp_part, hash) != 0 || strcmp(hash, entry->hash) != 0)
+        if (stat(tmp_part, &st) != 0 || !S_ISREG(st.st_mode) ||
+            (uint64_t)st.st_size != entry->size)
             return -1;
         chmod(tmp_part, entry->mode ? (mode_t)entry->mode : 0666);
         if (rename(tmp_part, final_path) != 0)
@@ -1345,47 +1932,370 @@ static int finalize_received(const char *target_root,
     return 0;
 }
 
-static int send_entries(unsigned int server_id,
-                        const char *transfer_id,
-                        const char *source_root,
-                        struct manifest_entry *entries,
-                        size_t count,
-                        json_t *accept,
-                        uint64_t *bytes_transferred)
+static int send_transfer_complete(struct transfer_context *ctx)
+{
+    json_t *complete;
+
+    if (g_plugin.host && g_plugin.host->log_info) {
+        char msg[256];
+
+        snprintf(msg,
+                 sizeof(msg),
+                 "mft send complete transfer=%s bytes=%llu",
+                 ctx && ctx->transfer_id ? ctx->transfer_id : "",
+                 (unsigned long long)(ctx ? ctx->bytes_transferred : 0));
+        g_plugin.host->log_info(g_plugin.host->host_context, msg);
+    }
+    complete = json_pack("{s:s,s:I,s:I,s:i,s:i}",
+                         "transfer_id",
+                         ctx->transfer_id,
+                         "bytes_total",
+                         (json_int_t)ctx->bytes_total,
+                         "bytes_transferred",
+                         (json_int_t)ctx->bytes_transferred,
+                         "files_transferred",
+                         (int)ctx->files_transferred,
+                         "files_skipped",
+                         (int)ctx->files_skipped);
+    if (!complete)
+        return -1;
+    mft_unlock();
+    if (send_json_frame(ctx->server_id, MFT_FRAME_COMPLETE, complete) != 0) {
+        mft_lock();
+        json_decref(complete);
+        return -1;
+    }
+    mft_lock();
+    json_decref(complete);
+    if (ctx->cancelled || ctx->free_after_pump)
+        return -3;
+    return touch_transfer_activity(ctx);
+}
+
+static int open_send_file_for_entry(struct transfer_context *ctx)
+{
+    char path[PATH_MAX];
+    struct manifest_entry *entry = &ctx->entries[ctx->send_entry_index];
+
+    if (join_path(path, sizeof(path), ctx->local_path, entry->relpath) != 0)
+        return -1;
+    ctx->send_fp = fopen(path, "rb");
+    return ctx->send_fp ? 0 : -1;
+}
+
+static bool accept_item_is_receive(json_t *accept, size_t index)
+{
+    json_t *accept_item = json_array_get(accept, index);
+    json_t *decision = accept_item ? json_object_get(accept_item, "decision") : NULL;
+
+    return json_is_string(decision) && strcmp(json_string_value(decision), "receive") == 0;
+}
+
+static bool send_blocks_all_acked(struct transfer_context *ctx)
 {
     size_t i;
 
-    *bytes_transferred = 0;
-    for (i = 0; i < count; i++) {
-        struct manifest_entry *entry = &entries[i];
-        json_t *accept_item = json_array_get(accept, i);
-        json_t *decision = accept_item ? json_object_get(accept_item, "decision") : NULL;
-        json_t *resume = accept_item ? json_object_get(accept_item, "resume_offset") : NULL;
-        char path[PATH_MAX];
-        FILE *fp;
-        uint64_t resume_offset = json_is_integer(resume) ? (uint64_t)json_integer_value(resume) : 0;
+    for (i = 0; i < ctx->entry_count; i++) {
+        struct manifest_entry *entry = &ctx->entries[i];
+        size_t block_index;
+
+        if (entry->type != 'f' || !accept_item_is_receive(ctx->accept, i))
+            continue;
+        for (block_index = 0; block_index < entry->block_count; block_index++) {
+            if (!entry->blocks[block_index].acked)
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool receive_blocks_all_ok(struct transfer_context *ctx)
+{
+    size_t i;
+
+    if (!ctx)
+        return false;
+    for (i = 0; i < ctx->entry_count; i++) {
+        struct manifest_entry *entry = &ctx->entries[i];
+        size_t block_index;
+
+        if (entry->type != 'f' || !entry_should_receive(ctx, i))
+            continue;
+        for (block_index = 0; block_index < entry->block_count; block_index++) {
+            if (!entry->blocks[block_index].received_ok)
+                return false;
+        }
+    }
+    return true;
+}
+
+static void log_first_missing_receive_block(struct transfer_context *ctx)
+{
+    size_t i;
+
+    if (!ctx || !g_plugin.host || !g_plugin.host->log_error)
+        return;
+    for (i = 0; i < ctx->entry_count; i++) {
+        struct manifest_entry *entry = &ctx->entries[i];
+        size_t block_index;
+
+        if (entry->type != 'f' || !entry_should_receive(ctx, i))
+            continue;
+        for (block_index = 0; block_index < entry->block_count; block_index++) {
+            struct block_entry *block = &entry->blocks[block_index];
+
+            if (!block->received_ok) {
+                char msg[256];
+
+                snprintf(msg,
+                         sizeof(msg),
+                         "mft missing block transfer=%s stream=%lu block=%lu offset=%llu size=%llu next=%llu retries=%u hash_started=%d hash_failed=%d",
+                         ctx->transfer_id ? ctx->transfer_id : "",
+                         (unsigned long)(i + 1),
+                         (unsigned long)block_index,
+                         (unsigned long long)block->offset,
+                         (unsigned long long)block->size,
+                         (unsigned long long)block->receive_next_offset,
+                         block->retries,
+                         block->receive_hash_started ? 1 : 0,
+                         block->receive_hash_failed ? 1 : 0);
+                g_plugin.host->log_error(g_plugin.host->host_context, msg);
+                return;
+            }
+        }
+    }
+}
+
+static unsigned int count_send_blocks_in_flight(struct transfer_context *ctx)
+{
+    unsigned int count = 0;
+    size_t i;
+
+    if (!ctx)
+        return 0;
+    for (i = 0; i < ctx->entry_count; i++) {
+        struct manifest_entry *entry = &ctx->entries[i];
+        size_t block_index;
 
         if (entry->type != 'f')
             continue;
-        if (json_is_string(decision) && strcmp(json_string_value(decision), "skip") == 0)
-            continue;
-        if (join_path(path, sizeof(path), source_root, entry->relpath) != 0)
-            return -1;
-        fp = fopen(path, "rb");
-        if (!fp)
-            return -1;
-        if (copy_file_range_chunks(fp,
-                                   resume_offset,
-                                   entry->size,
-                                   server_id,
-                                   transfer_id,
-                                   (uint32_t)(i + 1)) != 0) {
-            fclose(fp);
-            return -1;
+        for (block_index = 0; block_index < entry->block_count; block_index++) {
+            struct block_entry *block = &entry->blocks[block_index];
+
+            if (block->ack_waiting && !block->acked)
+                count++;
         }
-        fclose(fp);
-        *bytes_transferred += entry->size - resume_offset;
     }
+    return count;
+}
+
+static int send_block_frames(struct transfer_context *ctx,
+                             struct manifest_entry *entry,
+                             struct block_entry *block,
+                             uint32_t stream_id)
+{
+    uint64_t block_end = block->offset + block->size;
+    uint64_t next_offset = block->send_next_offset;
+    int rc;
+
+    (void)entry;
+    if (block->send_next_offset == 0 || block->send_next_offset < block->offset ||
+        block->send_next_offset > block_end)
+        block->send_next_offset = block->offset;
+    rc = copy_file_range_chunks(ctx->send_fp,
+                                block->send_next_offset,
+                                block_end,
+                                ctx->server_id,
+                                ctx->transfer_id,
+                                ctx,
+                                stream_id,
+                                &next_offset);
+    if (rc != 0) {
+        block->send_next_offset = next_offset;
+        return rc;
+    }
+    block->send_next_offset = block_end;
+    return 0;
+}
+
+static void schedule_send_pump(struct transfer_context *ctx, unsigned int delay_ms)
+{
+    unsigned long long now;
+
+    if (!ctx || !g_plugin.host || !g_plugin.host->now_ms)
+        return;
+    now = g_plugin.host->now_ms(g_plugin.host->host_context);
+    ctx->send_paused = true;
+    ctx->send_pump_deadline_ms = now > (unsigned long long)-1 - delay_ms ?
+                                     (unsigned long long)-1 :
+                                     now + delay_ms;
+    mft_signal_timer();
+}
+
+static int send_pump(struct transfer_context *ctx)
+{
+    struct manifest_entry *entry;
+    struct block_entry *block;
+    unsigned int blocks_sent = 0;
+    unsigned int blocks_in_flight;
+    int result = 0;
+
+    if (!ctx)
+        return -1;
+    if (ctx->cancelled || ctx->free_after_pump)
+        return 0;
+    if (ctx->pumping) {
+        schedule_send_pump(ctx, MFT_PUMP_RETRY_MS);
+        return 0;
+    }
+    ctx->pumping = true;
+    ctx->send_paused = false;
+    ctx->send_pump_deadline_ms = 0;
+    blocks_in_flight = count_send_blocks_in_flight(ctx);
+    if (g_plugin.host && g_plugin.host->log_info) {
+        char msg[256];
+
+        snprintf(msg,
+                 sizeof(msg),
+                 "mft send pump transfer=%s entry=%lu block=%lu inflight=%u",
+                 ctx->transfer_id ? ctx->transfer_id : "",
+                 (unsigned long)ctx->send_entry_index,
+                 (unsigned long)ctx->send_block_index,
+                 blocks_in_flight);
+        g_plugin.host->log_info(g_plugin.host->host_context, msg);
+    }
+    while (ctx->send_entry_index < ctx->entry_count) {
+        entry = &ctx->entries[ctx->send_entry_index];
+        if (entry->type != 'f') {
+            ctx->send_entry_index++;
+            ctx->send_block_index = 0;
+            continue;
+        }
+        if (!accept_item_is_receive(ctx->accept, ctx->send_entry_index)) {
+            ctx->send_entry_index++;
+            ctx->send_block_index = 0;
+            continue;
+        }
+        if (!ctx->send_fp && open_send_file_for_entry(ctx) != 0) {
+            result = -1;
+            goto done;
+        }
+        if (ctx->send_block_index >= entry->block_count) {
+            fclose(ctx->send_fp);
+            ctx->send_fp = NULL;
+            ctx->send_entry_index++;
+            ctx->send_block_index = 0;
+            continue;
+        }
+
+        block = &entry->blocks[ctx->send_block_index];
+        if (block->acked) {
+            ctx->send_block_index++;
+            continue;
+        }
+        if (block->ack_waiting && !block->resend_pending) {
+            ctx->send_block_index++;
+            continue;
+        }
+        if (blocks_in_flight >= MFT_MAX_IN_FLIGHT_BLOCKS)
+            goto done;
+        result = send_block_frames(ctx,
+                                   entry,
+                                   block,
+                                   (uint32_t)(ctx->send_entry_index + 1));
+        if (result == -2) {
+            schedule_send_pump(ctx, MFT_PUMP_RETRY_MS);
+            result = 0;
+            goto done;
+        }
+        if (result == -3) {
+            result = 0;
+            goto done;
+        }
+        if (result != 0) {
+            goto done;
+        }
+        block->sent = true;
+        block->ack_waiting = true;
+        block->resend_pending = false;
+        block->send_next_offset = block->offset;
+        block->ack_deadline_ms =
+            g_plugin.host->now_ms(g_plugin.host->host_context) + MFT_BLOCK_TIMEOUT_MS;
+        ctx->send_block_index++;
+        touch_transfer_activity(ctx);
+        blocks_sent++;
+        blocks_in_flight++;
+        if (blocks_sent >= MFT_PUMP_MAX_BLOCKS) {
+            schedule_send_pump(ctx, MFT_PUMP_RETRY_MS);
+            goto done;
+        }
+    }
+
+    if (!ctx->send_complete_sent && send_blocks_all_acked(ctx)) {
+        ctx->send_complete_sent = true;
+        result = send_transfer_complete(ctx);
+    }
+
+done:
+    ctx->pumping = false;
+    if (ctx->free_after_pump) {
+        release_transfer_after_unlink(ctx);
+        return 0;
+    }
+    return result;
+}
+
+static int prepare_send_entries(struct transfer_context *ctx,
+                                json_t *accept)
+{
+    size_t i;
+
+    ctx->accept = json_incref(accept);
+    ctx->send_entry_index = 0;
+    ctx->send_block_index = 0;
+    ctx->bytes_total = 0;
+    ctx->bytes_transferred = 0;
+    ctx->files_skipped = 0;
+    ctx->files_transferred = 0;
+    if (g_plugin.host && g_plugin.host->log_info) {
+        char msg[256];
+
+        snprintf(msg,
+                 sizeof(msg),
+                 "mft send prepare transfer=%s entries=%lu",
+                 ctx->transfer_id ? ctx->transfer_id : "",
+                 (unsigned long)ctx->entry_count);
+        g_plugin.host->log_info(g_plugin.host->host_context, msg);
+    }
+
+    for (i = 0; i < ctx->entry_count; i++) {
+        struct manifest_entry *entry = &ctx->entries[i];
+        json_t *accept_item = json_array_get(accept, i);
+        json_t *decision = accept_item ? json_object_get(accept_item, "decision") : NULL;
+        json_t *resume = accept_item ? json_object_get(accept_item, "resume_offset") : NULL;
+        uint64_t resume_offset = json_is_integer(resume) ? (uint64_t)json_integer_value(resume) : 0;
+        size_t block_index;
+
+        if (entry->type != 'f')
+            continue;
+        ctx->bytes_total += entry->size;
+        if (json_is_string(decision) && strcmp(json_string_value(decision), "skip") == 0) {
+            ctx->files_skipped++;
+            continue;
+        }
+        if (json_is_string(decision) && strcmp(json_string_value(decision), "receive") == 0)
+            ctx->files_transferred++;
+        for (block_index = 0; block_index < entry->block_count; block_index++) {
+            struct block_entry *block = &entry->blocks[block_index];
+
+            if (resume_offset >= block->offset + block->size) {
+                block->sent = true;
+                block->acked = true;
+                ctx->bytes_transferred += block->size;
+            }
+        }
+    }
+    schedule_send_pump(ctx, MFT_PUMP_RETRY_MS);
     return 0;
 }
 
@@ -1423,32 +2333,19 @@ static int send_summary(const char *invocation_id,
                                 "duration_ms",
                                 (json_int_t)(now - started_ms),
                                 "errors");
-    char *dump = json_dumps(summary, JSON_COMPACT | JSON_ENSURE_ASCII);
-    int rc = dump ? g_plugin.host->complete_async_ok(g_plugin.host->host_context,
-                                                     invocation_id,
-                                                     dump) : -1;
+    char *dump;
+    int rc;
 
+    if (!summary)
+        return -1;
+    dump = json_dumps(summary, JSON_COMPACT | JSON_ENSURE_ASCII);
+    rc = dump ? g_plugin.host->complete_async_ok(g_plugin.host->host_context,
+                                                 invocation_id,
+                                                 dump) : -1;
     free(dump);
     json_decref(summary);
     return rc;
 }
-
-struct transfer_context {
-    char *invocation_id;
-    char *transfer_id;
-    char *local_path;
-    char *remote_path;
-    char *source_name;
-    char direction[8];
-    unsigned int server_id;
-    uint32_t timeout_ms;
-    unsigned long long started_ms;
-    unsigned long long deadline_ms;
-    struct manifest_entry *entries;
-    size_t entry_count;
-    json_t *accept;
-    struct transfer_context *next;
-};
 
 static struct transfer_context *g_transfers;
 
@@ -1472,9 +2369,23 @@ static void free_transfer(struct transfer_context *ctx)
     free(ctx->local_path);
     free(ctx->remote_path);
     free(ctx->source_name);
+    if (ctx->send_fp)
+        fclose(ctx->send_fp);
     free_entries(ctx->entries, ctx->entry_count);
     json_decref(ctx->accept);
     free(ctx);
+}
+
+static void release_transfer_after_unlink(struct transfer_context *ctx)
+{
+    if (!ctx)
+        return;
+    if (ctx->pumping) {
+        ctx->cancelled = true;
+        ctx->free_after_pump = true;
+        return;
+    }
+    free_transfer(ctx);
 }
 
 static void unlink_transfer(struct transfer_context *ctx)
@@ -1495,6 +2406,7 @@ static int add_transfer(struct transfer_context *ctx)
 {
     ctx->next = g_transfers;
     g_transfers = ctx;
+    mft_signal_timer();
     return 0;
 }
 
@@ -1519,36 +2431,376 @@ static int send_abort_frame(unsigned int server_id,
     return rc;
 }
 
-static void complete_transfer_error(struct transfer_context *ctx,
-                                    const char *message,
-                                    bool notify_peer)
+static void complete_transfer_error_unlinked(struct transfer_context *ctx,
+                                             const char *message,
+                                             bool notify_peer)
 {
     char error[256];
+    bool defer_free;
 
     if (!ctx)
         return;
     snprintf(error, sizeof(error), "%s", message ? message : "File transfer failed.");
-    unlink_transfer(ctx);
+    mft_lock();
+    ctx->cancelled = true;
+    if (ctx->completed) {
+        mft_unlock();
+        return;
+    }
+    ctx->completed = true;
+    defer_free = ctx->pumping;
+    if (defer_free)
+        ctx->free_after_pump = true;
+    mft_unlock();
     if (notify_peer)
         send_abort_frame(ctx->server_id, ctx->transfer_id, error);
     if (ctx->invocation_id && g_plugin.host->complete_async_error)
         g_plugin.host->complete_async_error(g_plugin.host->host_context,
                                             ctx->invocation_id,
                                             error);
-    free_transfer(ctx);
+    if (!defer_free)
+        free_transfer(ctx);
+}
+
+static void complete_transfer_error_by_id(const char *transfer_id,
+                                          const char *message,
+                                          bool notify_peer)
+{
+    struct transfer_context *ctx;
+
+    if (!transfer_id)
+        return;
+    mft_lock();
+    ctx = find_transfer(transfer_id);
+    if (ctx)
+        unlink_transfer(ctx);
+    mft_unlock();
+    if (ctx)
+        complete_transfer_error_unlinked(ctx, message, notify_peer);
 }
 
 static void abort_transfers_for_peer(unsigned int server_id)
 {
     struct transfer_context *ctx = g_transfers;
 
+    mft_lock();
     while (ctx) {
         struct transfer_context *next = ctx->next;
 
-        if (ctx->server_id == server_id)
-            complete_transfer_error(ctx, "Peer closed during file transfer.", false);
+        if (ctx->server_id == server_id) {
+            unlink_transfer(ctx);
+            ctx->cancelled = true;
+            mft_unlock();
+            complete_transfer_error_unlinked(ctx, "Peer closed during file transfer.", false);
+            mft_lock();
+        }
         ctx = next;
     }
+    mft_unlock();
+}
+
+static void recompute_next_package_deadline(unsigned long long *next_deadline)
+{
+    struct transfer_context *ctx;
+
+    *next_deadline = 0;
+    for (ctx = g_transfers; ctx; ctx = ctx->next) {
+        size_t i;
+
+        for (i = 0; i < ctx->entry_count; i++) {
+            struct manifest_entry *entry = &ctx->entries[i];
+            size_t block_index;
+
+            if (ctx->send_paused) {
+                unsigned long long candidate = ctx->send_pump_deadline_ms;
+                if (!*next_deadline || candidate < *next_deadline)
+                    *next_deadline = candidate;
+            }
+            if (entry->type != 'f')
+                continue;
+            for (block_index = 0; block_index < entry->block_count; block_index++) {
+                struct block_entry *block = &entry->blocks[block_index];
+                unsigned long long candidate = 0;
+
+                if (block->ack_waiting && !block->acked)
+                    candidate = block->ack_deadline_ms;
+                if (block->receive_waiting && !block->received_ok &&
+                    (!candidate || block->receive_deadline_ms < candidate))
+                    candidate = block->receive_deadline_ms;
+                if (candidate && (!*next_deadline || candidate < *next_deadline))
+                    *next_deadline = candidate;
+            }
+        }
+    }
+}
+
+static void queue_pending_ack(struct pending_block_ack **head,
+                              unsigned int server_id,
+                              const char *transfer_id,
+                              uint32_t stream_id,
+                              size_t block_index,
+                              uint64_t offset,
+                              uint64_t size,
+                              bool ok)
+{
+    struct pending_block_ack *ack = calloc(1, sizeof(*ack));
+
+    if (!ack)
+        return;
+    ack->transfer_id = mft_strdup(transfer_id);
+    if (!ack->transfer_id) {
+        free(ack);
+        return;
+    }
+    ack->server_id = server_id;
+    ack->stream_id = stream_id;
+    ack->block_index = block_index;
+    ack->offset = offset;
+    ack->size = size;
+    ack->ok = ok;
+    ack->next = *head;
+    *head = ack;
+}
+
+static void send_pending_acks(struct pending_block_ack *acks)
+{
+    struct pending_block_ack *ack;
+
+    for (ack = acks; ack; ack = ack->next) {
+        send_block_ack_raw(ack->server_id,
+                           ack->transfer_id,
+                           ack->stream_id,
+                           ack->block_index,
+                           ack->offset,
+                           ack->size,
+                           ack->ok);
+    }
+}
+
+static void queue_pending_error(struct pending_transfer_error **head,
+                                struct transfer_context *ctx,
+                                const char *message,
+                                bool notify_peer)
+{
+    struct pending_transfer_error *error = calloc(1, sizeof(*error));
+
+    if (!error)
+        return;
+    error->ctx = ctx;
+    error->message = message;
+    error->notify_peer = notify_peer;
+    error->next = *head;
+    *head = error;
+}
+
+static void complete_pending_errors(struct pending_transfer_error *errors)
+{
+    while (errors) {
+        struct pending_transfer_error *next = errors->next;
+
+        complete_transfer_error_unlinked(errors->ctx,
+                                         errors->message,
+                                         errors->notify_peer);
+        free(errors);
+        errors = next;
+    }
+}
+
+static void run_pending_pumps(struct pending_pump *pumps)
+{
+    while (pumps) {
+        struct pending_pump *next = pumps->next;
+        struct transfer_context *ctx;
+
+        mft_lock();
+        ctx = find_transfer(pumps->transfer_id);
+        if (ctx && send_pump(ctx) != 0) {
+            unlink_transfer(ctx);
+            mft_unlock();
+            complete_transfer_error_unlinked(ctx, "Failed to continue file transfer data.", true);
+        } else {
+            mft_unlock();
+        }
+        free(pumps->transfer_id);
+        free(pumps);
+        pumps = next;
+    }
+}
+
+static void scan_package_timeouts(unsigned long long now,
+                                  struct pending_block_ack **pending_acks,
+                                  struct pending_transfer_error **pending_errors,
+                                  struct pending_pump **pending_pumps)
+{
+    struct transfer_context *ctx = g_transfers;
+
+    while (ctx) {
+        struct transfer_context *next = ctx->next;
+        bool failed = false;
+        size_t i;
+
+        if (ctx->send_paused &&
+            (!ctx->send_pump_deadline_ms || now >= ctx->send_pump_deadline_ms)) {
+            struct pending_pump *pump = calloc(1, sizeof(*pump));
+
+            if (pump) {
+                pump->transfer_id = mft_strdup(ctx->transfer_id);
+                if (pump->transfer_id) {
+                    pump->next = *pending_pumps;
+                    *pending_pumps = pump;
+                } else {
+                    free(pump);
+                }
+            }
+            ctx->send_paused = false;
+            ctx->send_pump_deadline_ms = 0;
+        }
+        for (i = 0; !failed && i < ctx->entry_count; i++) {
+            struct manifest_entry *entry = &ctx->entries[i];
+            size_t block_index;
+
+            if (entry->type != 'f')
+                continue;
+            for (block_index = 0; block_index < entry->block_count; block_index++) {
+                struct block_entry *block = &entry->blocks[block_index];
+
+                if (block->ack_waiting && !block->acked &&
+                    block->ack_deadline_ms && now >= block->ack_deadline_ms) {
+                    failed = true;
+                    break;
+                }
+                if (block->receive_waiting && !block->received_ok &&
+                    block->receive_deadline_ms && now >= block->receive_deadline_ms) {
+                    if (block->retries >= MFT_MAX_BLOCK_RETRIES) {
+                        failed = true;
+                        break;
+                    }
+                    block->retries++;
+                    block->receive_deadline_ms = now + MFT_BLOCK_TIMEOUT_MS;
+                    queue_pending_ack(pending_acks,
+                                      ctx->server_id,
+                                      ctx->transfer_id,
+                                      (uint32_t)(i + 1),
+                                      block_index,
+                                      block->offset,
+                                      block->size,
+                                      false);
+                }
+            }
+        }
+        if (failed) {
+            unlink_transfer(ctx);
+            queue_pending_error(pending_errors,
+                                ctx,
+                                "File transfer package task timed out.",
+                                true);
+        }
+        ctx = next;
+    }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI mft_timer_thread_main(LPVOID arg)
+#else
+static void *mft_timer_thread_main(void *arg)
+#endif
+{
+    (void)arg;
+    for (;;) {
+        unsigned long long now;
+        unsigned long long next_deadline;
+
+        mft_lock();
+        if (g_plugin.timer_stop) {
+            mft_unlock();
+            break;
+        }
+        recompute_next_package_deadline(&next_deadline);
+        if (!next_deadline) {
+#ifdef _WIN32
+            SleepConditionVariableCS(&g_plugin.timer_cv, &g_plugin.lock, INFINITE);
+#else
+            pthread_cond_wait(&g_plugin.timer_cond, &g_plugin.lock);
+#endif
+            mft_unlock();
+            continue;
+        }
+        now = g_plugin.host->now_ms(g_plugin.host->host_context);
+        if (now < next_deadline) {
+            unsigned long long wait_ms = next_deadline - now;
+#ifdef _WIN32
+            SleepConditionVariableCS(&g_plugin.timer_cv,
+                                     &g_plugin.lock,
+                                     wait_ms > INFINITE - 1 ? INFINITE - 1 : (DWORD)wait_ms);
+#else
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += (time_t)(wait_ms / 1000ull);
+            ts.tv_nsec += (long)((wait_ms % 1000ull) * 1000000ull);
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec++;
+                ts.tv_nsec -= 1000000000L;
+            }
+            pthread_cond_timedwait(&g_plugin.timer_cond, &g_plugin.lock, &ts);
+#endif
+            mft_unlock();
+            continue;
+        }
+        {
+            struct pending_block_ack *pending_acks = NULL;
+            struct pending_transfer_error *pending_errors = NULL;
+            struct pending_pump *pending_pumps = NULL;
+
+            scan_package_timeouts(now, &pending_acks, &pending_errors, &pending_pumps);
+            mft_unlock();
+            run_pending_pumps(pending_pumps);
+            send_pending_acks(pending_acks);
+            free_pending_acks(pending_acks);
+            complete_pending_errors(pending_errors);
+            mft_signal_timer();
+            continue;
+        }
+        mft_unlock();
+    }
+#ifndef _WIN32
+    return NULL;
+#else
+    return 0;
+#endif
+}
+
+static int start_timer_thread(void)
+{
+    if (g_plugin.timer_started)
+        return 0;
+#ifdef _WIN32
+    g_plugin.timer_thread = CreateThread(NULL, 0, mft_timer_thread_main, NULL, 0, NULL);
+    if (!g_plugin.timer_thread)
+        return -1;
+#else
+    if (pthread_create(&g_plugin.timer_thread, NULL, mft_timer_thread_main, NULL) != 0)
+        return -1;
+#endif
+    g_plugin.timer_started = true;
+    return 0;
+}
+
+static void stop_timer_thread(void)
+{
+    if (!g_plugin.timer_started)
+        return;
+    mft_lock();
+    g_plugin.timer_stop = true;
+    mft_signal_timer();
+    mft_unlock();
+#ifdef _WIN32
+    WaitForSingleObject(g_plugin.timer_thread, INFINITE);
+    CloseHandle(g_plugin.timer_thread);
+    g_plugin.timer_thread = NULL;
+#else
+    pthread_join(g_plugin.timer_thread, NULL);
+#endif
+    g_plugin.timer_started = false;
 }
 
 static uint32_t clamp_timeout_ms(unsigned long long value)
@@ -1573,6 +2825,11 @@ static int start_transfer_timer(struct transfer_context *ctx)
     return 0;
 }
 
+static int touch_transfer_activity(struct transfer_context *ctx)
+{
+    return start_transfer_timer(ctx);
+}
+
 static void expire_due_transfers(void)
 {
     struct transfer_context *ctx;
@@ -1581,14 +2838,20 @@ static void expire_due_transfers(void)
     if (!g_plugin.host || !g_plugin.host->now_ms)
         return;
     now = g_plugin.host->now_ms(g_plugin.host->host_context);
+    mft_lock();
     ctx = g_transfers;
     while (ctx) {
         struct transfer_context *next = ctx->next;
 
-        if (ctx->deadline_ms && now >= ctx->deadline_ms)
-            complete_transfer_error(ctx, "File transfer timed out.", true);
+        if (ctx->deadline_ms && now >= ctx->deadline_ms) {
+            unlink_transfer(ctx);
+            mft_unlock();
+            complete_transfer_error_unlinked(ctx, "File transfer timed out.", true);
+            mft_lock();
+        }
         ctx = next;
     }
+    mft_unlock();
 }
 
 static uint32_t payload_timeout_ms(json_t *payload)
@@ -1617,6 +2880,17 @@ static int start_send(const char *invocation_id,
     if (ensure_capability(server_id) != 0)
         return -2;
 
+    if (g_plugin.host && g_plugin.host->log_info) {
+        char msg[256];
+
+        snprintf(msg,
+                 sizeof(msg),
+                 "mft start send path=%s remote=%s",
+                 local_path ? local_path : "",
+                 remote_path ? remote_path : "");
+        g_plugin.host->log_info(g_plugin.host->host_context, msg);
+    }
+
     ctx = calloc(1, sizeof(*ctx));
     if (!ctx)
         return -1;
@@ -1633,6 +2907,16 @@ static int start_send(const char *invocation_id,
 
     if (stat(local_path, &st) != 0)
         goto fail;
+    if (g_plugin.host && g_plugin.host->log_info) {
+        char msg[256];
+
+        snprintf(msg,
+                 sizeof(msg),
+                 "mft start send stat ok size=%llu dir=%d",
+                 (unsigned long long)st.st_size,
+                 S_ISDIR(st.st_mode) ? 1 : 0);
+        g_plugin.host->log_info(g_plugin.host->host_context, msg);
+    }
     if (S_ISDIR(st.st_mode)) {
         ctx->source_name = path_basename_dup(local_path);
         if (!ctx->source_name)
@@ -1654,6 +2938,15 @@ static int start_send(const char *invocation_id,
     }
     if (manifest_is_single_file_root(ctx->entries, ctx->entry_count) && !ctx->source_name)
         goto fail;
+    if (g_plugin.host && g_plugin.host->log_info) {
+        char msg[256];
+
+        snprintf(msg,
+                 sizeof(msg),
+                 "mft start send scan done entries=%lu",
+                 (unsigned long)ctx->entry_count);
+        g_plugin.host->log_info(g_plugin.host->host_context, msg);
+    }
     for (i = 0; i < ctx->entry_count; i++) {
         if (ctx->entries[i].type == 'f')
             bytes_total += ctx->entries[i].size;
@@ -1661,6 +2954,16 @@ static int start_send(const char *invocation_id,
     manifest = entries_to_manifest(ctx->entries, ctx->entry_count);
     if (!manifest)
         goto fail;
+    if (g_plugin.host && g_plugin.host->log_info) {
+        char msg[256];
+
+        snprintf(msg,
+                 sizeof(msg),
+                 "mft start send manifest ready entries=%lu bytes=%llu",
+                 (unsigned long)ctx->entry_count,
+                 (unsigned long long)bytes_total);
+        g_plugin.host->log_info(g_plugin.host->host_context, msg);
+    }
     payload = json_pack("{s:s,s:s,s:o,s:I,s:i}",
                         "transfer_id",
                         ctx->transfer_id,
@@ -1682,9 +2985,23 @@ static int start_send(const char *invocation_id,
         goto fail;
     if (start_transfer_timer(ctx) != 0)
         goto fail;
+    mft_lock();
     add_transfer(ctx);
+    mft_unlock();
+    if (g_plugin.host && g_plugin.host->log_info) {
+        char msg[256];
+
+        snprintf(msg,
+                 sizeof(msg),
+                 "mft start send offer tx=%s bytes=%llu",
+                 ctx->transfer_id ? ctx->transfer_id : "",
+                 (unsigned long long)bytes_total);
+        g_plugin.host->log_info(g_plugin.host->host_context, msg);
+    }
     if (send_json_frame(server_id, MFT_FRAME_OFFER, payload) != 0) {
+        mft_lock();
         unlink_transfer(ctx);
+        mft_unlock();
         goto fail;
     }
     json_decref(payload);
@@ -1736,9 +3053,13 @@ static int start_recv(const char *invocation_id,
                         (int)timeout_ms);
     if (!payload || start_transfer_timer(ctx) != 0)
         goto fail;
+    mft_lock();
     add_transfer(ctx);
+    mft_unlock();
     if (send_json_frame(server_id, MFT_FRAME_FETCH_REQUEST, payload) != 0) {
+        mft_lock();
         unlink_transfer(ctx);
+        mft_unlock();
         goto fail;
     }
     json_decref(payload);
@@ -1764,12 +3085,20 @@ static void handle_offer(unsigned int server_id, json_t *payload)
     char target_root[PATH_MAX];
     const char *source_name_value = NULL;
     int created_ctx = 0;
+    char *transfer_id_value = NULL;
+    int response_rc;
 
     if (!json_is_string(transfer_id) || !json_is_string(remote_path) ||
         manifest_to_entries(manifest, &entries, &count) != 0)
         return;
+    transfer_id_value = mft_strdup(json_string_value(transfer_id));
+    if (!transfer_id_value) {
+        free_entries(entries, count);
+        return;
+    }
 
-    ctx = find_transfer(json_string_value(transfer_id));
+    mft_lock();
+    ctx = find_transfer(transfer_id_value);
     if (json_is_string(source_name))
         source_name_value = json_string_value(source_name);
     else if (ctx && ctx->source_name)
@@ -1777,12 +3106,19 @@ static void handle_offer(unsigned int server_id, json_t *payload)
     if (source_name_value &&
         (strcmp(source_name_value, ".") == 0 || !path_is_safe_rel(source_name_value))) {
         free_entries(entries, count);
-        if (ctx)
-            complete_transfer_error(ctx, "Invalid source_name in file transfer offer.", true);
-        else
+        if (ctx) {
+            unlink_transfer(ctx);
+            mft_unlock();
+            complete_transfer_error_unlinked(ctx,
+                                             "Invalid source_name in file transfer offer.",
+                                             true);
+        } else {
+            mft_unlock();
             send_abort_frame(server_id,
-                             json_string_value(transfer_id),
+                             transfer_id_value,
                              "Invalid source_name in file transfer offer.");
+        }
+        free(transfer_id_value);
         return;
     }
 
@@ -1794,12 +3130,19 @@ static void handle_offer(unsigned int server_id, json_t *payload)
                              count) != 0 ||
         prepare_accept(target_root, entries, count, &accept) != 0) {
         free_entries(entries, count);
-        if (ctx)
-            complete_transfer_error(ctx, "Failed to prepare receive target path.", true);
-        else
+        if (ctx) {
+            unlink_transfer(ctx);
+            mft_unlock();
+            complete_transfer_error_unlinked(ctx,
+                                             "Failed to prepare receive target path.",
+                                             true);
+        } else {
+            mft_unlock();
             send_abort_frame(server_id,
-                             json_string_value(transfer_id),
+                             transfer_id_value,
                              "Failed to prepare receive target path.");
+        }
+        free(transfer_id_value);
         return;
     }
 
@@ -1808,10 +3151,11 @@ static void handle_offer(unsigned int server_id, json_t *payload)
         if (!ctx) {
             free_entries(entries, count);
             json_decref(accept);
+            mft_unlock();
             return;
         }
         created_ctx = 1;
-        ctx->transfer_id = mft_strdup(json_string_value(transfer_id));
+        ctx->transfer_id = mft_strdup(transfer_id_value);
         ctx->local_path = mft_strdup(target_root);
         if (source_name_value)
             ctx->source_name = mft_strdup(source_name_value);
@@ -1819,9 +3163,11 @@ static void handle_offer(unsigned int server_id, json_t *payload)
             free_transfer(ctx);
             json_decref(accept);
             free_entries(entries, count);
+            mft_unlock();
             send_abort_frame(server_id,
-                             json_string_value(transfer_id),
+                             transfer_id_value,
                              "Failed to allocate receive context.");
+            free(transfer_id_value);
             return;
         }
     } else {
@@ -1835,7 +3181,12 @@ static void handle_offer(unsigned int server_id, json_t *payload)
         if (!ctx->local_path) {
             free_entries(entries, count);
             json_decref(accept);
-            complete_transfer_error(ctx, "Failed to allocate receive target path.", true);
+            unlink_transfer(ctx);
+            mft_unlock();
+            complete_transfer_error_unlinked(ctx,
+                                             "Failed to allocate receive target path.",
+                                             true);
+            free(transfer_id_value);
             return;
         }
     }
@@ -1850,10 +3201,37 @@ static void handle_offer(unsigned int server_id, json_t *payload)
     if (created_ctx)
         add_transfer(ctx);
 
-    response = json_pack("{s:s,s:o}", "transfer_id", ctx->transfer_id, "accept", accept);
-    if (!response || send_json_frame(server_id, MFT_FRAME_ACCEPT, response) != 0)
-        complete_transfer_error(ctx, "Failed to send file transfer accept.", true);
+    response = json_pack("{s:s,s:O}", "transfer_id", ctx->transfer_id, "accept", accept);
+    if (!response) {
+        json_decref(response);
+        unlink_transfer(ctx);
+        mft_unlock();
+        complete_transfer_error_unlinked(ctx, "Failed to send file transfer accept.", true);
+        free(transfer_id_value);
+        return;
+    }
+    mft_unlock();
+    response_rc = send_json_frame(server_id, MFT_FRAME_ACCEPT, response);
     json_decref(response);
+    if (response_rc != 0) {
+        complete_transfer_error_by_id(transfer_id_value,
+                                      "Failed to send file transfer accept.",
+                                      true);
+        free(transfer_id_value);
+        return;
+    }
+
+    mft_lock();
+    ctx = find_transfer(transfer_id_value);
+    if (ctx) {
+        mark_receive_resume_blocks(ctx);
+        advance_receive_wait(ctx);
+        touch_transfer_activity(ctx);
+        mft_signal_timer();
+    }
+    mft_unlock();
+    json_decref(accept);
+    free(transfer_id_value);
 }
 
 static void handle_fetch_request(unsigned int server_id, json_t *payload)
@@ -1924,9 +3302,13 @@ static void handle_fetch_request(unsigned int server_id, json_t *payload)
     if (ctx->source_name &&
         json_object_set_new(offer, "source_name", json_string(ctx->source_name)) != 0)
         goto fail;
+    mft_lock();
     add_transfer(ctx);
+    mft_unlock();
     if (send_json_frame(server_id, MFT_FRAME_OFFER, offer) != 0) {
+        mft_lock();
         unlink_transfer(ctx);
+        mft_unlock();
         goto fail;
     }
     json_decref(offer);
@@ -1944,59 +3326,57 @@ static void handle_accept(unsigned int server_id, json_t *payload)
     json_t *transfer_id = json_object_get(payload, "transfer_id");
     json_t *accept = json_object_get(payload, "accept");
     struct transfer_context *ctx;
-    uint64_t bytes_total = 0;
-    uint64_t bytes_transferred = 0;
-    unsigned int files_skipped = 0;
-    unsigned int files_transferred = 0;
-    size_t i;
-    json_t *complete;
+    int prepare_failed = 0;
+    int pump_failed = 0;
+    char *transfer_id_value = NULL;
 
     if (!json_is_string(transfer_id) || !json_is_array(accept))
         return;
-    ctx = find_transfer(json_string_value(transfer_id));
-    if (!ctx)
-        return;
+    if (g_plugin.host && g_plugin.host->log_info) {
+        char msg[256];
 
-    for (i = 0; i < ctx->entry_count; i++) {
-        if (ctx->entries[i].type == 'f')
-            bytes_total += ctx->entries[i].size;
+        snprintf(msg,
+                 sizeof(msg),
+                 "mft handle accept server=%u",
+                 server_id);
+        g_plugin.host->log_info(g_plugin.host->host_context, msg);
     }
-    if (send_entries(server_id,
-                     ctx->transfer_id,
-                     ctx->local_path,
-                     ctx->entries,
-                     ctx->entry_count,
-                     accept,
-                     &bytes_transferred) != 0)
-    {
-        complete_transfer_error(ctx, "Failed to send file transfer data.", true);
+    transfer_id_value = mft_strdup(json_string_value(transfer_id));
+    if (!transfer_id_value)
+        return;
+    mft_lock();
+    ctx = find_transfer(transfer_id_value);
+    if (!ctx) {
+        mft_unlock();
+        free(transfer_id_value);
         return;
     }
-    for (i = 0; i < json_array_size(accept); i++) {
-        json_t *item = json_array_get(accept, i);
-        json_t *decision = item ? json_object_get(item, "decision") : NULL;
-        if (json_is_string(decision) && strcmp(json_string_value(decision), "skip") == 0)
-            files_skipped++;
-        else if (json_is_string(decision) && strcmp(json_string_value(decision), "receive") == 0)
-            files_transferred++;
+
+    (void)server_id;
+    if (prepare_send_entries(ctx, accept) != 0)
+        prepare_failed = 1;
+    else {
+        touch_transfer_activity(ctx);
+        if (send_pump(ctx) != 0)
+            pump_failed = 1;
     }
-    complete = json_pack("{s:s,s:I,s:I,s:i,s:i}",
-                         "transfer_id",
-                         ctx->transfer_id,
-                         "bytes_total",
-                         (json_int_t)bytes_total,
-                         "bytes_transferred",
-                         (json_int_t)bytes_transferred,
-                         "files_transferred",
-                         (int)files_transferred,
-                         "files_skipped",
-                         (int)files_skipped);
-    if (!complete || send_json_frame(server_id, MFT_FRAME_COMPLETE, complete) != 0) {
-        json_decref(complete);
-        complete_transfer_error(ctx, "Failed to send file transfer completion.", true);
+    mft_unlock();
+    if (prepare_failed) {
+        complete_transfer_error_by_id(transfer_id_value,
+                                      "Failed to send file transfer data.",
+                                      true);
+        free(transfer_id_value);
         return;
     }
-    json_decref(complete);
+    if (pump_failed) {
+        complete_transfer_error_by_id(transfer_id_value,
+                                      "Failed to start file transfer data.",
+                                      true);
+        free(transfer_id_value);
+        return;
+    }
+    free(transfer_id_value);
+    mft_signal_timer();
 }
 
 static void handle_data(unsigned int server_id,
@@ -2007,32 +3387,232 @@ static void handle_data(unsigned int server_id,
     uint32_t stream_id;
     uint64_t offset;
     uint32_t data_len;
+    char chunk_hash[65];
+    char actual_hash[65];
     char transfer_id[256];
-    struct transfer_context *ctx;
+    struct transfer_context *ctx = NULL;
+    char target_root[PATH_MAX];
+    char relpath[PATH_MAX];
+    char part_path_value[PATH_MAX];
+    size_t block_index;
+    uint64_t block_offset;
+    uint64_t block_size;
+    char block_hash[65];
+    const unsigned char *chunk_data;
+    bool chunk_ok;
+    bool is_block_tail = false;
+    bool send_ack = false;
+    bool ack_ok = false;
+    bool block_hash_ok = false;
+    bool signal_timer = false;
+    const char *error_message = NULL;
 
-    (void)server_id;
-
-    if (len < 24)
+    if (len < 88)
         return;
     tid_len = read_u16_be(payload + 6);
     stream_id = read_u32_be(payload + 8);
     offset = read_u64_be(payload + 12);
     data_len = read_u32_be(payload + 20);
-    if (tid_len == 0 || tid_len >= sizeof(transfer_id) || len < 24u + tid_len + data_len)
+    if (tid_len == 0 || tid_len >= sizeof(transfer_id) || len < 88u + tid_len + data_len)
         return;
-    memcpy(transfer_id, payload + 24, tid_len);
+    memcpy(chunk_hash, payload + 24, 64);
+    chunk_hash[64] = '\0';
+    memcpy(transfer_id, payload + 88, tid_len);
     transfer_id[tid_len] = '\0';
+    chunk_data = payload + 88 + tid_len;
+    bytes_sha256(chunk_data, data_len, actual_hash);
+    chunk_ok = strcmp(actual_hash, chunk_hash) == 0;
+
+    mft_lock();
     ctx = find_transfer(transfer_id);
-    if (!ctx || stream_id == 0 || stream_id > ctx->entry_count)
+    if (!ctx || stream_id == 0 || stream_id > ctx->entry_count) {
+        mft_unlock();
         return;
-    if (receive_entry_data(ctx->local_path,
-                           ctx->entries,
-                           ctx->entry_count,
-                           ctx->entries[stream_id - 1].relpath,
-                           payload + 24 + tid_len,
-                           data_len,
-                           offset) != 0)
-        complete_transfer_error(ctx, "Failed to write received file data.", true);
+    }
+    {
+        struct manifest_entry *entry = &ctx->entries[stream_id - 1];
+        struct block_entry *block;
+
+        if (entry->type != 'f' || offset >= entry->size) {
+            mft_unlock();
+            return;
+        }
+        block_index = (size_t)(offset / MFT_LOGICAL_BLOCK_SIZE);
+        if (block_index >= entry->block_count) {
+            mft_unlock();
+            return;
+        }
+        block = &entry->blocks[block_index];
+        if (offset < block->offset || offset + data_len > block->offset + block->size) {
+            mft_unlock();
+            return;
+        }
+        if (strlen(ctx->local_path) >= sizeof(target_root) ||
+            strlen(entry->relpath) >= sizeof(relpath)) {
+            mft_unlock();
+            return;
+        }
+        snprintf(target_root, sizeof(target_root), "%s", ctx->local_path);
+        snprintf(relpath, sizeof(relpath), "%s", entry->relpath);
+        block_offset = block->offset;
+        block_size = block->size;
+        snprintf(block_hash, sizeof(block_hash), "%s", block->hash);
+        if (offset == block->offset) {
+            sha256_init(&block->receive_hash_ctx);
+            block->receive_hash_started = true;
+            block->receive_hash_failed = false;
+            block->receive_next_offset = block->offset;
+        }
+        if (!block->receive_hash_started ||
+            block->receive_hash_failed ||
+            offset != block->receive_next_offset) {
+            int nack_rc = mark_block_nack(ctx, stream_id, block_index);
+
+            block->receive_hash_started = false;
+            block->receive_hash_failed = true;
+            block->receive_next_offset = block->offset;
+            if (nack_rc == -2)
+                error_message = "File transfer receive retry limit exceeded.";
+            else if (nack_rc == 0)
+                send_ack = true;
+            mft_unlock();
+            if (send_ack)
+                send_block_ack_raw(server_id,
+                                   transfer_id,
+                                   stream_id,
+                                   block_index,
+                                   block_offset,
+                                   block_size,
+                                   false);
+            mft_signal_timer();
+            if (error_message)
+                complete_transfer_error_by_id(transfer_id, error_message, true);
+            return;
+        }
+    }
+
+    if (!chunk_ok) {
+        int nack_rc = mark_block_nack(ctx, stream_id, block_index);
+
+        if (nack_rc == -2)
+            error_message = "File transfer receive retry limit exceeded.";
+        else if (nack_rc == 0)
+            send_ack = true;
+        mft_unlock();
+        if (send_ack)
+            send_block_ack_raw(server_id,
+                               transfer_id,
+                               stream_id,
+                               block_index,
+                               block_offset,
+                               block_size,
+                               false);
+        mft_signal_timer();
+        if (error_message)
+            complete_transfer_error_by_id(transfer_id, error_message, true);
+        return;
+    }
+    if (part_path_for_relpath(target_root, relpath, part_path_value, sizeof(part_path_value)) != 0) {
+        mft_unlock();
+        complete_transfer_error_by_id(transfer_id, "Failed to write received file data.", true);
+        return;
+    }
+    is_block_tail = offset + data_len == block_offset + block_size;
+    mft_unlock();
+
+    if (write_all_at(part_path_value, chunk_data, data_len, offset) != 0) {
+        complete_transfer_error_by_id(transfer_id, "Failed to write received file data.", true);
+        return;
+    }
+
+    mft_lock();
+    ctx = find_transfer(transfer_id);
+    if (!ctx || stream_id == 0 || stream_id > ctx->entry_count) {
+        mft_unlock();
+        return;
+    }
+    {
+        struct manifest_entry *entry = &ctx->entries[stream_id - 1];
+        struct block_entry *block;
+
+        if (entry->type != 'f' || block_index >= entry->block_count) {
+            mft_unlock();
+            return;
+        }
+        block = &entry->blocks[block_index];
+        if (block->offset != block_offset || block->size != block_size) {
+            mft_unlock();
+            return;
+        }
+        touch_transfer_activity(ctx);
+        if (!block->receive_hash_started ||
+            block->receive_hash_failed ||
+            offset != block->receive_next_offset) {
+            int nack_rc = mark_block_nack(ctx, stream_id, block_index);
+
+            block->receive_hash_started = false;
+            block->receive_hash_failed = true;
+            block->receive_next_offset = block->offset;
+            if (nack_rc == -2)
+                error_message = "File transfer receive retry limit exceeded.";
+            else if (nack_rc == 0)
+                send_ack = true;
+            signal_timer = true;
+        } else {
+            sha256_update(&block->receive_hash_ctx, chunk_data, data_len);
+            block->receive_next_offset = offset + data_len;
+            block->receive_waiting = true;
+            block->receive_deadline_ms =
+                g_plugin.host->now_ms(g_plugin.host->host_context) + MFT_BLOCK_TIMEOUT_MS;
+        }
+        if (is_block_tail) {
+            block->receive_deadline_ms = 0;
+            if (!error_message && !send_ack && !block->receive_hash_failed) {
+                unsigned char hash_bytes[32];
+
+                sha256_final(&block->receive_hash_ctx, hash_bytes);
+                hash_to_hex(hash_bytes, actual_hash);
+                block_hash_ok = strcmp(actual_hash, block_hash) == 0;
+                block->receive_hash_started = false;
+            }
+            if (!error_message && block_hash_ok) {
+                if (!block->received_ok) {
+                    block->received_ok = true;
+                    block->receive_waiting = false;
+                    block->receive_deadline_ms = 0;
+                    block->receive_next_offset = block->offset;
+                    ctx->bytes_transferred += block->size;
+                }
+                send_ack = true;
+                ack_ok = true;
+                advance_receive_wait(ctx);
+            } else if (!error_message) {
+                int nack_rc = mark_block_nack(ctx, stream_id, block_index);
+
+                block->receive_hash_started = false;
+                block->receive_hash_failed = true;
+                block->receive_next_offset = block->offset;
+                if (nack_rc == -2)
+                    error_message = "File transfer receive retry limit exceeded.";
+                else if (nack_rc == 0)
+                    send_ack = true;
+            }
+            signal_timer = true;
+        }
+    }
+    mft_unlock();
+    if (send_ack)
+        send_block_ack_raw(server_id,
+                           transfer_id,
+                           stream_id,
+                           block_index,
+                           block_offset,
+                           block_size,
+                           ack_ok);
+    if (signal_timer)
+        mft_signal_timer();
+    if (error_message)
+        complete_transfer_error_by_id(transfer_id, error_message, true);
 }
 
 static void handle_complete(unsigned int server_id, json_t *payload)
@@ -2044,12 +3624,25 @@ static void handle_complete(unsigned int server_id, json_t *payload)
     uint64_t bytes_total = 0;
     uint64_t bytes_transferred = 0;
     size_t i;
+    char *summary_invocation_id = NULL;
+    char *summary_transfer_id = NULL;
+    char summary_direction[8];
+    size_t summary_files_total = 0;
+    unsigned int summary_files_transferred = 0;
+    unsigned int summary_files_skipped = 0;
+    uint64_t summary_bytes_total = 0;
+    uint64_t summary_bytes_transferred = 0;
+    unsigned long long summary_started_ms = 0;
+    bool unlinked = false;
 
     if (!json_is_string(transfer_id))
         return;
+    mft_lock();
     ctx = find_transfer(json_string_value(transfer_id));
-    if (!ctx)
+    if (!ctx) {
+        mft_unlock();
         return;
+    }
     for (i = 0; i < ctx->entry_count; i++) {
         if (ctx->entries[i].type == 'f')
             bytes_total += ctx->entries[i].size;
@@ -2070,6 +3663,18 @@ static void handle_complete(unsigned int server_id, json_t *payload)
     if (strcmp(ctx->direction, "receive") == 0) {
         json_t *ack;
 
+        if (!receive_blocks_all_ok(ctx)) {
+            log_first_missing_receive_block(ctx);
+            unlink_transfer(ctx);
+            mft_unlock();
+            complete_transfer_error_unlinked(ctx,
+                                             "File transfer completed before all blocks were received.",
+                                             true);
+            return;
+        }
+        unlink_transfer(ctx);
+        unlinked = true;
+        mft_unlock();
         if (finalize_received(ctx->local_path,
                               ctx->entries,
                               ctx->entry_count,
@@ -2077,7 +3682,9 @@ static void handle_complete(unsigned int server_id, json_t *payload)
                               &files_skipped,
                               &files_transferred) != 0)
         {
-            complete_transfer_error(ctx, "Failed to finalize received file transfer.", true);
+            complete_transfer_error_unlinked(ctx,
+                                             "Failed to finalize received file transfer.",
+                                             true);
             return;
         }
         ack = json_pack("{s:s,s:b,s:I,s:I,s:i,s:i}",
@@ -2093,28 +3700,57 @@ static void handle_complete(unsigned int server_id, json_t *payload)
                         (int)files_transferred,
                         "files_skipped",
                         (int)files_skipped);
-        if (!ack || send_json_frame(server_id, MFT_FRAME_COMPLETE, ack) != 0) {
+        if (!ack) {
             json_decref(ack);
-            complete_transfer_error(ctx, "Failed to send file transfer acknowledgement.", true);
+            complete_transfer_error_unlinked(ctx,
+                                             "Failed to send file transfer acknowledgement.",
+                                             true);
+            return;
+        }
+        if (send_json_frame(server_id, MFT_FRAME_COMPLETE, ack) != 0) {
+            json_decref(ack);
+            complete_transfer_error_unlinked(ctx,
+                                             "Failed to send file transfer acknowledgement.",
+                                             true);
             return;
         }
         json_decref(ack);
+        mft_lock();
     }
     if (bytes_transferred == 0)
         bytes_transferred = bytes_total;
-    if (ctx->invocation_id)
-        send_summary(ctx->invocation_id,
-                     ctx->transfer_id,
+    if (ctx->invocation_id) {
+        summary_invocation_id = mft_strdup(ctx->invocation_id);
+        summary_transfer_id = mft_strdup(ctx->transfer_id);
+        snprintf(summary_direction,
+                 sizeof(summary_direction),
+                 "%s",
+                 strcmp(ctx->direction, "receive") == 0 ? "recv" : "send");
+        summary_files_total = ctx->entry_count;
+        summary_files_transferred = files_transferred;
+        summary_files_skipped = files_skipped;
+        summary_bytes_total = bytes_total;
+        summary_bytes_transferred = bytes_transferred;
+        summary_started_ms = ctx->started_ms;
+    }
+    if (!unlinked)
+        unlink_transfer(ctx);
+    ctx->completed = true;
+    release_transfer_after_unlink(ctx);
+    mft_unlock();
+    if (summary_invocation_id && summary_transfer_id)
+        send_summary(summary_invocation_id,
+                     summary_transfer_id,
                      server_id,
-                     strcmp(ctx->direction, "receive") == 0 ? "recv" : "send",
-                     ctx->entry_count,
-                     files_transferred,
-                     files_skipped,
-                     bytes_total,
-                     bytes_transferred,
-                     ctx->started_ms);
-    unlink_transfer(ctx);
-    free_transfer(ctx);
+                     summary_direction,
+                     summary_files_total,
+                     summary_files_transferred,
+                     summary_files_skipped,
+                     summary_bytes_total,
+                     summary_bytes_transferred,
+                     summary_started_ms);
+    free(summary_invocation_id);
+    free(summary_transfer_id);
 }
 
 static void handle_abort(json_t *payload)
@@ -2125,13 +3761,18 @@ static void handle_abort(json_t *payload)
 
     if (!json_is_string(transfer_id))
         return;
+    mft_lock();
     ctx = find_transfer(json_string_value(transfer_id));
-    if (!ctx)
+    if (!ctx) {
+        mft_unlock();
         return;
-    complete_transfer_error(ctx,
-                            json_is_string(message) ? json_string_value(message)
-                                                    : "Peer aborted file transfer.",
-                            false);
+    }
+    unlink_transfer(ctx);
+    mft_unlock();
+    complete_transfer_error_unlinked(ctx,
+                                     json_is_string(message) ? json_string_value(message)
+                                                             : "Peer aborted file transfer.",
+                                     false);
 }
 
 static void on_frame(void *user_data,
@@ -2166,6 +3807,9 @@ static void on_frame(void *user_data,
         break;
     case MFT_FRAME_ACCEPT:
         handle_accept(server_id, json);
+        break;
+    case MFT_FRAME_ACK:
+        handle_ack(server_id, json);
         break;
     case MFT_FRAME_COMPLETE:
         handle_complete(server_id, json);
@@ -2254,6 +3898,33 @@ MFT_PLUGIN_EXPORT int MFT_PLUGIN_INIT(const struct mcp_plugin_host_api *host,
         snprintf(result_json, result_size, "Missing ABI 1.1 host API.");
         return -1;
     }
+#ifdef _WIN32
+    InitializeCriticalSection(&g_plugin.lock);
+    InitializeConditionVariable(&g_plugin.timer_cv);
+    g_plugin.sync_initialized = true;
+#else
+    {
+        pthread_mutexattr_t attr;
+
+        if (pthread_mutexattr_init(&attr) != 0) {
+            snprintf(result_json, result_size, "Failed to initialize file transfer synchronization.");
+            return -1;
+        }
+        if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) != 0 ||
+            pthread_mutex_init(&g_plugin.lock, &attr) != 0 ||
+            pthread_cond_init(&g_plugin.timer_cond, NULL) != 0) {
+            pthread_mutexattr_destroy(&attr);
+            snprintf(result_json, result_size, "Failed to initialize file transfer synchronization.");
+            return -1;
+        }
+        pthread_mutexattr_destroy(&attr);
+    }
+    g_plugin.sync_initialized = true;
+#endif
+    if (start_timer_thread() != 0) {
+        snprintf(result_json, result_size, "Failed to start file transfer timer thread.");
+        return -1;
+    }
     if (register_tools() != 0) {
         snprintf(result_json, result_size, "Failed to register server.send/server.recv.");
         return -1;
@@ -2328,6 +3999,7 @@ MFT_PLUGIN_EXPORT int MFT_PLUGIN_INVOKE(const char *invocation_id,
 
 MFT_PLUGIN_EXPORT int MFT_PLUGIN_SHUTDOWN(void)
 {
+    stop_timer_thread();
     while (g_transfers) {
         struct transfer_context *ctx = g_transfers;
 
@@ -2337,6 +4009,15 @@ MFT_PLUGIN_EXPORT int MFT_PLUGIN_SHUTDOWN(void)
     }
     if (g_plugin.host && g_plugin.host->peer_transport_unregister_handler)
         g_plugin.host->peer_transport_unregister_handler(g_plugin.host->host_context, MFT_MAGIC);
+#ifdef _WIN32
+    if (g_plugin.sync_initialized)
+        DeleteCriticalSection(&g_plugin.lock);
+#else
+    if (g_plugin.sync_initialized) {
+        pthread_cond_destroy(&g_plugin.timer_cond);
+        pthread_mutex_destroy(&g_plugin.lock);
+    }
+#endif
     memset(&g_plugin, 0, sizeof(g_plugin));
     return 0;
 }
