@@ -14,6 +14,17 @@ struct peer_write_req {
     bool close_after_write;
 };
 
+struct peer_thread_send_req {
+    unsigned int server_id;
+    char *payload;
+    size_t len;
+    int rc;
+    bool done;
+    uv_mutex_t mutex;
+    uv_cond_t cond;
+    struct peer_thread_send_req *next;
+};
+
 struct peer_connect_req {
     uv_connect_t req;
     struct mcp_peer_connection *conn;
@@ -60,8 +71,17 @@ struct mcp_peer_connection {
 
 struct mcp_peer_transport {
     uv_loop_t *loop;
+    uv_thread_t loop_thread;
+    bool loop_thread_valid;
+    bool closing;
     size_t max_frame_bytes;
     size_t write_high_watermark;
+    uv_async_t send_async;
+    bool send_async_initialized;
+    uv_mutex_t send_mutex;
+    bool send_mutex_initialized;
+    struct peer_thread_send_req *pending_sends_head;
+    struct peer_thread_send_req *pending_sends_tail;
     mcp_peer_json_frame_cb on_json;
     mcp_peer_close_cb on_close;
     void *json_arg;
@@ -89,6 +109,57 @@ static void write_u32_be(char *data, uint32_t value)
     data[1] = (char)((value >> 16) & 0xffu);
     data[2] = (char)((value >> 8) & 0xffu);
     data[3] = (char)(value & 0xffu);
+}
+
+static void thread_send_async_cb(uv_async_t *handle);
+
+static void thread_send_complete(struct peer_thread_send_req *req, int rc)
+{
+    uv_mutex_lock(&req->mutex);
+    req->rc = rc;
+    req->done = true;
+    uv_cond_signal(&req->cond);
+    uv_mutex_unlock(&req->mutex);
+}
+
+static void fail_pending_thread_sends(struct mcp_peer_transport *transport)
+{
+    struct peer_thread_send_req *req;
+
+    if (!transport || !transport->send_mutex_initialized)
+        return;
+
+    uv_mutex_lock(&transport->send_mutex);
+    req = transport->pending_sends_head;
+    transport->pending_sends_head = NULL;
+    transport->pending_sends_tail = NULL;
+    uv_mutex_unlock(&transport->send_mutex);
+
+    while (req) {
+        struct peer_thread_send_req *next = req->next;
+
+        req->next = NULL;
+        thread_send_complete(req, -1);
+        req = next;
+    }
+}
+
+static void send_async_close_cb(uv_handle_t *handle)
+{
+    struct mcp_peer_transport *transport = handle->data;
+
+    if (transport)
+        transport->send_async_initialized = false;
+}
+
+static bool peer_transport_on_loop_thread(struct mcp_peer_transport *transport)
+{
+    uv_thread_t current;
+
+    if (!transport || !transport->loop_thread_valid)
+        return true;
+    current = uv_thread_self();
+    return uv_thread_equal(&current, &transport->loop_thread) != 0;
 }
 
 static struct mcp_peer_connection *find_connection(struct mcp_peer_transport *transport,
@@ -422,9 +493,24 @@ int mcp_peer_transport_create(struct mcp_peer_transport **out,
         return -1;
 
     transport->loop = loop;
+    transport->loop_thread = uv_thread_self();
+    transport->loop_thread_valid = true;
     transport->max_frame_bytes = max_frame_bytes;
     transport->write_high_watermark = write_high_watermark ? write_high_watermark
                                                            : (4 * max_frame_bytes);
+    if (uv_mutex_init(&transport->send_mutex) != 0) {
+        free(transport);
+        return -1;
+    }
+    transport->send_mutex_initialized = true;
+    if (uv_async_init(loop, &transport->send_async, thread_send_async_cb) != 0) {
+        uv_mutex_destroy(&transport->send_mutex);
+        free(transport);
+        return -1;
+    }
+    transport->send_async_initialized = true;
+    transport->send_async.data = transport;
+    uv_unref((uv_handle_t *)&transport->send_async);
     *out = transport;
     return 0;
 }
@@ -439,6 +525,13 @@ void mcp_peer_transport_destroy(struct mcp_peer_transport *transport)
         return;
 
     mcp_peer_transport_close(transport);
+    while (transport->loop &&
+           (transport->connections || transport->send_async_initialized))
+        uv_run(transport->loop, UV_RUN_DEFAULT);
+    if (transport->send_mutex_initialized) {
+        uv_mutex_destroy(&transport->send_mutex);
+        transport->send_mutex_initialized = false;
+    }
 
     while ((handler = transport->handlers) != NULL) {
         transport->handlers = handler->next;
@@ -548,7 +641,22 @@ int mcp_peer_transport_adopt(struct mcp_peer_transport *transport,
 
 void mcp_peer_transport_close(struct mcp_peer_transport *transport)
 {
-    while (transport && transport->connections)
+    if (!transport)
+        return;
+
+    if (transport->send_mutex_initialized) {
+        uv_mutex_lock(&transport->send_mutex);
+        transport->closing = true;
+        uv_mutex_unlock(&transport->send_mutex);
+    } else {
+        transport->closing = true;
+    }
+    fail_pending_thread_sends(transport);
+    if (transport->send_async_initialized &&
+        !uv_is_closing((uv_handle_t *)&transport->send_async))
+        uv_close((uv_handle_t *)&transport->send_async, send_async_close_cb);
+
+    while (transport->connections)
         mcp_peer_connection_close(transport->connections);
 }
 
@@ -634,24 +742,122 @@ int mcp_peer_connection_send_frame(struct mcp_peer_connection *conn,
     return 0;
 }
 
-int mcp_peer_transport_send_frame(struct mcp_peer_transport *transport,
-                                  unsigned int server_id,
-                                  const void *payload,
-                                  size_t len)
+static int peer_transport_send_frame_on_loop(struct mcp_peer_transport *transport,
+                                             unsigned int server_id,
+                                             const void *payload,
+                                             size_t len)
 {
     if (transport && transport->external_send) {
         int rc = transport->external_send(transport->external_send_arg,
                                           server_id,
                                           payload,
                                           len);
-        if (rc == 0)
-            return 0;
+        if (rc == 0 || rc == -2)
+            return rc;
     }
 
     return mcp_peer_connection_send_frame(find_connection(transport, server_id),
                                           payload,
                                           len,
                                           false);
+}
+
+static void thread_send_async_cb(uv_async_t *handle)
+{
+    struct mcp_peer_transport *transport = handle->data;
+    struct peer_thread_send_req *req;
+
+    if (!transport || !transport->send_mutex_initialized)
+        return;
+    for (;;) {
+        uv_mutex_lock(&transport->send_mutex);
+        req = transport->pending_sends_head;
+        if (req) {
+            transport->pending_sends_head = req->next;
+            if (!transport->pending_sends_head)
+                transport->pending_sends_tail = NULL;
+            req->next = NULL;
+        }
+        uv_mutex_unlock(&transport->send_mutex);
+        if (!req)
+            break;
+
+        if (transport->closing)
+            thread_send_complete(req, -1);
+        else
+            thread_send_complete(req,
+                                 peer_transport_send_frame_on_loop(transport,
+                                                                   req->server_id,
+                                                                   req->payload,
+                                                                   req->len));
+    }
+}
+
+static int peer_transport_send_frame_threadsafe(struct mcp_peer_transport *transport,
+                                                unsigned int server_id,
+                                                const void *payload,
+                                                size_t len)
+{
+    struct peer_thread_send_req req;
+    int rc = -1;
+
+    if (!transport || !transport->send_async_initialized || !transport->send_mutex_initialized)
+        return -1;
+    memset(&req, 0, sizeof(req));
+    req.server_id = server_id;
+    req.len = len;
+    req.payload = malloc(len);
+    if (!req.payload)
+        return -1;
+    memcpy(req.payload, payload, len);
+    if (uv_mutex_init(&req.mutex) != 0) {
+        free(req.payload);
+        return -1;
+    }
+    if (uv_cond_init(&req.cond) != 0) {
+        uv_mutex_destroy(&req.mutex);
+        free(req.payload);
+        return -1;
+    }
+
+    uv_mutex_lock(&transport->send_mutex);
+    if (transport->closing ||
+        !transport->send_async_initialized ||
+        uv_is_closing((uv_handle_t *)&transport->send_async)) {
+        uv_mutex_unlock(&transport->send_mutex);
+        uv_cond_destroy(&req.cond);
+        uv_mutex_destroy(&req.mutex);
+        free(req.payload);
+        return -1;
+    }
+    if (transport->pending_sends_tail)
+        transport->pending_sends_tail->next = &req;
+    else
+        transport->pending_sends_head = &req;
+    transport->pending_sends_tail = &req;
+    uv_async_send(&transport->send_async);
+    uv_mutex_unlock(&transport->send_mutex);
+
+    uv_mutex_lock(&req.mutex);
+    while (!req.done)
+        uv_cond_wait(&req.cond, &req.mutex);
+    rc = req.rc;
+    uv_mutex_unlock(&req.mutex);
+
+    uv_cond_destroy(&req.cond);
+    uv_mutex_destroy(&req.mutex);
+    free(req.payload);
+    return rc;
+}
+
+int mcp_peer_transport_send_frame(struct mcp_peer_transport *transport,
+                                  unsigned int server_id,
+                                  const void *payload,
+                                  size_t len)
+{
+    if (transport && !peer_transport_on_loop_thread(transport))
+        return peer_transport_send_frame_threadsafe(transport, server_id, payload, len);
+    return peer_transport_send_frame_on_loop(transport, server_id, payload, len);
 }
 
 size_t mcp_peer_transport_write_queue_bytes(struct mcp_peer_transport *transport,
