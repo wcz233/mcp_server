@@ -164,6 +164,40 @@ add_test(
     COMMAND mcp_file_transfer_resume_test
 )
 
+add_executable(mcp_file_transfer_protocol_bounds_test
+    file_transfer_protocol_bounds_test.c
+)
+
+target_include_directories(mcp_file_transfer_protocol_bounds_test
+    PRIVATE
+        "${PROJECT_SOURCE_DIR}/include"
+)
+
+target_compile_definitions(mcp_file_transfer_protocol_bounds_test
+    PRIVATE
+        $<$<PLATFORM_ID:Linux>:_GNU_SOURCE>
+        $<$<PLATFORM_ID:Linux>:_POSIX_C_SOURCE=200809L>
+)
+
+target_link_libraries(mcp_file_transfer_protocol_bounds_test
+    PRIVATE
+        MCP::jansson
+        MCP::libuv
+        Threads::Threads
+)
+
+if(MSVC)
+    target_compile_definitions(mcp_file_transfer_protocol_bounds_test PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(mcp_file_transfer_protocol_bounds_test PRIVATE /W4)
+else()
+    target_compile_options(mcp_file_transfer_protocol_bounds_test PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_test(
+    NAME mcp_file_transfer_protocol_bounds
+    COMMAND mcp_file_transfer_protocol_bounds_test
+)
+
 if(NOT "${MCP_TOOL_PLUGIN_MANAGER}" STREQUAL "n")
     add_library(mcp_busy_shutdown_plugin MODULE
         busy_shutdown_plugin.c

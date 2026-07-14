@@ -163,6 +163,9 @@ typedef int mode_t;
 #define MFT_CAP_WHOLE_FILE "mft.v1.whole_file"
 #define MFT_CAP_RESUME "mft.v1.resume"
 #define MFT_CAP_BLOCK_ACK "mft.v1.block_ack"
+#define MFT_MAX_FRAME_SIZE (1024u * 1024u)
+#define MFT_MAX_MANIFEST_ENTRIES 4096u
+#define MFT_MAX_BLOCKS_PER_FILE 8192u
 #define MFT_LOGICAL_BLOCK_SIZE (64u * 1024u * 1024u)
 #define MFT_MAX_CHUNK 32768u
 #define MFT_MAX_CONCURRENT_STREAMS 4u
@@ -1245,12 +1248,16 @@ static int copy_file_range_chunks(FILE *fp,
     unsigned char *frame;
     unsigned char buf[MFT_MAX_CHUNK];
     uint64_t pos = offset;
+    size_t transfer_id_len;
     uint16_t tid_len;
     int rc;
 
     if (!transfer_id)
         return -1;
-    tid_len = (uint16_t)strlen(transfer_id);
+    transfer_id_len = strlen(transfer_id);
+    if (transfer_id_len == 0 || transfer_id_len >= 256)
+        return -1;
+    tid_len = (uint16_t)transfer_id_len;
 
     if (mft_seek_stream(fp, offset) != 0)
         return -1;
@@ -1263,6 +1270,8 @@ static int copy_file_range_chunks(FILE *fp,
         size_t header_len = 4 + 1 + 1 + 2 + 4 + 8 + 4 + 64 + tid_len;
 
         if (n == 0)
+            return -1;
+        if (header_len > MFT_MAX_FRAME_SIZE || n > MFT_MAX_FRAME_SIZE - header_len)
             return -1;
         bytes_sha256(buf, n, chunk_hash);
         frame = malloc(header_len + n);
@@ -1316,7 +1325,7 @@ static int send_json_frame(unsigned int server_id, enum mft_frame_type type, jso
     if (!json)
         return -1;
     json_len = strlen(json);
-    if (json_len > UINT32_MAX - 8) {
+    if (json_len > MFT_MAX_FRAME_SIZE - 8u) {
         free(json);
         return -1;
     }
@@ -1375,8 +1384,13 @@ static int append_entry(struct manifest_entry **entries,
 {
     struct manifest_entry *next;
 
+    if (*count >= MFT_MAX_MANIFEST_ENTRIES)
+        return -1;
     if (*count == *capacity) {
         size_t next_capacity = *capacity ? *capacity * 2 : 16;
+
+        if (next_capacity > MFT_MAX_MANIFEST_ENTRIES)
+            next_capacity = MFT_MAX_MANIFEST_ENTRIES;
         next = realloc(*entries, next_capacity * sizeof(**entries));
         if (!next)
             return -1;
@@ -1394,6 +1408,7 @@ static int build_entry(const char *path,
 {
     struct stat st;
     FILE *fp = NULL;
+    uint64_t block_count;
     size_t i;
 
     if (stat(path, &st) != 0)
@@ -1404,6 +1419,11 @@ static int build_entry(const char *path,
         return -1;
     entry->mode = (unsigned int)(st.st_mode & 0777u);
     entry->mtime_ns = stat_mtime_ns(&st);
+    if (entry->mtime_ns > INT64_MAX) {
+        free(entry->relpath);
+        memset(entry, 0, sizeof(*entry));
+        return -1;
+    }
 
     if (S_ISDIR(st.st_mode)) {
         entry->type = 'd';
@@ -1415,10 +1435,20 @@ static int build_entry(const char *path,
         return -2;
     }
     entry->type = 'f';
+    if (st.st_size < 0) {
+        free(entry->relpath);
+        memset(entry, 0, sizeof(*entry));
+        return -1;
+    }
     entry->size = (uint64_t)st.st_size;
-    entry->block_count = entry->size == 0 ? 0 :
-                             (size_t)((entry->size + MFT_LOGICAL_BLOCK_SIZE - 1) /
-                                      MFT_LOGICAL_BLOCK_SIZE);
+    block_count = entry->size == 0 ? 0 :
+                      1 + (entry->size - 1) / MFT_LOGICAL_BLOCK_SIZE;
+    if (block_count > MFT_MAX_BLOCKS_PER_FILE) {
+        free(entry->relpath);
+        memset(entry, 0, sizeof(*entry));
+        return -1;
+    }
+    entry->block_count = (size_t)block_count;
     if (entry->block_count == 0) {
         if (file_sha256(path, entry->hash) != 0) {
             free(entry->relpath);
@@ -1472,12 +1502,15 @@ static int scan_path(const char *root,
     struct dirent *dent;
     int rc;
 
+    if (*count >= MFT_MAX_MANIFEST_ENTRIES)
+        return -1;
     if (join_path(path, sizeof(path), root, relpath) != 0)
         return -1;
     rc = build_entry(path, relpath, &entry);
     if (rc != 0)
         return rc;
     if (append_entry(entries, count, capacity, &entry) != 0) {
+        free(entry.blocks);
         free(entry.relpath);
         return -1;
     }
@@ -1516,6 +1549,11 @@ static json_t *entries_to_manifest(struct manifest_entry *entries, size_t count)
     json_t *array = json_array();
     size_t i;
 
+    if (count > MFT_MAX_MANIFEST_ENTRIES) {
+        json_decref(manifest);
+        json_decref(array);
+        return NULL;
+    }
     for (i = 0; i < count; i++) {
         struct manifest_entry *entry = &entries[i];
         json_t *item = json_pack("{s:s,s:s,s:I,s:I,s:i}",
@@ -1557,6 +1595,65 @@ static json_t *entries_to_manifest(struct manifest_entry *entries, size_t count)
     return manifest;
 }
 
+static int json_nonnegative_u64(json_t *value, uint64_t *out)
+{
+    json_int_t raw;
+
+    if (!json_is_integer(value))
+        return -1;
+    raw = json_integer_value(value);
+    if (raw < 0)
+        return -1;
+    *out = (uint64_t)raw;
+    return 0;
+}
+
+static int json_nonnegative_uint(json_t *value, unsigned int *out)
+{
+    uint64_t raw;
+
+    if (json_nonnegative_u64(value, &raw) != 0 || raw > UINT_MAX)
+        return -1;
+    *out = (unsigned int)raw;
+    return 0;
+}
+
+static int validate_manifest_bounds(json_t *array)
+{
+    uint64_t total_size = 0;
+    size_t index;
+    json_t *item;
+
+    if (!json_is_array(array) || json_array_size(array) > MFT_MAX_MANIFEST_ENTRIES)
+        return -1;
+    json_array_foreach(array, index, item) {
+        json_t *type;
+        json_t *size;
+        uint64_t entry_size;
+        const char *type_value;
+
+        if (!json_is_object(item))
+            return -1;
+        type = json_object_get(item, "type");
+        size = json_object_get(item, "size");
+        if (!json_is_string(type) ||
+            json_nonnegative_u64(size, &entry_size) != 0)
+            return -1;
+        type_value = json_string_value(type);
+        if (strcmp(type_value, "file") == 0) {
+            if (entry_size > (uint64_t)INT64_MAX - total_size)
+                return -1;
+            total_size += entry_size;
+        } else if (strcmp(type_value, "directory") == 0) {
+            if (entry_size != 0)
+                return -1;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int manifest_to_entries(json_t *manifest,
                                struct manifest_entry **out_entries,
                                size_t *out_count)
@@ -1569,8 +1666,10 @@ static int manifest_to_entries(json_t *manifest,
 
     *out_entries = NULL;
     *out_count = 0;
+    if (!json_is_object(manifest))
+        return -1;
     array = json_object_get(manifest, "entries");
-    if (!json_is_array(array))
+    if (validate_manifest_bounds(array) != 0)
         return -1;
 
     entries = calloc(json_array_size(array), sizeof(*entries));
@@ -1585,41 +1684,40 @@ static int manifest_to_entries(json_t *manifest,
         json_t *mode = json_object_get(item, "mode");
         json_t *hash = json_object_get(item, "hash");
         json_t *blocks = json_object_get(item, "blocks");
+        json_t *block_size_value = json_object_get(item, "block_size");
         struct manifest_entry *entry = &entries[count];
 
         if (!json_is_string(relpath) ||
             !path_is_safe_rel(json_string_value(relpath)) ||
             !json_is_string(type) ||
-            !json_is_integer(size) ||
-            !json_is_integer(mtime_ns) ||
-            !json_is_integer(mode)) {
-            free_entries(entries, count);
+            json_nonnegative_u64(size, &entry->size) != 0 ||
+            json_nonnegative_u64(mtime_ns, &entry->mtime_ns) != 0 ||
+            json_nonnegative_uint(mode, &entry->mode) != 0) {
+            free_entries(entries, count + 1);
             return -1;
         }
         entry->relpath = mft_strdup(json_string_value(relpath));
         if (!entry->relpath) {
-            free_entries(entries, count);
+            free_entries(entries, count + 1);
             return -1;
         }
         entry->type = strcmp(json_string_value(type), "directory") == 0 ? 'd' : 'f';
-        entry->size = (uint64_t)json_integer_value(size);
-        entry->mtime_ns = (uint64_t)json_integer_value(mtime_ns);
-        entry->mode = (unsigned int)json_integer_value(mode);
         if (entry->type == 'f') {
             size_t block_index;
             uint64_t expected_offset = 0;
+            uint64_t declared_block_size;
 
-            if (!json_is_string(hash) || strlen(json_string_value(hash)) != 64) {
+            if (!json_is_string(hash) || strlen(json_string_value(hash)) != 64 ||
+                !json_is_array(blocks) ||
+                json_nonnegative_u64(block_size_value, &declared_block_size) != 0 ||
+                declared_block_size != MFT_LOGICAL_BLOCK_SIZE) {
                 free_entries(entries, count + 1);
                 return -1;
             }
             snprintf(entry->hash, sizeof(entry->hash), "%s", json_string_value(hash));
-            if (!json_is_array(blocks)) {
-                free_entries(entries, count + 1);
-                return -1;
-            }
             entry->block_count = json_array_size(blocks);
-            if ((entry->size == 0 && entry->block_count != 0) ||
+            if (entry->block_count > MFT_MAX_BLOCKS_PER_FILE ||
+                (entry->size == 0 && entry->block_count != 0) ||
                 (entry->size != 0 && entry->block_count == 0)) {
                 free_entries(entries, count + 1);
                 return -1;
@@ -1633,24 +1731,30 @@ static int manifest_to_entries(json_t *manifest,
             }
             for (block_index = 0; block_index < entry->block_count; block_index++) {
                 json_t *block_item = json_array_get(blocks, block_index);
-                json_t *offset = json_object_get(block_item, "offset");
-                json_t *block_size = json_object_get(block_item, "size");
-                json_t *block_hash = json_object_get(block_item, "hash");
+                json_t *offset;
+                json_t *block_size;
+                json_t *block_hash;
                 struct block_entry *block = &entry->blocks[block_index];
+                uint64_t expected_size;
 
-                if (!json_is_integer(offset) ||
-                    !json_is_integer(block_size) ||
+                if (expected_offset >= entry->size || !json_is_object(block_item)) {
+                    free_entries(entries, count + 1);
+                    return -1;
+                }
+                offset = json_object_get(block_item, "offset");
+                block_size = json_object_get(block_item, "size");
+                block_hash = json_object_get(block_item, "hash");
+                if (json_nonnegative_u64(offset, &block->offset) != 0 ||
+                    json_nonnegative_u64(block_size, &block->size) != 0 ||
                     !json_is_string(block_hash) ||
                     strlen(json_string_value(block_hash)) != 64) {
                     free_entries(entries, count + 1);
                     return -1;
                 }
-                block->offset = (uint64_t)json_integer_value(offset);
-                block->size = (uint64_t)json_integer_value(block_size);
-                if (block->offset != expected_offset ||
-                    block->size == 0 ||
-                    block->size > MFT_LOGICAL_BLOCK_SIZE ||
-                    block->offset + block->size > entry->size) {
+                expected_size = entry->size - expected_offset;
+                if (expected_size > MFT_LOGICAL_BLOCK_SIZE)
+                    expected_size = MFT_LOGICAL_BLOCK_SIZE;
+                if (block->offset != expected_offset || block->size != expected_size) {
                     free_entries(entries, count + 1);
                     return -1;
                 }
@@ -1680,7 +1784,7 @@ static int send_hello(unsigned int server_id)
                                 MFT_CAP_RESUME,
                                 MFT_CAP_BLOCK_ACK,
                                 "max_frame_size",
-                                1024 * 1024,
+                                (int)MFT_MAX_FRAME_SIZE,
                                 "initial_session_window",
                                 1024 * 1024,
                                 "initial_stream_window",
@@ -2023,6 +2127,8 @@ static void handle_ack(unsigned int server_id, json_t *payload)
     struct block_entry *block;
     uint32_t stream_id;
     size_t block_index;
+    json_int_t stream_id_raw;
+    json_int_t block_index_raw;
 
     (void)server_id;
     if (!json_is_string(transfer_id) ||
@@ -2030,23 +2136,28 @@ static void handle_ack(unsigned int server_id, json_t *payload)
         !json_is_integer(block_index_json) ||
         !json_is_boolean(ok_json))
         return;
+    stream_id_raw = json_integer_value(stream_id_json);
+    block_index_raw = json_integer_value(block_index_json);
+    if (stream_id_raw <= 0 || (uint64_t)stream_id_raw > UINT32_MAX ||
+        block_index_raw < 0)
+        return;
     mft_lock();
     ctx = find_transfer(json_string_value(transfer_id));
     if (!ctx || strcmp(ctx->direction, "send") != 0) {
         mft_unlock();
         return;
     }
-    stream_id = (uint32_t)json_integer_value(stream_id_json);
+    stream_id = (uint32_t)stream_id_raw;
     if (stream_id == 0 || stream_id > ctx->entry_count) {
         mft_unlock();
         return;
     }
     entry = &ctx->entries[stream_id - 1];
-    block_index = (size_t)json_integer_value(block_index_json);
-    if (entry->type != 'f' || block_index >= entry->block_count) {
+    if (entry->type != 'f' || (uint64_t)block_index_raw >= entry->block_count) {
         mft_unlock();
         return;
     }
+    block_index = (size_t)block_index_raw;
     block = &entry->blocks[block_index];
     if (json_boolean_value(ok_json)) {
         if (!block->acked) {
@@ -2129,9 +2240,10 @@ static void mark_receive_resume_blocks(struct transfer_context *ctx)
         struct manifest_entry *entry = &ctx->entries[i];
         json_t *accept_item = json_array_get(ctx->accept, i);
         json_t *resume = accept_item ? json_object_get(accept_item, "resume_offset") : NULL;
-        uint64_t resume_offset = json_is_integer(resume) ? (uint64_t)json_integer_value(resume) : 0;
+        uint64_t resume_offset = 0;
         size_t block_index;
 
+        (void)json_nonnegative_u64(resume, &resume_offset);
         if (!entry_should_receive(ctx, i))
             continue;
         for (block_index = 0; block_index < entry->block_count; block_index++) {
@@ -2495,11 +2607,66 @@ done:
     return result;
 }
 
+static bool resume_offset_is_block_boundary(const struct manifest_entry *entry,
+                                            uint64_t resume_offset)
+{
+    size_t block_index;
+
+    if (resume_offset == 0)
+        return true;
+    for (block_index = 0; block_index < entry->block_count; block_index++) {
+        const struct block_entry *block = &entry->blocks[block_index];
+
+        if (resume_offset == block->offset + block->size)
+            return true;
+    }
+    return false;
+}
+
+static int validate_accept(json_t *accept,
+                           const struct manifest_entry *entries,
+                           size_t count)
+{
+    size_t i;
+
+    if (!json_is_array(accept) || json_array_size(accept) != count)
+        return -1;
+    for (i = 0; i < count; i++) {
+        const struct manifest_entry *entry = &entries[i];
+        json_t *item = json_array_get(accept, i);
+        json_t *decision;
+        json_t *resume;
+        uint64_t resume_offset;
+        const char *decision_value;
+
+        if (!json_is_object(item))
+            return -1;
+        decision = json_object_get(item, "decision");
+        resume = json_object_get(item, "resume_offset");
+        if (!json_is_string(decision) ||
+            json_nonnegative_u64(resume, &resume_offset) != 0)
+            return -1;
+        decision_value = json_string_value(decision);
+        if (entry->type == 'd') {
+            if (strcmp(decision_value, "create_directory") != 0 || resume_offset != 0)
+                return -1;
+        } else if ((strcmp(decision_value, "receive") != 0 &&
+                    strcmp(decision_value, "skip") != 0) ||
+                   resume_offset > entry->size ||
+                   !resume_offset_is_block_boundary(entry, resume_offset)) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int prepare_send_entries(struct transfer_context *ctx,
                                 json_t *accept)
 {
     size_t i;
 
+    if (validate_accept(accept, ctx->entries, ctx->entry_count) != 0)
+        return -1;
     ctx->accept = json_incref(accept);
     ctx->send_entry_index = 0;
     ctx->send_block_index = 0;
@@ -2523,9 +2690,10 @@ static int prepare_send_entries(struct transfer_context *ctx,
         json_t *accept_item = json_array_get(accept, i);
         json_t *decision = accept_item ? json_object_get(accept_item, "decision") : NULL;
         json_t *resume = accept_item ? json_object_get(accept_item, "resume_offset") : NULL;
-        uint64_t resume_offset = json_is_integer(resume) ? (uint64_t)json_integer_value(resume) : 0;
+        uint64_t resume_offset;
         size_t block_index;
 
+        (void)json_nonnegative_u64(resume, &resume_offset);
         if (entry->type != 'f')
             continue;
         ctx->bytes_total += entry->size;
@@ -3451,8 +3619,11 @@ static int prepare_source_entries(struct transfer_context *ctx)
     if (manifest_is_single_file_root(ctx->entries, ctx->entry_count) && !ctx->source_name)
         return -1;
     for (i = 0; i < ctx->entry_count; i++) {
-        if (ctx->entries[i].type == 'f')
+        if (ctx->entries[i].type == 'f') {
+            if (ctx->entries[i].size > (uint64_t)INT64_MAX - ctx->bytes_total)
+                return -1;
             ctx->bytes_total += ctx->entries[i].size;
+        }
     }
     return 0;
 }
@@ -4035,10 +4206,53 @@ static void handle_accept(unsigned int server_id, json_t *payload)
     mft_signal_timer();
 }
 
+struct data_frame_view {
+    uint16_t transfer_id_len;
+    uint32_t stream_id;
+    uint64_t offset;
+    uint32_t data_len;
+    const unsigned char *chunk_hash;
+    const unsigned char *transfer_id;
+    const unsigned char *data;
+};
+
+static bool valid_frame_envelope(const unsigned char *payload, size_t len)
+{
+    return payload && len >= 8 && len <= MFT_MAX_FRAME_SIZE &&
+           memcmp(payload, MFT_MAGIC, 4) == 0 && payload[4] == MFT_VERSION;
+}
+
+static int parse_data_frame(const unsigned char *payload,
+                            size_t len,
+                            struct data_frame_view *frame)
+{
+    size_t remaining;
+
+    if (!frame || !valid_frame_envelope(payload, len) ||
+        payload[5] != MFT_FRAME_DATA || len < 88)
+        return -1;
+    frame->transfer_id_len = read_u16_be(payload + 6);
+    frame->stream_id = read_u32_be(payload + 8);
+    frame->offset = read_u64_be(payload + 12);
+    frame->data_len = read_u32_be(payload + 20);
+    remaining = len - 88;
+    if (frame->transfer_id_len == 0 || frame->transfer_id_len >= 256 ||
+        frame->transfer_id_len > remaining || frame->data_len == 0 ||
+        frame->data_len > MFT_MAX_CHUNK ||
+        frame->data_len != remaining - frame->transfer_id_len ||
+        frame->offset > UINT64_MAX - frame->data_len)
+        return -1;
+    frame->chunk_hash = payload + 24;
+    frame->transfer_id = payload + 88;
+    frame->data = payload + 88 + frame->transfer_id_len;
+    return 0;
+}
+
 static void handle_data(unsigned int server_id,
                         const unsigned char *payload,
                         size_t len)
 {
+    struct data_frame_view frame;
     uint16_t tid_len;
     uint32_t stream_id;
     uint64_t offset;
@@ -4055,19 +4269,17 @@ static void handle_data(unsigned int server_id,
     bool send_ack = false;
     const char *error_message = NULL;
 
-    if (len < 88)
+    if (parse_data_frame(payload, len, &frame) != 0)
         return;
-    tid_len = read_u16_be(payload + 6);
-    stream_id = read_u32_be(payload + 8);
-    offset = read_u64_be(payload + 12);
-    data_len = read_u32_be(payload + 20);
-    if (tid_len == 0 || tid_len >= sizeof(transfer_id) || len < 88u + tid_len + data_len)
-        return;
-    memcpy(chunk_hash, payload + 24, 64);
+    tid_len = frame.transfer_id_len;
+    stream_id = frame.stream_id;
+    offset = frame.offset;
+    data_len = frame.data_len;
+    memcpy(chunk_hash, frame.chunk_hash, 64);
     chunk_hash[64] = '\0';
-    memcpy(transfer_id, payload + 88, tid_len);
+    memcpy(transfer_id, frame.transfer_id, tid_len);
     transfer_id[tid_len] = '\0';
-    chunk_data = payload + 88 + tid_len;
+    chunk_data = frame.data;
 
     mft_lock();
     ctx = find_transfer(transfer_id);
@@ -4078,18 +4290,21 @@ static void handle_data(unsigned int server_id,
     {
         struct manifest_entry *entry = &ctx->entries[stream_id - 1];
         struct block_entry *block;
+        uint64_t block_index_value;
 
         if (entry->type != 'f' || offset >= entry->size) {
             mft_unlock();
             return;
         }
-        block_index = (size_t)(offset / MFT_LOGICAL_BLOCK_SIZE);
-        if (block_index >= entry->block_count) {
+        block_index_value = offset / MFT_LOGICAL_BLOCK_SIZE;
+        if (block_index_value >= entry->block_count) {
             mft_unlock();
             return;
         }
+        block_index = (size_t)block_index_value;
         block = &entry->blocks[block_index];
-        if (offset < block->offset || offset + data_len > block->offset + block->size) {
+        if (offset < block->offset || offset - block->offset > block->size ||
+            data_len > block->size - (offset - block->offset)) {
             mft_unlock();
             return;
         }
@@ -4157,7 +4372,7 @@ static void handle_data(unsigned int server_id,
         job->block_offset = block_offset;
         job->block_size = block_size;
         job->data_len = data_len;
-        job->block_tail = offset + data_len == block_offset + block_size;
+        job->block_tail = offset - block_offset + data_len == block_size;
         snprintf(job->chunk_hash, sizeof(job->chunk_hash), "%s", chunk_hash);
         snprintf(job->block_hash, sizeof(job->block_hash), "%s", block_hash);
         memcpy(job->data, chunk_data, data_len);
@@ -4218,18 +4433,37 @@ static void handle_complete(unsigned int server_id, json_t *payload)
     }
     {
         json_t *v;
+        uint64_t raw;
 
         v = json_object_get(payload, "bytes_transferred");
-        if (json_is_integer(v)) {
-            bytes_transferred = (uint64_t)json_integer_value(v);
+        if (v) {
+            if (json_nonnegative_u64(v, &raw) != 0 || raw > bytes_total) {
+                mft_unlock();
+                return;
+            }
+            bytes_transferred = raw;
             bytes_transferred_present = true;
         }
         v = json_object_get(payload, "files_transferred");
-        if (json_is_integer(v))
-            files_transferred = (unsigned int)json_integer_value(v);
+        if (v) {
+            if (json_nonnegative_u64(v, &raw) != 0 || raw > ctx->entry_count) {
+                mft_unlock();
+                return;
+            }
+            files_transferred = (unsigned int)raw;
+        }
         v = json_object_get(payload, "files_skipped");
-        if (json_is_integer(v))
-            files_skipped = (unsigned int)json_integer_value(v);
+        if (v) {
+            if (json_nonnegative_u64(v, &raw) != 0 || raw > ctx->entry_count) {
+                mft_unlock();
+                return;
+            }
+            files_skipped = (unsigned int)raw;
+        }
+        if ((size_t)files_transferred + files_skipped > ctx->entry_count) {
+            mft_unlock();
+            return;
+        }
     }
     if (strcmp(ctx->direction, "receive") == 0) {
         json_t *ack;
@@ -4356,7 +4590,7 @@ static void on_frame(void *user_data,
     json_error_t error;
 
     (void)user_data;
-    if (payload_len < 8 || memcmp(payload, MFT_MAGIC, 4) != 0 || payload[4] != MFT_VERSION)
+    if (!valid_frame_envelope(payload, payload_len))
         return;
     expire_due_transfers();
     if (payload[5] == MFT_FRAME_DATA) {
