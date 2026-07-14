@@ -1045,6 +1045,17 @@ static int close_receive_file(struct manifest_entry *entry)
     return close(fd);
 }
 
+static int flush_receive_file(struct manifest_entry *entry)
+{
+    if (!entry->receive_fd_open)
+        return -1;
+#ifdef _WIN32
+    return _commit(entry->receive_fd);
+#else
+    return fsync(entry->receive_fd);
+#endif
+}
+
 static int open_receive_file(struct manifest_entry *entry,
                              const char *path,
                              bool truncate)
@@ -1903,7 +1914,6 @@ static int finalize_received(const char *target_root,
         struct manifest_entry *entry = &entries[i];
         char final_path[PATH_MAX];
         char tmp_part[PATH_MAX];
-        struct stat st;
         json_t *decision_item = json_array_get(accept, i);
         json_t *decision = decision_item ? json_object_get(decision_item, "decision") : NULL;
 
@@ -1916,10 +1926,9 @@ static int finalize_received(const char *target_root,
         if (join_path(final_path, sizeof(final_path), target_root, entry->relpath) != 0 ||
             part_path(tmp_part, sizeof(tmp_part), final_path) != 0)
             return -1;
-        if (close_receive_file(entry) != 0)
+        if (flush_receive_file(entry) != 0 || close_receive_file(entry) != 0)
             return -1;
-        if (stat(tmp_part, &st) != 0 || !S_ISREG(st.st_mode) ||
-            (uint64_t)st.st_size != entry->size)
+        if (!quick_file_matches(tmp_part, entry))
             return -1;
         chmod(tmp_part, entry->mode ? (mode_t)entry->mode : 0666);
         if (rename(tmp_part, final_path) != 0)

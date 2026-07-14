@@ -7,6 +7,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -291,6 +292,57 @@ def main():
         )
         assert missing_recv["isError"] is True, missing_recv
         assert "Remote path" in missing_recv["content"][0]["text"], missing_recv
+
+        corrupt_src = file_src_dir / "corrupt.bin"
+        corrupt_target = Path(tmp) / "corrupt-target.bin"
+        corrupt_part = Path(str(corrupt_target) + ".part")
+        corrupt_src.write_bytes(b"c" * (8 * 1024 * 1024))
+        transfer = {}
+
+        def send_corruptible_file():
+            try:
+                transfer["result"] = call_tool(
+                    sock_a,
+                    17,
+                    "server.send",
+                    {
+                        "server_id": peer_b,
+                        "local_path": str(corrupt_src),
+                        "remote_path": str(corrupt_target),
+                    },
+                    timeout=30.0,
+                )
+            except Exception as exc:
+                transfer["error"] = exc
+
+        worker = threading.Thread(target=send_corruptible_file)
+        worker.start()
+        deadline = time.time() + 10
+        corrupted = False
+        while time.time() < deadline:
+            try:
+                if corrupt_part.stat().st_size > 0:
+                    with corrupt_part.open("r+b", buffering=0) as f:
+                        f.seek(0)
+                        f.write(b"x")
+                    corrupted = True
+                    break
+            except FileNotFoundError:
+                pass
+            if not worker.is_alive():
+                break
+            time.sleep(0.005)
+
+        worker.join(timeout=35)
+        assert not worker.is_alive(), "corruption transfer did not finish"
+        if "error" in transfer:
+            raise transfer["error"]
+        assert corrupted, "partial file was not corrupted during transfer"
+        corrupt_result = transfer["result"]
+        assert corrupt_result["isError"] is True, corrupt_result
+        assert "finalize" in corrupt_result["content"][0]["text"].lower(), corrupt_result
+        assert not corrupt_target.exists(), corrupt_target
+        assert corrupt_part.exists(), corrupt_part
     finally:
         for sock in (sock_a, sock_b):
             if sock:
