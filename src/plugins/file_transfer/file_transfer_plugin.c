@@ -22,7 +22,6 @@
 #else
 #include <dirent.h>
 #include <pthread.h>
-#include <sys/select.h>
 #include <unistd.h>
 #endif
 
@@ -175,6 +174,7 @@ typedef int mode_t;
 #define MFT_MAX_PREPARE_JOBS 4u
 #define MFT_MAX_WRITE_JOBS 128u
 #define MFT_MAX_WRITE_PAYLOAD (4u * 1024u * 1024u)
+#define MFT_NEGOTIATION_TIMEOUT_MS 1000u
 #define MFT_DEFAULT_TIMEOUT_MS 30000u
 #define MFT_MIN_TIMEOUT_MS 1000u
 #define MFT_MAX_TIMEOUT_MS 600000u
@@ -262,6 +262,17 @@ struct receive_write_job {
     struct sha256_ctx hash_ctx;
     enum receive_write_result result;
     unsigned char data[];
+};
+
+struct pending_negotiation {
+    char *invocation_id;
+    char *local_path;
+    char *remote_path;
+    unsigned int server_id;
+    uint32_t timeout_ms;
+    unsigned long long deadline_ms;
+    bool receive;
+    struct pending_negotiation *next;
 };
 
 struct mft_plugin {
@@ -352,6 +363,7 @@ struct pending_pump {
 };
 
 static struct mft_plugin g_plugin;
+static struct pending_negotiation *g_pending_negotiations;
 
 static struct transfer_context *find_transfer(const char *transfer_id);
 static void unlink_transfer(struct transfer_context *ctx);
@@ -362,6 +374,17 @@ static void complete_transfer_error_unlinked(struct transfer_context *ctx,
 static int send_pump(struct transfer_context *ctx);
 static void schedule_send_pump(struct transfer_context *ctx, unsigned int delay_ms);
 static bool accept_item_is_receive(json_t *accept, size_t index);
+static int start_send(const char *invocation_id,
+                      unsigned int server_id,
+                      const char *local_path,
+                      const char *remote_path,
+                      uint32_t timeout_ms);
+static int start_recv(const char *invocation_id,
+                      unsigned int server_id,
+                      const char *remote_path,
+                      const char *local_path,
+                      uint32_t timeout_ms);
+static void resume_pending_negotiations(struct pending_negotiation *pending);
 static void discard_receive_write_jobs(struct transfer_context *ctx,
                                        uint32_t stream_id,
                                        size_t block_index,
@@ -557,19 +580,6 @@ static void hash_to_hex(const unsigned char hash[32], char out[65])
         out[i * 2 + 1] = hex[hash[i] & 0x0f];
     }
     out[64] = '\0';
-}
-
-static void mft_sleep_ms(unsigned int milliseconds)
-{
-#ifdef _WIN32
-    Sleep(milliseconds);
-#else
-    struct timeval delay;
-
-    delay.tv_sec = (long)(milliseconds / 1000u);
-    delay.tv_usec = (long)((milliseconds % 1000u) * 1000u);
-    select(0, NULL, NULL, NULL, &delay);
-#endif
 }
 
 static int file_sha256(const char *path, char out[65])
@@ -1611,6 +1621,124 @@ static int send_hello(unsigned int server_id)
     return rc;
 }
 
+static void free_pending_negotiation(struct pending_negotiation *pending)
+{
+    if (!pending)
+        return;
+    free(pending->invocation_id);
+    free(pending->local_path);
+    free(pending->remote_path);
+    free(pending);
+}
+
+static void free_pending_negotiations(struct pending_negotiation *pending)
+{
+    while (pending) {
+        struct pending_negotiation *next = pending->next;
+
+        free_pending_negotiation(pending);
+        pending = next;
+    }
+}
+
+static void complete_pending_negotiation_errors(struct pending_negotiation *pending,
+                                                const char *message)
+{
+    while (pending) {
+        struct pending_negotiation *next = pending->next;
+
+        if (g_plugin.host && g_plugin.host->complete_async_error)
+            g_plugin.host->complete_async_error(g_plugin.host->host_context,
+                                                pending->invocation_id,
+                                                message);
+        free_pending_negotiation(pending);
+        pending = next;
+    }
+}
+
+static int queue_pending_negotiation(const char *invocation_id,
+                                     unsigned int server_id,
+                                     const char *local_path,
+                                     const char *remote_path,
+                                     uint32_t timeout_ms,
+                                     bool receive)
+{
+    struct pending_negotiation *pending = calloc(1, sizeof(*pending));
+    unsigned long long now;
+
+    if (!pending || !g_plugin.host || !g_plugin.host->now_ms) {
+        free(pending);
+        return -1;
+    }
+    pending->invocation_id = mft_strdup(invocation_id);
+    pending->local_path = mft_strdup(local_path);
+    pending->remote_path = mft_strdup(remote_path);
+    if (!pending->invocation_id || !pending->local_path || !pending->remote_path) {
+        free_pending_negotiation(pending);
+        return -1;
+    }
+    now = g_plugin.host->now_ms(g_plugin.host->host_context);
+    pending->server_id = server_id;
+    pending->timeout_ms = timeout_ms;
+    pending->deadline_ms = now > (unsigned long long)-1 - MFT_NEGOTIATION_TIMEOUT_MS ?
+                               (unsigned long long)-1 :
+                               now + MFT_NEGOTIATION_TIMEOUT_MS;
+    pending->receive = receive;
+    mft_lock();
+    if (g_plugin.shutting_down) {
+        mft_unlock();
+        free_pending_negotiation(pending);
+        return -1;
+    }
+    pending->next = g_pending_negotiations;
+    g_pending_negotiations = pending;
+    mft_unlock();
+    mft_signal_timer();
+    return 0;
+}
+
+static struct pending_negotiation *take_pending_negotiations(unsigned int server_id)
+{
+    struct pending_negotiation **current;
+    struct pending_negotiation *head = NULL;
+
+    mft_lock();
+    current = &g_pending_negotiations;
+    while (*current) {
+        struct pending_negotiation *pending = *current;
+
+        if (pending->server_id == server_id) {
+            *current = pending->next;
+            pending->next = head;
+            head = pending;
+        } else {
+            current = &pending->next;
+        }
+    }
+    mft_unlock();
+    if (head)
+        mft_signal_timer();
+    return head;
+}
+
+static void scan_negotiation_timeouts(unsigned long long now,
+                                      struct pending_negotiation **expired)
+{
+    struct pending_negotiation **current = &g_pending_negotiations;
+
+    while (*current) {
+        struct pending_negotiation *pending = *current;
+
+        if (pending->deadline_ms && now >= pending->deadline_ms) {
+            *current = pending->next;
+            pending->next = *expired;
+            *expired = pending;
+        } else {
+            current = &pending->next;
+        }
+    }
+}
+
 static void on_peer_connected(void *user_data, unsigned int server_id)
 {
     (void)user_data;
@@ -1621,8 +1749,13 @@ static void abort_transfers_for_peer(unsigned int server_id);
 
 static void on_peer_closed(void *user_data, unsigned int server_id)
 {
+    struct pending_negotiation *pending;
+
     (void)user_data;
+    pending = take_pending_negotiations(server_id);
     abort_transfers_for_peer(server_id);
+    complete_pending_negotiation_errors(pending,
+                                        "Peer closed during MFT1 capability negotiation.");
 }
 
 static void handle_hello(unsigned int server_id, json_t *payload)
@@ -1631,6 +1764,7 @@ static void handle_hello(unsigned int server_id, json_t *payload)
     json_t *cap;
     size_t i;
     int should_reply = 0;
+    struct pending_negotiation *pending = NULL;
 
     json_array_foreach(capabilities, i, cap) {
         const char *name;
@@ -1653,25 +1787,11 @@ static void handle_hello(unsigned int server_id, json_t *payload)
     }
     if (should_reply)
         send_hello(server_id);
-}
-
-static int ensure_capability(unsigned int server_id)
-{
-    unsigned int i;
-
     if (g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
                                                      server_id,
                                                      MFT_CAP_BLOCK_ACK))
-        return 0;
-    send_hello(server_id);
-    for (i = 0; i < 50; i++) {
-        if (g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
-                                                         server_id,
-                                                         MFT_CAP_BLOCK_ACK))
-            return 0;
-        mft_sleep_ms(20);
-    }
-    return -1;
+        pending = take_pending_negotiations(server_id);
+    resume_pending_negotiations(pending);
 }
 
 static int prepare_accept(const char *target_root,
@@ -2830,6 +2950,7 @@ static void abort_transfers_for_peer(unsigned int server_id)
 static void recompute_next_package_deadline(unsigned long long *next_deadline)
 {
     struct transfer_context *ctx;
+    struct pending_negotiation *pending;
 
     *next_deadline = 0;
     for (ctx = g_transfers; ctx; ctx = ctx->next) {
@@ -2862,6 +2983,11 @@ static void recompute_next_package_deadline(unsigned long long *next_deadline)
                     *next_deadline = candidate;
             }
         }
+    }
+    for (pending = g_pending_negotiations; pending; pending = pending->next) {
+        if (pending->deadline_ms &&
+            (!*next_deadline || pending->deadline_ms < *next_deadline))
+            *next_deadline = pending->deadline_ms;
     }
 }
 
@@ -3092,13 +3218,18 @@ static void *mft_timer_thread_main(void *arg)
             struct pending_block_ack *pending_acks = NULL;
             struct pending_transfer_error *pending_errors = NULL;
             struct pending_pump *pending_pumps = NULL;
+            struct pending_negotiation *expired_negotiations = NULL;
 
             scan_package_timeouts(now, &pending_acks, &pending_errors, &pending_pumps);
+            scan_negotiation_timeouts(now, &expired_negotiations);
             mft_unlock();
             run_pending_pumps(pending_pumps);
             send_pending_acks(pending_acks);
             free_pending_acks(pending_acks);
             complete_pending_errors(pending_errors);
+            complete_pending_negotiation_errors(
+                expired_negotiations,
+                "MFT1 capability negotiation timed out.");
             mft_signal_timer();
             continue;
         }
@@ -3388,9 +3519,6 @@ static int start_send(const char *invocation_id,
 {
     struct transfer_context *ctx;
 
-    if (ensure_capability(server_id) != 0)
-        return -2;
-
     if (g_plugin.host && g_plugin.host->log_info) {
         char msg[256];
 
@@ -3442,9 +3570,6 @@ static int start_recv(const char *invocation_id,
     struct transfer_context *ctx;
     json_t *payload = NULL;
 
-    if (ensure_capability(server_id) != 0)
-        return -2;
-
     ctx = calloc(1, sizeof(*ctx));
     if (!ctx)
         return -1;
@@ -3488,6 +3613,46 @@ fail:
     json_decref(payload);
     free_transfer(ctx);
     return -1;
+}
+
+static void resume_pending_negotiations(struct pending_negotiation *pending)
+{
+    while (pending) {
+        struct pending_negotiation *next = pending->next;
+        int rc;
+
+        if (pending->deadline_ms && g_plugin.host && g_plugin.host->now_ms &&
+            g_plugin.host->now_ms(g_plugin.host->host_context) >= pending->deadline_ms) {
+            if (g_plugin.host->complete_async_error) {
+                g_plugin.host->complete_async_error(g_plugin.host->host_context,
+                                                    pending->invocation_id,
+                                                    "MFT1 capability negotiation timed out.");
+            }
+            free_pending_negotiation(pending);
+            pending = next;
+            continue;
+        }
+        if (pending->receive) {
+            rc = start_recv(pending->invocation_id,
+                            pending->server_id,
+                            pending->remote_path,
+                            pending->local_path,
+                            pending->timeout_ms);
+        } else {
+            rc = start_send(pending->invocation_id,
+                            pending->server_id,
+                            pending->local_path,
+                            pending->remote_path,
+                            pending->timeout_ms);
+        }
+        if (rc != 0 && g_plugin.host && g_plugin.host->complete_async_error) {
+            g_plugin.host->complete_async_error(g_plugin.host->host_context,
+                                                pending->invocation_id,
+                                                "File transfer setup failed after capability negotiation.");
+        }
+        free_pending_negotiation(pending);
+        pending = next;
+    }
 }
 
 static void handle_offer(unsigned int server_id, json_t *payload)
@@ -4242,6 +4407,7 @@ MFT_PLUGIN_EXPORT int MFT_PLUGIN_INVOKE(const char *invocation_id,
     json_t *remote_path;
     unsigned int server_id;
     uint32_t timeout_ms;
+    bool receive;
     int rc;
 
     expire_due_transfers();
@@ -4259,34 +4425,57 @@ MFT_PLUGIN_EXPORT int MFT_PLUGIN_INVOKE(const char *invocation_id,
         return MCP_PLUGIN_CALL_ERROR;
     }
     timeout_ms = args_timeout_ms(args);
+    receive = strcmp(tool_name, "server.recv") == 0;
+    if (strcmp(tool_name, "server.send") != 0 && !receive) {
+        json_decref(args);
+        snprintf(result_json, result_size, "File transfer setup failed.");
+        return MCP_PLUGIN_CALL_ERROR;
+    }
 
-    if (strcmp(tool_name, "server.send") == 0)
+    if (!g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
+                                                      server_id,
+                                                      MFT_CAP_BLOCK_ACK)) {
+        if (send_hello(server_id) != 0 ||
+            queue_pending_negotiation(invocation_id,
+                                      server_id,
+                                      json_string_value(local_path),
+                                      json_string_value(remote_path),
+                                      timeout_ms,
+                                      receive) != 0) {
+            json_decref(args);
+            snprintf(result_json,
+                     result_size,
+                     "Failed to start MFT1 capability negotiation.");
+            return MCP_PLUGIN_CALL_ERROR;
+        }
+        json_decref(args);
+        return MCP_PLUGIN_CALL_PENDING;
+    }
+
+    if (!receive)
         rc = start_send(invocation_id,
                         server_id,
                         json_string_value(local_path),
                         json_string_value(remote_path),
                         timeout_ms);
-    else if (strcmp(tool_name, "server.recv") == 0)
+    else
         rc = start_recv(invocation_id,
                         server_id,
                         json_string_value(remote_path),
                         json_string_value(local_path),
                         timeout_ms);
-    else
-        rc = -1;
     json_decref(args);
 
     if (rc == 0)
         return MCP_PLUGIN_CALL_PENDING;
-    if (rc == -2)
-        snprintf(result_json, result_size, "MFT1 whole-file capability is not negotiated for server_id %u.", server_id);
-    else
-        snprintf(result_json, result_size, "File transfer setup failed.");
+    snprintf(result_json, result_size, "File transfer setup failed.");
     return MCP_PLUGIN_CALL_ERROR;
 }
 
 MFT_PLUGIN_EXPORT int MFT_PLUGIN_SHUTDOWN(void)
 {
+    struct pending_negotiation *pending;
+
     if (g_plugin.sync_initialized) {
         mft_lock();
         if (g_plugin.io_jobs != 0) {
@@ -4297,6 +4486,11 @@ MFT_PLUGIN_EXPORT int MFT_PLUGIN_SHUTDOWN(void)
         mft_unlock();
     }
     stop_timer_thread();
+    mft_lock();
+    pending = g_pending_negotiations;
+    g_pending_negotiations = NULL;
+    mft_unlock();
+    free_pending_negotiations(pending);
     while (g_transfers) {
         struct transfer_context *ctx = g_transfers;
 
