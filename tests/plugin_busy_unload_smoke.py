@@ -32,6 +32,7 @@ def main():
         )
         init = recv(proc)
         assert init["id"] == 1, init
+        send(proc, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
 
         loaded = call_tool(proc, 2, "plugin_tools.insmod", {"package_path": plugin_path})
         assert loaded["isError"] is False, loaded
@@ -43,7 +44,7 @@ def main():
 
         modules = assert_json_text(call_tool(proc, 4, "plugin_tools.lsmod", {}))["plugins"]
         retained = next(item for item in modules if item["plugin_id"] == plugin_id)
-        assert retained["state"] == "active", retained
+        assert retained["state"] == "ACTIVE", retained
 
         unloaded = call_tool(proc, 5, "plugin_tools.rmmod", {"plugin_id": plugin_id})
         assert unloaded["isError"] is False, unloaded

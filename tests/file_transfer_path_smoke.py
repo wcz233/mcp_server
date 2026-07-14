@@ -74,13 +74,18 @@ def main():
         assert peer_a > 0 and peer_b > 0
 
         pull = Path(tmp) / "pull"
+        missing_remote = Path(tmp) / "missing" / "remote.bin"
+        assert not missing_remote.exists(), missing_remote
+        forward_remote = missing_remote.as_posix()
+        backslash_remote = str(missing_remote).replace("/", "\\")
+        mixed_remote = backslash_remote.replace("\\", "/", 1)
         forward = call_tool(
             sock_a,
             next_a,
             "server.recv",
             {
                 "server_id": peer_b,
-                "remote_path": "D:/Project/2025-12-02/mcp/mcp.txt",
+                "remote_path": forward_remote,
                 "local_path": str(pull / "forward"),
                 "timeout_ms": 2000,
             },
@@ -95,7 +100,7 @@ def main():
             "server.recv",
             {
                 "server_id": peer_b,
-                "remote_path": "D:\\Project\\2025-12-02\\mcp\\mcp.txt",
+                "remote_path": backslash_remote,
                 "local_path": str(pull / "backslash"),
                 "timeout_ms": 2000,
             },
@@ -110,7 +115,7 @@ def main():
             "server.recv",
             {
                 "server_id": peer_b,
-                "remote_path": "D:\\Project/2025-12-02\\mcp.txt",
+                "remote_path": mixed_remote,
                 "local_path": str(pull / "mixed"),
                 "timeout_ms": 2000,
             },
