@@ -25,6 +25,7 @@
 #define MCP_DISCOVERY_HEARTBEAT_TIMEOUT_MS 3000ull
 #define MCP_DISCOVERY_MAX_DATAGRAM 65536u
 #define MCP_DISCOVERY_MAX_FRAME (1024u * 1024u)
+#define MCP_DISCOVERY_WRITE_HIGH_WATERMARK (4u * 1024u * 1024u)
 #define MCP_DISCOVERY_PROXY_TIMEOUT_MS_DEFAULT 5000u
 #define MCP_DISCOVERY_PROXY_TIMEOUT_MS_MAX 300000u
 #define MCP_DISCOVERY_INITIALIZE_ID "mcp_gateway_initialize"
@@ -63,6 +64,8 @@ struct discovery_udp_send {
 struct discovery_write_req {
     uv_write_t req;
     uv_buf_t buf;
+    struct discovery_peer_conn *conn;
+    size_t queued_bytes;
     bool close_after_write;
 };
 
@@ -80,6 +83,7 @@ struct discovery_peer_conn {
     char *rx_buf;
     size_t rx_len;
     size_t rx_cap;
+    size_t write_queue_bytes;
 };
 
 struct discovery_pending_list {
@@ -923,9 +927,11 @@ static void peer_connect(struct mcp_server_discovery *discovery, struct discover
 static void peer_write_cb(uv_write_t *req, int status)
 {
     struct discovery_write_req *write_req = (struct discovery_write_req *)req;
-    struct discovery_peer_conn *conn = req->handle->data;
+    struct discovery_peer_conn *conn = write_req->conn ? write_req->conn : req->handle->data;
     bool close_after_write = write_req->close_after_write;
 
+    if (conn && conn->write_queue_bytes >= write_req->queued_bytes)
+        conn->write_queue_bytes -= write_req->queued_bytes;
     free(write_req->buf.base);
     free(write_req);
 
@@ -944,6 +950,8 @@ static int peer_send_frame(struct discovery_peer_conn *conn,
 
     if (!conn || !conn->connected || conn->closing || !data || len == 0 || len > UINT32_MAX)
         return -1;
+    if (conn->write_queue_bytes + len + 4 > MCP_DISCOVERY_WRITE_HIGH_WATERMARK)
+        return -2;
 
     write_req = calloc(1, sizeof(*write_req));
     if (!write_req)
@@ -954,6 +962,8 @@ static int peer_send_frame(struct discovery_peer_conn *conn,
         free(write_req);
         return -1;
     }
+    write_req->conn = conn;
+    write_req->queued_bytes = len + 4;
     write_req->close_after_write = close_after_write;
 
     write_u32_be(write_req->buf.base, (uint32_t)len);
@@ -964,11 +974,13 @@ static int peer_send_frame(struct discovery_peer_conn *conn,
     write_req->buf.len = len + 4;
 #endif
 
+    conn->write_queue_bytes += write_req->queued_bytes;
     if (uv_write(&write_req->req,
                  (uv_stream_t *)&conn->tcp,
                  &write_req->buf,
                  1,
                  peer_write_cb) != 0) {
+        conn->write_queue_bytes -= write_req->queued_bytes;
         free(write_req->buf.base);
         free(write_req);
         return -1;
