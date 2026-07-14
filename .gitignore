@@ -4,6 +4,7 @@
 /install/
 /dist/
 
+AGENTS.md
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
