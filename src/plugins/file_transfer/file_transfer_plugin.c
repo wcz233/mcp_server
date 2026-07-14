@@ -1,3 +1,4 @@
+#include "file_offset.h"
 #include "mcp/plugin/plugin_abi.h"
 
 #include <errno.h>
@@ -137,7 +138,6 @@ static int closedir(DIR *dir)
 #define mkdir(path, mode) _mkdir(path)
 #define open _open
 #define write _write
-#define lseek _lseeki64
 #ifndef ssize_t
 typedef intptr_t ssize_t;
 #endif
@@ -566,7 +566,7 @@ static int fill_file_hashes(FILE *fp, struct manifest_entry *entry)
     size_t block_index = 0;
     bool block_active = false;
 
-    if (fseek(fp, 0, SEEK_SET) != 0)
+    if (mft_seek_stream(fp, 0) != 0)
         return -1;
     sha256_init(&file_ctx);
     while (remaining > 0) {
@@ -1046,7 +1046,7 @@ static int write_all_at(const char *path,
     if (fd < 0)
         return -1;
     while (done < len) {
-        if (lseek(fd, (off_t)(offset + done), SEEK_SET) < 0) {
+        if (offset > UINT64_MAX - done || mft_seek_fd(fd, offset + done) != 0) {
             close(fd);
             return -1;
         }
@@ -1102,7 +1102,7 @@ static int copy_file_range_chunks(FILE *fp,
         return -1;
     tid_len = (uint16_t)strlen(transfer_id);
 
-    if (fseek(fp, (long)offset, SEEK_SET) != 0)
+    if (mft_seek_stream(fp, offset) != 0)
         return -1;
 
     while (pos < end_offset) {

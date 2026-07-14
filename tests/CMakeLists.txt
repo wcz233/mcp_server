@@ -1,5 +1,31 @@
 find_package(Python3 COMPONENTS Interpreter)
 
+add_executable(mcp_file_transfer_offset_test
+    file_transfer_offset_test.c
+)
+
+target_include_directories(mcp_file_transfer_offset_test
+    PRIVATE
+        "${PROJECT_SOURCE_DIR}/src/plugins/file_transfer"
+)
+
+target_compile_definitions(mcp_file_transfer_offset_test
+    PRIVATE
+        $<$<PLATFORM_ID:Linux>:_POSIX_C_SOURCE=200809L>
+)
+
+if(MSVC)
+    target_compile_definitions(mcp_file_transfer_offset_test PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(mcp_file_transfer_offset_test PRIVATE /W4)
+else()
+    target_compile_options(mcp_file_transfer_offset_test PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_test(
+    NAME mcp_file_transfer_offset
+    COMMAND mcp_file_transfer_offset_test
+)
+
 if(Python3_Interpreter_FOUND)
     set(_mcp_file_transfer_path_plugin "-")
     if(TARGET mcp_file_transfer_plugin)
