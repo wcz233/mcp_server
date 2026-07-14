@@ -805,6 +805,8 @@ static bool framed_maybe_dispatch_binary(struct mcp_server *server,
     session = client_session_for_reply(server, &reply_to, false);
     if (!session || session->peer_server_id == 0)
         return false;
+    if (server->discovery)
+        mcp_server_discovery_mark_peer_active(server->discovery, session->peer_server_id);
 
     return mcp_peer_transport_dispatch_frame(server->peer_transport,
                                              session->peer_server_id,

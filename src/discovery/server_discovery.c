@@ -677,6 +677,13 @@ static void peer_mark_heartbeat_ok(struct discovery_peer *peer)
     peer->state = DISCOVERY_PEER_ONLINE;
 }
 
+static void peer_mark_activity(struct discovery_peer_conn *conn)
+{
+    if (!conn)
+        return;
+    peer_mark_heartbeat_ok(conn->peer);
+}
+
 static void peer_conn_fail(struct discovery_peer_conn *conn)
 {
     if (!conn)
@@ -789,6 +796,8 @@ static void peer_conn_handle_frame(struct discovery_peer_conn *conn, const char 
                                               data,
                                               len) != 0)
             peer_conn_fail(conn);
+        else
+            peer_mark_activity(conn);
         return;
     }
 
@@ -808,7 +817,7 @@ static void peer_conn_handle_frame(struct discovery_peer_conn *conn, const char 
     } else if (pending_proxy_complete_response(conn, root)) {
         /* Handled by gateway proxy completion. */
     } else if (result || json_object_get(root, "error")) {
-        peer_mark_heartbeat_ok(conn->peer);
+        peer_mark_activity(conn);
     }
 
     json_decref(root);
@@ -996,13 +1005,18 @@ static int discovery_external_send_frame(void *arg,
 {
     struct mcp_server_discovery *discovery = arg;
     struct discovery_peer *peer;
+    int rc;
 
     if (!discovery || server_id == 0 || !payload || len == 0)
         return -1;
 
     for (peer = discovery->peers; peer; peer = peer->next) {
-        if (peer->server_id == server_id)
-            return peer_send_frame(peer->conn, payload, len, false);
+        if (peer->server_id == server_id) {
+            rc = peer_send_frame(peer->conn, payload, len, false);
+            if (rc == 0)
+                peer_mark_heartbeat_ok(peer);
+            return rc;
+        }
     }
 
     return -1;
@@ -2095,6 +2109,15 @@ static struct discovery_peer *find_peer_by_server_id(struct mcp_server_discovery
     }
 
     return NULL;
+}
+
+void mcp_server_discovery_mark_peer_active(struct mcp_server_discovery *discovery,
+                                           unsigned int server_id)
+{
+    struct discovery_peer *peer = find_peer_by_server_id(discovery, server_id);
+
+    if (peer)
+        peer_mark_heartbeat_ok(peer);
 }
 
 bool mcp_server_discovery_server_has_tool(struct mcp_server_discovery *discovery,
