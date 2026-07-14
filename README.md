@@ -57,6 +57,13 @@ CONFIG_MCP_FILE_TRANSFER_PLUGIN=m
 `.config` 只有在显式传入 `-DMCP_KCONFIG_CONFIG=...` 时才参与 CMake 配置；
 使用 `-C config/*.cmake` 时，以对应 `.cmake` 文件中的 `MCP_*` 设置为准。
 
+对 `server.send` / `server.recv` 还需要额外确认“运行中的服务”真的启用了
+MFT1 文件传输插件。若构建结果是 `MCP_FILE_TRANSFER_PLUGIN=m`，则仅生成
+`mcp_file_transfer_plugin.so` 并不会自动让服务具备文件传输能力；启动后的
+`mcp_server` 还需要显式执行 `plugin_tools.insmod`。否则运行态工具列表里不会
+出现 `server.send` / `server.recv`，对端也不会协商 `whole-file`
+capability，调用时会报 `MFT1 whole-file capability is not negotiated`。
+
 ```bash
 cd mcp_server
 make defconfig
@@ -84,6 +91,7 @@ cmake --build mcp_server/build --parallel
 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
+
 ```
 
 产物路径通常是：
