@@ -173,6 +173,8 @@ typedef int mode_t;
 #define MFT_PUMP_MAX_BLOCKS 4u
 #define MFT_MAX_IN_FLIGHT_BLOCKS 4u
 #define MFT_MAX_PREPARE_JOBS 4u
+#define MFT_MAX_WRITE_JOBS 128u
+#define MFT_MAX_WRITE_PAYLOAD (4u * 1024u * 1024u)
 #define MFT_DEFAULT_TIMEOUT_MS 30000u
 #define MFT_MIN_TIMEOUT_MS 1000u
 #define MFT_MAX_TIMEOUT_MS 600000u
@@ -215,6 +217,8 @@ struct block_entry {
     bool receive_hash_failed;
     uint64_t send_next_offset;
     uint64_t receive_next_offset;
+    uint64_t receive_queued_offset;
+    unsigned int receive_generation;
     unsigned long long ack_deadline_ms;
     unsigned long long receive_deadline_ms;
     struct sha256_ctx receive_hash_ctx;
@@ -231,6 +235,33 @@ struct manifest_entry {
     size_t block_count;
     int receive_fd;
     bool receive_fd_open;
+};
+
+enum receive_write_result {
+    RECEIVE_WRITE_OK = 0,
+    RECEIVE_WRITE_CHUNK_MISMATCH = 1,
+    RECEIVE_WRITE_BLOCK_MISMATCH = 2,
+    RECEIVE_WRITE_IO_ERROR = 3,
+};
+
+struct receive_write_job {
+    uv_work_t req;
+    struct transfer_context *ctx;
+    struct receive_write_job *next;
+    uint32_t stream_id;
+    size_t block_index;
+    unsigned int generation;
+    int fd;
+    uint64_t offset;
+    uint64_t block_offset;
+    uint64_t block_size;
+    size_t data_len;
+    bool block_tail;
+    char chunk_hash[65];
+    char block_hash[65];
+    struct sha256_ctx hash_ctx;
+    enum receive_write_result result;
+    unsigned char data[];
 };
 
 struct mft_plugin {
@@ -285,6 +316,11 @@ struct transfer_context {
     int prepare_result;
     uv_work_t prepare_req;
     unsigned int io_jobs;
+    struct receive_write_job *write_head;
+    struct receive_write_job *write_tail;
+    struct receive_write_job *write_active;
+    unsigned int write_jobs;
+    size_t write_payload_bytes;
     unsigned long long send_pump_deadline_ms;
     struct manifest_entry *entries;
     size_t entry_count;
@@ -326,6 +362,10 @@ static void complete_transfer_error_unlinked(struct transfer_context *ctx,
 static int send_pump(struct transfer_context *ctx);
 static void schedule_send_pump(struct transfer_context *ctx, unsigned int delay_ms);
 static bool accept_item_is_receive(json_t *accept, size_t index);
+static void discard_receive_write_jobs(struct transfer_context *ctx,
+                                       uint32_t stream_id,
+                                       size_t block_index,
+                                       bool discard_all);
 
 #ifdef _WIN32
 static void mft_lock(void)
@@ -1082,7 +1122,7 @@ static int open_receive_file(struct manifest_entry *entry,
     return 0;
 }
 
-static int write_all_at(struct manifest_entry *entry,
+static int write_all_at(int fd,
                         const unsigned char *data,
                         size_t len,
                         uint64_t offset)
@@ -1090,21 +1130,19 @@ static int write_all_at(struct manifest_entry *entry,
     ssize_t written;
     size_t done = 0;
 
-    if (!entry->receive_fd_open)
-        return -1;
     while (done < len) {
         if (offset > UINT64_MAX - done ||
-            mft_seek_fd(entry->receive_fd, offset + done) != 0)
+            mft_seek_fd(fd, offset + done) != 0)
             return -1;
 #ifdef _WIN32
         {
             size_t remaining = len - done;
             unsigned int chunk = remaining > UINT_MAX ? UINT_MAX : (unsigned int)remaining;
 
-            written = write(entry->receive_fd, data + done, chunk);
+            written = write(fd, data + done, chunk);
         }
 #else
-        written = write(entry->receive_fd, data + done, len - done);
+        written = write(fd, data + done, len - done);
 #endif
         if (written <= 0)
             return -1;
@@ -1774,6 +1812,9 @@ static int mark_block_nack(struct transfer_context *ctx,
     block->receive_hash_started = false;
     block->receive_hash_failed = true;
     block->receive_next_offset = block->offset;
+    block->receive_queued_offset = block->offset;
+    block->receive_generation++;
+    discard_receive_write_jobs(ctx, stream_id, block_index, false);
     block->receive_deadline_ms =
         g_plugin.host->now_ms(g_plugin.host->host_context) + MFT_BLOCK_TIMEOUT_MS;
     return 0;
@@ -2393,10 +2434,250 @@ static void free_transfer(struct transfer_context *ctx)
     free(ctx);
 }
 
-static void cancel_prepare_job(struct transfer_context *ctx)
+static void finish_receive_write_job(struct transfer_context *ctx,
+                                     struct receive_write_job *job)
+{
+    if (ctx->write_jobs > 0)
+        ctx->write_jobs--;
+    if (ctx->write_payload_bytes >= job->data_len)
+        ctx->write_payload_bytes -= job->data_len;
+    if (ctx->io_jobs > 0)
+        ctx->io_jobs--;
+    if (g_plugin.io_jobs > 0)
+        g_plugin.io_jobs--;
+}
+
+static void receive_write_work(uv_work_t *req)
+{
+    struct receive_write_job *job = req->data;
+    unsigned char hash_bytes[32];
+    char actual_hash[65];
+
+    bytes_sha256(job->data, job->data_len, actual_hash);
+    if (strcmp(actual_hash, job->chunk_hash) != 0) {
+        job->result = RECEIVE_WRITE_CHUNK_MISMATCH;
+        return;
+    }
+    if (write_all_at(job->fd, job->data, job->data_len, job->offset) != 0) {
+        job->result = RECEIVE_WRITE_IO_ERROR;
+        return;
+    }
+    sha256_update(&job->hash_ctx, job->data, job->data_len);
+    if (job->block_tail) {
+        struct sha256_ctx final_ctx = job->hash_ctx;
+
+        sha256_final(&final_ctx, hash_bytes);
+        hash_to_hex(hash_bytes, actual_hash);
+        if (strcmp(actual_hash, job->block_hash) != 0) {
+            job->result = RECEIVE_WRITE_BLOCK_MISMATCH;
+            return;
+        }
+    }
+    job->result = RECEIVE_WRITE_OK;
+}
+
+static void receive_write_after_work(uv_work_t *req, int status);
+
+static int start_next_receive_write(struct transfer_context *ctx)
+{
+    uv_loop_t *loop;
+
+    if (!g_plugin.host || !g_plugin.host->get_loop)
+        return -1;
+    loop = g_plugin.host->get_loop(g_plugin.host->host_context);
+    if (!loop)
+        return -1;
+
+    while (!ctx->write_active && ctx->write_head) {
+        struct receive_write_job *job = ctx->write_head;
+        struct manifest_entry *entry = NULL;
+        struct block_entry *block = NULL;
+        int rc;
+
+        ctx->write_head = job->next;
+        if (!ctx->write_head)
+            ctx->write_tail = NULL;
+        job->next = NULL;
+        if (job->stream_id > 0 && job->stream_id <= ctx->entry_count) {
+            entry = &ctx->entries[job->stream_id - 1];
+            if (entry->type == 'f' && job->block_index < entry->block_count)
+                block = &entry->blocks[job->block_index];
+        }
+        if (ctx->cancelled || !block || block->received_ok ||
+            block->receive_generation != job->generation) {
+            finish_receive_write_job(ctx, job);
+            free(job);
+            continue;
+        }
+
+        job->hash_ctx = block->receive_hash_ctx;
+        job->req.data = job;
+        ctx->write_active = job;
+        rc = uv_queue_work(loop,
+                           &job->req,
+                           receive_write_work,
+                           receive_write_after_work);
+        if (rc == 0)
+            return 0;
+        ctx->write_active = NULL;
+        finish_receive_write_job(ctx, job);
+        free(job);
+        return -1;
+    }
+    return 0;
+}
+
+static void receive_write_after_work(uv_work_t *req, int status)
+{
+    struct receive_write_job *job = req->data;
+    struct transfer_context *ctx = job->ctx;
+    struct block_entry *block = NULL;
+    char transfer_id[256] = "";
+    unsigned int server_id = 0;
+    bool release = false;
+    bool send_ack = false;
+    bool ack_ok = false;
+    bool fail_transfer = false;
+    bool notify_timer = false;
+    const char *error_message = NULL;
+
+    mft_lock();
+    if (ctx->write_active == job)
+        ctx->write_active = NULL;
+    finish_receive_write_job(ctx, job);
+    if (ctx->free_after_io || ctx->cancelled) {
+        release = ctx->io_jobs == 0 && !ctx->pumping;
+        mft_unlock();
+        free(job);
+        if (release)
+            free_transfer(ctx);
+        return;
+    }
+
+    if (job->stream_id > 0 && job->stream_id <= ctx->entry_count) {
+        struct manifest_entry *entry = &ctx->entries[job->stream_id - 1];
+
+        if (entry->type == 'f' && job->block_index < entry->block_count)
+            block = &entry->blocks[job->block_index];
+    }
+    if (!block || block->receive_generation != job->generation || block->received_ok) {
+        if (start_next_receive_write(ctx) != 0) {
+            unlink_transfer(ctx);
+            fail_transfer = true;
+            error_message = "Failed to queue received file data write.";
+        }
+        mft_unlock();
+        free(job);
+        if (fail_transfer)
+            complete_transfer_error_unlinked(ctx, error_message, true);
+        return;
+    }
+
+    server_id = ctx->server_id;
+    snprintf(transfer_id, sizeof(transfer_id), "%s", ctx->transfer_id);
+    if (status < 0 || job->result == RECEIVE_WRITE_IO_ERROR) {
+        unlink_transfer(ctx);
+        fail_transfer = true;
+        error_message = "Failed to write received file data.";
+    } else if (job->result == RECEIVE_WRITE_CHUNK_MISMATCH ||
+               job->result == RECEIVE_WRITE_BLOCK_MISMATCH ||
+               !block->receive_hash_started || block->receive_hash_failed ||
+               job->offset != block->receive_next_offset) {
+        int nack_rc = mark_block_nack(ctx, job->stream_id, job->block_index);
+
+        if (nack_rc == -2) {
+            unlink_transfer(ctx);
+            fail_transfer = true;
+            error_message = "File transfer receive retry limit exceeded.";
+        } else if (nack_rc == 0) {
+            send_ack = true;
+        }
+        notify_timer = true;
+    } else {
+        block->receive_hash_ctx = job->hash_ctx;
+        block->receive_next_offset = job->offset + job->data_len;
+        block->receive_waiting = true;
+        block->receive_deadline_ms =
+            g_plugin.host->now_ms(g_plugin.host->host_context) + MFT_BLOCK_TIMEOUT_MS;
+        touch_transfer_activity(ctx);
+        if (job->block_tail) {
+            block->received_ok = true;
+            block->receive_waiting = false;
+            block->receive_hash_started = false;
+            block->receive_deadline_ms = 0;
+            block->receive_next_offset = block->offset;
+            block->receive_queued_offset = block->offset;
+            ctx->bytes_transferred += block->size;
+            send_ack = true;
+            ack_ok = true;
+            advance_receive_wait(ctx);
+            notify_timer = true;
+        }
+    }
+    if (!fail_transfer && start_next_receive_write(ctx) != 0) {
+        unlink_transfer(ctx);
+        fail_transfer = true;
+        error_message = "Failed to queue received file data write.";
+    }
+    mft_unlock();
+
+    if (send_ack && !fail_transfer)
+        send_block_ack_raw(server_id,
+                           transfer_id,
+                           job->stream_id,
+                           job->block_index,
+                           job->block_offset,
+                           job->block_size,
+                           ack_ok);
+    if (notify_timer)
+        mft_signal_timer();
+    free(job);
+    if (fail_transfer)
+        complete_transfer_error_unlinked(ctx, error_message, true);
+}
+
+static bool receive_write_job_matches(const struct receive_write_job *job,
+                                      uint32_t stream_id,
+                                      size_t block_index)
+{
+    return job->stream_id == stream_id && job->block_index == block_index;
+}
+
+static void discard_receive_write_jobs(struct transfer_context *ctx,
+                                       uint32_t stream_id,
+                                       size_t block_index,
+                                       bool discard_all)
+{
+    struct receive_write_job *job = ctx->write_head;
+    struct receive_write_job *previous = NULL;
+
+    if (ctx->write_active &&
+        (discard_all || receive_write_job_matches(ctx->write_active, stream_id, block_index)))
+        (void)uv_cancel((uv_req_t *)&ctx->write_active->req);
+    while (job) {
+        struct receive_write_job *next = job->next;
+
+        if (discard_all || receive_write_job_matches(job, stream_id, block_index)) {
+            if (previous)
+                previous->next = next;
+            else
+                ctx->write_head = next;
+            if (ctx->write_tail == job)
+                ctx->write_tail = previous;
+            finish_receive_write_job(ctx, job);
+            free(job);
+        } else {
+            previous = job;
+        }
+        job = next;
+    }
+}
+
+static void cancel_transfer_io_jobs(struct transfer_context *ctx)
 {
     if (ctx->prepare_queued)
         (void)uv_cancel((uv_req_t *)&ctx->prepare_req);
+    discard_receive_write_jobs(ctx, 0, 0, true);
 }
 
 static void release_transfer_after_unlink(struct transfer_context *ctx)
@@ -2413,9 +2694,9 @@ static void release_transfer_after_unlink(struct transfer_context *ctx)
     if (ctx->io_jobs != 0) {
         ctx->cancelled = true;
         ctx->free_after_io = true;
-        cancel_prepare_job(ctx);
-        defer_free = true;
+        cancel_transfer_io_jobs(ctx);
     }
+    defer_free = ctx->pumping || ctx->io_jobs != 0;
     if (!defer_free)
         free_transfer(ctx);
 }
@@ -2488,8 +2769,9 @@ static void complete_transfer_error_unlinked(struct transfer_context *ctx,
         ctx->free_after_pump = true;
     if (ctx->io_jobs != 0) {
         ctx->free_after_io = true;
-        cancel_prepare_job(ctx);
+        cancel_transfer_io_jobs(ctx);
     }
+    defer_free = ctx->pumping || ctx->io_jobs != 0;
     server_id = ctx->server_id;
     if (notify_peer)
         transfer_id = mft_strdup(ctx->transfer_id);
@@ -2717,12 +2999,14 @@ static void scan_package_timeouts(unsigned long long now,
                 }
                 if (block->receive_waiting && !block->received_ok &&
                     block->receive_deadline_ms && now >= block->receive_deadline_ms) {
-                    if (block->retries >= MFT_MAX_BLOCK_RETRIES) {
+                    int nack_rc = mark_block_nack(ctx,
+                                                  (uint32_t)(i + 1),
+                                                  block_index);
+
+                    if (nack_rc != 0) {
                         failed = true;
                         break;
                     }
-                    block->retries++;
-                    block->receive_deadline_ms = now + MFT_BLOCK_TIMEOUT_MS;
                     queue_pending_ack(pending_acks,
                                       ctx->server_id,
                                       ctx->transfer_id,
@@ -3467,22 +3751,16 @@ static void handle_data(unsigned int server_id,
     uint64_t offset;
     uint32_t data_len;
     char chunk_hash[65];
-    char actual_hash[65];
     char transfer_id[256];
     struct transfer_context *ctx = NULL;
+    struct receive_write_job *job = NULL;
     size_t block_index;
     uint64_t block_offset;
     uint64_t block_size;
     char block_hash[65];
     const unsigned char *chunk_data;
-    bool chunk_ok;
-    bool is_block_tail = false;
     bool send_ack = false;
-    bool ack_ok = false;
-    bool block_hash_ok = false;
-    bool signal_timer = false;
     const char *error_message = NULL;
-    struct manifest_entry *receive_entry = NULL;
 
     if (len < 88)
         return;
@@ -3497,8 +3775,6 @@ static void handle_data(unsigned int server_id,
     memcpy(transfer_id, payload + 88, tid_len);
     transfer_id[tid_len] = '\0';
     chunk_data = payload + 88 + tid_len;
-    bytes_sha256(chunk_data, data_len, actual_hash);
-    chunk_ok = strcmp(actual_hash, chunk_hash) == 0;
 
     mft_lock();
     ctx = find_transfer(transfer_id);
@@ -3528,24 +3804,21 @@ static void handle_data(unsigned int server_id,
             mft_unlock();
             return;
         }
-        receive_entry = entry;
         block_offset = block->offset;
         block_size = block->size;
         snprintf(block_hash, sizeof(block_hash), "%s", block->hash);
-        if (offset == block->offset) {
+        if (offset == block->offset && !block->receive_hash_started) {
             sha256_init(&block->receive_hash_ctx);
             block->receive_hash_started = true;
             block->receive_hash_failed = false;
             block->receive_next_offset = block->offset;
+            block->receive_queued_offset = block->offset;
         }
         if (!block->receive_hash_started ||
             block->receive_hash_failed ||
-            offset != block->receive_next_offset) {
+            offset != block->receive_queued_offset) {
             int nack_rc = mark_block_nack(ctx, stream_id, block_index);
 
-            block->receive_hash_started = false;
-            block->receive_hash_failed = true;
-            block->receive_next_offset = block->offset;
             if (nack_rc == -2)
                 error_message = "File transfer receive retry limit exceeded.";
             else if (nack_rc == 0)
@@ -3564,120 +3837,55 @@ static void handle_data(unsigned int server_id,
                 complete_transfer_error_by_id(transfer_id, error_message, true);
             return;
         }
-    }
-
-    if (!chunk_ok) {
-        int nack_rc = mark_block_nack(ctx, stream_id, block_index);
-
-        if (nack_rc == -2)
-            error_message = "File transfer receive retry limit exceeded.";
-        else if (nack_rc == 0)
-            send_ack = true;
-        mft_unlock();
-        if (send_ack)
-            send_block_ack_raw(server_id,
-                               transfer_id,
-                               stream_id,
-                               block_index,
-                               block_offset,
-                               block_size,
-                               false);
-        mft_signal_timer();
-        if (error_message)
-            complete_transfer_error_by_id(transfer_id, error_message, true);
-        return;
-    }
-    is_block_tail = offset + data_len == block_offset + block_size;
-    if (write_all_at(receive_entry, chunk_data, data_len, offset) != 0) {
-        mft_unlock();
-        complete_transfer_error_by_id(transfer_id, "Failed to write received file data.", true);
-        return;
-    }
-    ctx = find_transfer(transfer_id);
-    if (!ctx || stream_id == 0 || stream_id > ctx->entry_count) {
-        mft_unlock();
-        return;
-    }
-    {
-        struct manifest_entry *entry = &ctx->entries[stream_id - 1];
-        struct block_entry *block;
-
-        if (entry->type != 'f' || block_index >= entry->block_count) {
+        if (ctx->write_jobs >= MFT_MAX_WRITE_JOBS ||
+            data_len > MFT_MAX_WRITE_PAYLOAD - ctx->write_payload_bytes ||
+            data_len > SIZE_MAX - sizeof(*job)) {
             mft_unlock();
+            complete_transfer_error_by_id(transfer_id,
+                                          "File transfer receive queue limit exceeded.",
+                                          true);
             return;
         }
-        block = &entry->blocks[block_index];
-        if (block->offset != block_offset || block->size != block_size) {
+        job = malloc(sizeof(*job) + data_len);
+        if (!job) {
             mft_unlock();
+            complete_transfer_error_by_id(transfer_id,
+                                          "Failed to queue received file data write.",
+                                          true);
             return;
         }
-        touch_transfer_activity(ctx);
-        if (!block->receive_hash_started ||
-            block->receive_hash_failed ||
-            offset != block->receive_next_offset) {
-            int nack_rc = mark_block_nack(ctx, stream_id, block_index);
-
-            block->receive_hash_started = false;
-            block->receive_hash_failed = true;
-            block->receive_next_offset = block->offset;
-            if (nack_rc == -2)
-                error_message = "File transfer receive retry limit exceeded.";
-            else if (nack_rc == 0)
-                send_ack = true;
-            signal_timer = true;
-        } else {
-            sha256_update(&block->receive_hash_ctx, chunk_data, data_len);
-            block->receive_next_offset = offset + data_len;
-            block->receive_waiting = true;
-            block->receive_deadline_ms =
-                g_plugin.host->now_ms(g_plugin.host->host_context) + MFT_BLOCK_TIMEOUT_MS;
-        }
-        if (is_block_tail) {
-            block->receive_deadline_ms = 0;
-            if (!error_message && !send_ack && !block->receive_hash_failed) {
-                unsigned char hash_bytes[32];
-
-                sha256_final(&block->receive_hash_ctx, hash_bytes);
-                hash_to_hex(hash_bytes, actual_hash);
-                block_hash_ok = strcmp(actual_hash, block_hash) == 0;
-                block->receive_hash_started = false;
-            }
-            if (!error_message && block_hash_ok) {
-                if (!block->received_ok) {
-                    block->received_ok = true;
-                    block->receive_waiting = false;
-                    block->receive_deadline_ms = 0;
-                    block->receive_next_offset = block->offset;
-                    ctx->bytes_transferred += block->size;
-                }
-                send_ack = true;
-                ack_ok = true;
-                advance_receive_wait(ctx);
-            } else if (!error_message) {
-                int nack_rc = mark_block_nack(ctx, stream_id, block_index);
-
-                block->receive_hash_started = false;
-                block->receive_hash_failed = true;
-                block->receive_next_offset = block->offset;
-                if (nack_rc == -2)
-                    error_message = "File transfer receive retry limit exceeded.";
-                else if (nack_rc == 0)
-                    send_ack = true;
-            }
-            signal_timer = true;
-        }
+        memset(job, 0, sizeof(*job));
+        job->ctx = ctx;
+        job->stream_id = stream_id;
+        job->block_index = block_index;
+        job->generation = block->receive_generation;
+        job->fd = entry->receive_fd;
+        job->offset = offset;
+        job->block_offset = block_offset;
+        job->block_size = block_size;
+        job->data_len = data_len;
+        job->block_tail = offset + data_len == block_offset + block_size;
+        snprintf(job->chunk_hash, sizeof(job->chunk_hash), "%s", chunk_hash);
+        snprintf(job->block_hash, sizeof(job->block_hash), "%s", block_hash);
+        memcpy(job->data, chunk_data, data_len);
+        block->receive_queued_offset = offset + data_len;
+        block->receive_waiting = true;
+        block->receive_deadline_ms =
+            g_plugin.host->now_ms(g_plugin.host->host_context) + MFT_BLOCK_TIMEOUT_MS;
+        ctx->write_jobs++;
+        ctx->write_payload_bytes += data_len;
+        ctx->io_jobs++;
+        g_plugin.io_jobs++;
+        if (ctx->write_tail)
+            ctx->write_tail->next = job;
+        else
+            ctx->write_head = job;
+        ctx->write_tail = job;
+        if (start_next_receive_write(ctx) != 0)
+            error_message = "Failed to queue received file data write.";
     }
     mft_unlock();
-    if (send_ack)
-        send_block_ack_raw(server_id,
-                           transfer_id,
-                           stream_id,
-                           block_index,
-                           block_offset,
-                           block_size,
-                           ack_ok);
-    if (signal_timer)
-        mft_signal_timer();
+    mft_signal_timer();
     if (error_message)
         complete_transfer_error_by_id(transfer_id, error_message, true);
 }
