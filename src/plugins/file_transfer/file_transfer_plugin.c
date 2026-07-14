@@ -227,6 +227,8 @@ struct manifest_entry {
     char hash[65];
     struct block_entry *blocks;
     size_t block_count;
+    int receive_fd;
+    bool receive_fd_open;
 };
 
 struct mft_plugin {
@@ -1031,55 +1033,61 @@ static uint64_t validated_resume_offset(const char *final_path,
     return 0;
 }
 
-static int write_all_at(const char *path,
+static int close_receive_file(struct manifest_entry *entry)
+{
+    int fd;
+
+    if (!entry->receive_fd_open)
+        return 0;
+    fd = entry->receive_fd;
+    entry->receive_fd_open = false;
+    entry->receive_fd = 0;
+    return close(fd);
+}
+
+static int open_receive_file(struct manifest_entry *entry,
+                             const char *path,
+                             bool truncate)
+{
+    int flags = O_CREAT | O_WRONLY | MFT_OPEN_BINARY;
+
+    if (truncate)
+        flags |= O_TRUNC;
+    entry->receive_fd = open(path, flags, 0666);
+    if (entry->receive_fd < 0)
+        return -1;
+    entry->receive_fd_open = true;
+    return 0;
+}
+
+static int write_all_at(struct manifest_entry *entry,
                         const unsigned char *data,
                         size_t len,
                         uint64_t offset)
 {
-    int fd;
     ssize_t written;
     size_t done = 0;
 
-    if (ensure_parent_dirs(path) != 0)
-        return -1;
-    fd = open(path, O_CREAT | O_WRONLY | MFT_OPEN_BINARY, 0666);
-    if (fd < 0)
+    if (!entry->receive_fd_open)
         return -1;
     while (done < len) {
-        if (offset > UINT64_MAX - done || mft_seek_fd(fd, offset + done) != 0) {
-            close(fd);
+        if (offset > UINT64_MAX - done ||
+            mft_seek_fd(entry->receive_fd, offset + done) != 0)
             return -1;
-        }
 #ifdef _WIN32
         {
             size_t remaining = len - done;
             unsigned int chunk = remaining > UINT_MAX ? UINT_MAX : (unsigned int)remaining;
 
-            written = write(fd, data + done, chunk);
+            written = write(entry->receive_fd, data + done, chunk);
         }
 #else
-        written = write(fd, data + done, len - done);
+        written = write(entry->receive_fd, data + done, len - done);
 #endif
-        if (written <= 0) {
-            close(fd);
+        if (written <= 0)
             return -1;
-        }
         done += (size_t)written;
     }
-    close(fd);
-    return 0;
-}
-
-static int truncate_file(const char *path)
-{
-    int fd;
-
-    if (ensure_parent_dirs(path) != 0)
-        return -1;
-    fd = open(path, O_CREAT | O_WRONLY | O_TRUNC | MFT_OPEN_BINARY, 0666);
-    if (fd < 0)
-        return -1;
-    close(fd);
     return 0;
 }
 
@@ -1211,6 +1219,7 @@ static void free_entries(struct manifest_entry *entries, size_t count)
     size_t i;
 
     for (i = 0; i < count; i++) {
+        close_receive_file(&entries[i]);
         free(entries[i].relpath);
         free(entries[i].blocks);
     }
@@ -1640,7 +1649,7 @@ static int prepare_accept(const char *target_root,
                     json_decref(accept);
                     return -1;
                 }
-                if (resume_offset == 0 && truncate_file(tmp_part) != 0) {
+                if (open_receive_file(entry, tmp_part, resume_offset == 0) != 0) {
                     json_decref(accept);
                     return -1;
                 }
@@ -1659,20 +1668,6 @@ static int prepare_accept(const char *target_root,
     }
 
     *out_accept = accept;
-    return 0;
-}
-
-static int part_path_for_relpath(const char *target_root,
-                                 const char *relpath,
-                                 char *out,
-                                 size_t out_len)
-{
-    char final_path[PATH_MAX];
-
-    if (!target_root || !relpath ||
-        join_path(final_path, sizeof(final_path), target_root, relpath) != 0 ||
-        part_path(out, out_len, final_path) != 0)
-        return -1;
     return 0;
 }
 
@@ -1920,6 +1915,8 @@ static int finalize_received(const char *target_root,
         }
         if (join_path(final_path, sizeof(final_path), target_root, entry->relpath) != 0 ||
             part_path(tmp_part, sizeof(tmp_part), final_path) != 0)
+            return -1;
+        if (close_receive_file(entry) != 0)
             return -1;
         if (stat(tmp_part, &st) != 0 || !S_ISREG(st.st_mode) ||
             (uint64_t)st.st_size != entry->size)
@@ -3391,9 +3388,6 @@ static void handle_data(unsigned int server_id,
     char actual_hash[65];
     char transfer_id[256];
     struct transfer_context *ctx = NULL;
-    char target_root[PATH_MAX];
-    char relpath[PATH_MAX];
-    char part_path_value[PATH_MAX];
     size_t block_index;
     uint64_t block_offset;
     uint64_t block_size;
@@ -3406,6 +3400,7 @@ static void handle_data(unsigned int server_id,
     bool block_hash_ok = false;
     bool signal_timer = false;
     const char *error_message = NULL;
+    struct manifest_entry *receive_entry = NULL;
 
     if (len < 88)
         return;
@@ -3447,13 +3442,11 @@ static void handle_data(unsigned int server_id,
             mft_unlock();
             return;
         }
-        if (strlen(ctx->local_path) >= sizeof(target_root) ||
-            strlen(entry->relpath) >= sizeof(relpath)) {
+        if (!entry->receive_fd_open) {
             mft_unlock();
             return;
         }
-        snprintf(target_root, sizeof(target_root), "%s", ctx->local_path);
-        snprintf(relpath, sizeof(relpath), "%s", entry->relpath);
+        receive_entry = entry;
         block_offset = block->offset;
         block_size = block->size;
         snprintf(block_hash, sizeof(block_hash), "%s", block->hash);
@@ -3512,20 +3505,12 @@ static void handle_data(unsigned int server_id,
             complete_transfer_error_by_id(transfer_id, error_message, true);
         return;
     }
-    if (part_path_for_relpath(target_root, relpath, part_path_value, sizeof(part_path_value)) != 0) {
+    is_block_tail = offset + data_len == block_offset + block_size;
+    if (write_all_at(receive_entry, chunk_data, data_len, offset) != 0) {
         mft_unlock();
         complete_transfer_error_by_id(transfer_id, "Failed to write received file data.", true);
         return;
     }
-    is_block_tail = offset + data_len == block_offset + block_size;
-    mft_unlock();
-
-    if (write_all_at(part_path_value, chunk_data, data_len, offset) != 0) {
-        complete_transfer_error_by_id(transfer_id, "Failed to write received file data.", true);
-        return;
-    }
-
-    mft_lock();
     ctx = find_transfer(transfer_id);
     if (!ctx || stream_id == 0 || stream_id > ctx->entry_count) {
         mft_unlock();
