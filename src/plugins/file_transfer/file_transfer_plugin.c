@@ -2835,6 +2835,9 @@ static void recompute_next_package_deadline(unsigned long long *next_deadline)
     for (ctx = g_transfers; ctx; ctx = ctx->next) {
         size_t i;
 
+        if (ctx->deadline_ms &&
+            (!*next_deadline || ctx->deadline_ms < *next_deadline))
+            *next_deadline = ctx->deadline_ms;
         for (i = 0; i < ctx->entry_count; i++) {
             struct manifest_entry *entry = &ctx->entries[i];
             size_t block_index;
@@ -2967,6 +2970,15 @@ static void scan_package_timeouts(unsigned long long now,
         bool failed = false;
         size_t i;
 
+        if (ctx->deadline_ms && now >= ctx->deadline_ms) {
+            unlink_transfer(ctx);
+            queue_pending_error(pending_errors,
+                                ctx,
+                                "File transfer timed out.",
+                                true);
+            ctx = next;
+            continue;
+        }
         if (ctx->send_paused &&
             (!ctx->send_pump_deadline_ms || now >= ctx->send_pump_deadline_ms)) {
             struct pending_pump *pump = calloc(1, sizeof(*pump));
