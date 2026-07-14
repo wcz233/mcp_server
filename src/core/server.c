@@ -331,6 +331,8 @@ static void close_runtime_handles(struct mcp_server *server)
     mcp_framed_listener_close(server->tcp_listener);
     mcp_stdio_transport_close(server->stdio);
     mcp_shell_jobs_shutdown(server->shell_jobs);
+    mcp_plugin_manager_close(server->plugin_manager);
+    mcp_peer_transport_close(server->peer_transport);
     if (server->core_async_initialized &&
         !uv_is_closing((uv_handle_t *)&server->core_async))
         uv_close((uv_handle_t *)&server->core_async, NULL);
