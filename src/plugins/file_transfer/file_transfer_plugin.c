@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+#include <uv.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -171,6 +172,7 @@ typedef int mode_t;
 #define MFT_PUMP_RETRY_MS 50u
 #define MFT_PUMP_MAX_BLOCKS 4u
 #define MFT_MAX_IN_FLIGHT_BLOCKS 4u
+#define MFT_MAX_PREPARE_JOBS 4u
 #define MFT_DEFAULT_TIMEOUT_MS 30000u
 #define MFT_MIN_TIMEOUT_MS 1000u
 #define MFT_MAX_TIMEOUT_MS 600000u
@@ -246,6 +248,9 @@ struct mft_plugin {
     bool sync_initialized;
     bool timer_started;
     bool timer_stop;
+    bool shutting_down;
+    unsigned int io_jobs;
+    unsigned int prepare_jobs;
 };
 
 struct transfer_context {
@@ -273,7 +278,13 @@ struct transfer_context {
     bool pumping;
     bool cancelled;
     bool free_after_pump;
+    bool free_after_io;
     bool completed;
+    bool prepare_queued;
+    bool prepare_fetch;
+    int prepare_result;
+    uv_work_t prepare_req;
+    unsigned int io_jobs;
     unsigned long long send_pump_deadline_ms;
     struct manifest_entry *entries;
     size_t entry_count;
@@ -2382,16 +2393,31 @@ static void free_transfer(struct transfer_context *ctx)
     free(ctx);
 }
 
+static void cancel_prepare_job(struct transfer_context *ctx)
+{
+    if (ctx->prepare_queued)
+        (void)uv_cancel((uv_req_t *)&ctx->prepare_req);
+}
+
 static void release_transfer_after_unlink(struct transfer_context *ctx)
 {
+    bool defer_free = false;
+
     if (!ctx)
         return;
     if (ctx->pumping) {
         ctx->cancelled = true;
         ctx->free_after_pump = true;
-        return;
+        defer_free = true;
     }
-    free_transfer(ctx);
+    if (ctx->io_jobs != 0) {
+        ctx->cancelled = true;
+        ctx->free_after_io = true;
+        cancel_prepare_job(ctx);
+        defer_free = true;
+    }
+    if (!defer_free)
+        free_transfer(ctx);
 }
 
 static void unlink_transfer(struct transfer_context *ctx)
@@ -2442,6 +2468,9 @@ static void complete_transfer_error_unlinked(struct transfer_context *ctx,
                                              bool notify_peer)
 {
     char error[256];
+    char *transfer_id = NULL;
+    char *invocation_id = NULL;
+    unsigned int server_id;
     bool defer_free;
 
     if (!ctx)
@@ -2454,16 +2483,27 @@ static void complete_transfer_error_unlinked(struct transfer_context *ctx,
         return;
     }
     ctx->completed = true;
-    defer_free = ctx->pumping;
-    if (defer_free)
+    defer_free = ctx->pumping || ctx->io_jobs != 0;
+    if (ctx->pumping)
         ctx->free_after_pump = true;
-    mft_unlock();
+    if (ctx->io_jobs != 0) {
+        ctx->free_after_io = true;
+        cancel_prepare_job(ctx);
+    }
+    server_id = ctx->server_id;
     if (notify_peer)
-        send_abort_frame(ctx->server_id, ctx->transfer_id, error);
-    if (ctx->invocation_id && g_plugin.host->complete_async_error)
+        transfer_id = mft_strdup(ctx->transfer_id);
+    if (ctx->invocation_id)
+        invocation_id = mft_strdup(ctx->invocation_id);
+    mft_unlock();
+    if (transfer_id)
+        send_abort_frame(server_id, transfer_id, error);
+    if (invocation_id && g_plugin.host->complete_async_error)
         g_plugin.host->complete_async_error(g_plugin.host->host_context,
-                                            ctx->invocation_id,
+                                            invocation_id,
                                             error);
+    free(transfer_id);
+    free(invocation_id);
     if (!defer_free)
         free_transfer(ctx);
 }
@@ -2869,6 +2909,181 @@ static uint32_t payload_timeout_ms(json_t *payload)
     return clamp_timeout_ms((unsigned long long)json_integer_value(value));
 }
 
+static int prepare_source_entries(struct transfer_context *ctx)
+{
+    struct stat st;
+    size_t capacity = 0;
+    size_t i;
+
+    if (stat(ctx->local_path, &st) != 0)
+        return -1;
+    if (S_ISDIR(st.st_mode)) {
+        char *source_name = path_basename_dup(ctx->local_path);
+        char *root = path_dirname_dup(ctx->local_path);
+
+        if (!source_name || !root) {
+            free(source_name);
+            free(root);
+            return -1;
+        }
+        free(ctx->source_name);
+        ctx->source_name = source_name;
+        free(ctx->local_path);
+        ctx->local_path = root;
+        if (scan_path(ctx->local_path,
+                      ctx->source_name,
+                      &ctx->entries,
+                      &ctx->entry_count,
+                      &capacity) != 0)
+            return -1;
+    } else {
+        if (!S_ISREG(st.st_mode) ||
+            scan_path(ctx->local_path,
+                      ".",
+                      &ctx->entries,
+                      &ctx->entry_count,
+                      &capacity) != 0)
+            return -1;
+        if (manifest_is_single_file_root(ctx->entries, ctx->entry_count)) {
+            ctx->source_name = path_basename_dup(ctx->local_path);
+            if (!ctx->source_name)
+                return -1;
+        }
+    }
+    if (manifest_is_single_file_root(ctx->entries, ctx->entry_count) && !ctx->source_name)
+        return -1;
+    for (i = 0; i < ctx->entry_count; i++) {
+        if (ctx->entries[i].type == 'f')
+            ctx->bytes_total += ctx->entries[i].size;
+    }
+    return 0;
+}
+
+static void prepare_transfer_work(uv_work_t *req)
+{
+    struct transfer_context *ctx = req->data;
+
+    ctx->prepare_result = prepare_source_entries(ctx);
+}
+
+static int send_prepared_offer(struct transfer_context *ctx)
+{
+    json_t *manifest = entries_to_manifest(ctx->entries, ctx->entry_count);
+    json_t *offer;
+    int rc;
+
+    if (!manifest)
+        return -1;
+    if (ctx->prepare_fetch) {
+        offer = json_pack("{s:s,s:s,s:O}",
+                          "transfer_id",
+                          ctx->transfer_id,
+                          "remote_path",
+                          ctx->remote_path,
+                          "manifest",
+                          manifest);
+    } else {
+        offer = json_pack("{s:s,s:s,s:O,s:I,s:i}",
+                          "transfer_id",
+                          ctx->transfer_id,
+                          "remote_path",
+                          ctx->remote_path,
+                          "manifest",
+                          manifest,
+                          "bytes_total",
+                          (json_int_t)ctx->bytes_total,
+                          "max_concurrent_streams",
+                          (int)MFT_MAX_CONCURRENT_STREAMS);
+    }
+    json_decref(manifest);
+    if (!offer)
+        return -1;
+    if (json_object_set_new(offer,
+                            "timeout_ms",
+                            json_integer((json_int_t)ctx->timeout_ms)) != 0 ||
+        (ctx->source_name &&
+         json_object_set_new(offer, "source_name", json_string(ctx->source_name)) != 0)) {
+        json_decref(offer);
+        return -1;
+    }
+    rc = send_json_frame(ctx->server_id, MFT_FRAME_OFFER, offer);
+    json_decref(offer);
+    return rc;
+}
+
+static void prepare_transfer_after_work(uv_work_t *req, int status)
+{
+    struct transfer_context *ctx = req->data;
+    bool release = false;
+    bool notify_peer;
+    const char *message;
+
+    mft_lock();
+    ctx->prepare_queued = false;
+    if (ctx->io_jobs > 0)
+        ctx->io_jobs--;
+    if (g_plugin.io_jobs > 0)
+        g_plugin.io_jobs--;
+    if (g_plugin.prepare_jobs > 0)
+        g_plugin.prepare_jobs--;
+    if (ctx->free_after_io || ctx->cancelled) {
+        release = ctx->io_jobs == 0 && !ctx->pumping;
+        mft_unlock();
+        if (release)
+            free_transfer(ctx);
+        return;
+    }
+
+    notify_peer = ctx->prepare_fetch;
+    message = notify_peer ? "Remote path is not a readable regular file or directory."
+                          : "Local path is not a readable regular file or directory.";
+    if (status < 0 || ctx->prepare_result != 0 ||
+        touch_transfer_activity(ctx) != 0 || send_prepared_offer(ctx) != 0) {
+        unlink_transfer(ctx);
+        mft_unlock();
+        complete_transfer_error_unlinked(ctx, message, notify_peer);
+        return;
+    }
+    mft_unlock();
+    mft_signal_timer();
+}
+
+static int queue_prepare_transfer(struct transfer_context *ctx)
+{
+    uv_loop_t *loop;
+    int rc;
+
+    if (!g_plugin.host || !g_plugin.host->get_loop)
+        return -1;
+    loop = g_plugin.host->get_loop(g_plugin.host->host_context);
+    if (!loop)
+        return -1;
+
+    mft_lock();
+    if (g_plugin.shutting_down || g_plugin.prepare_jobs >= MFT_MAX_PREPARE_JOBS) {
+        mft_unlock();
+        return -1;
+    }
+    ctx->prepare_req.data = ctx;
+    ctx->prepare_result = -1;
+    ctx->prepare_queued = true;
+    ctx->io_jobs++;
+    g_plugin.io_jobs++;
+    g_plugin.prepare_jobs++;
+    rc = uv_queue_work(loop,
+                       &ctx->prepare_req,
+                       prepare_transfer_work,
+                       prepare_transfer_after_work);
+    if (rc != 0) {
+        ctx->prepare_queued = false;
+        ctx->io_jobs--;
+        g_plugin.io_jobs--;
+        g_plugin.prepare_jobs--;
+    }
+    mft_unlock();
+    return rc;
+}
+
 static int start_send(const char *invocation_id,
                       unsigned int server_id,
                       const char *local_path,
@@ -2876,12 +3091,6 @@ static int start_send(const char *invocation_id,
                       uint32_t timeout_ms)
 {
     struct transfer_context *ctx;
-    json_t *manifest = NULL;
-    json_t *payload = NULL;
-    struct stat st;
-    uint64_t bytes_total = 0;
-    size_t i;
-    size_t capacity = 0;
 
     if (ensure_capability(server_id) != 0)
         return -2;
@@ -2910,112 +3119,20 @@ static int start_send(const char *invocation_id,
     strcpy(ctx->direction, "send");
     if (!ctx->invocation_id || !ctx->transfer_id || !ctx->local_path || !ctx->remote_path)
         goto fail;
-
-    if (stat(local_path, &st) != 0)
-        goto fail;
-    if (g_plugin.host && g_plugin.host->log_info) {
-        char msg[256];
-
-        snprintf(msg,
-                 sizeof(msg),
-                 "mft start send stat ok size=%llu dir=%d",
-                 (unsigned long long)st.st_size,
-                 S_ISDIR(st.st_mode) ? 1 : 0);
-        g_plugin.host->log_info(g_plugin.host->host_context, msg);
-    }
-    if (S_ISDIR(st.st_mode)) {
-        ctx->source_name = path_basename_dup(local_path);
-        if (!ctx->source_name)
-            goto fail;
-        free(ctx->local_path);
-        ctx->local_path = path_dirname_dup(local_path);
-        if (!ctx->local_path)
-            goto fail;
-        if (scan_path(ctx->local_path, ctx->source_name, &ctx->entries, &ctx->entry_count, &capacity) != 0)
-            goto fail;
-    } else {
-        if (scan_path(local_path, ".", &ctx->entries, &ctx->entry_count, &capacity) != 0)
-            goto fail;
-        if (manifest_is_single_file_root(ctx->entries, ctx->entry_count)) {
-            ctx->source_name = path_basename_dup(local_path);
-            if (!ctx->source_name)
-                goto fail;
-        }
-    }
-    if (manifest_is_single_file_root(ctx->entries, ctx->entry_count) && !ctx->source_name)
-        goto fail;
-    if (g_plugin.host && g_plugin.host->log_info) {
-        char msg[256];
-
-        snprintf(msg,
-                 sizeof(msg),
-                 "mft start send scan done entries=%lu",
-                 (unsigned long)ctx->entry_count);
-        g_plugin.host->log_info(g_plugin.host->host_context, msg);
-    }
-    for (i = 0; i < ctx->entry_count; i++) {
-        if (ctx->entries[i].type == 'f')
-            bytes_total += ctx->entries[i].size;
-    }
-    manifest = entries_to_manifest(ctx->entries, ctx->entry_count);
-    if (!manifest)
-        goto fail;
-    if (g_plugin.host && g_plugin.host->log_info) {
-        char msg[256];
-
-        snprintf(msg,
-                 sizeof(msg),
-                 "mft start send manifest ready entries=%lu bytes=%llu",
-                 (unsigned long)ctx->entry_count,
-                 (unsigned long long)bytes_total);
-        g_plugin.host->log_info(g_plugin.host->host_context, msg);
-    }
-    payload = json_pack("{s:s,s:s,s:o,s:I,s:i}",
-                        "transfer_id",
-                        ctx->transfer_id,
-                        "remote_path",
-                        remote_path,
-                        "manifest",
-                        manifest,
-                        "bytes_total",
-                        (json_int_t)bytes_total,
-                        "max_concurrent_streams",
-                        (int)MFT_MAX_CONCURRENT_STREAMS);
-    manifest = NULL;
-    if (!payload)
-        goto fail;
-    if (json_object_set_new(payload, "timeout_ms", json_integer((json_int_t)timeout_ms)) != 0)
-        goto fail;
-    if (ctx->source_name &&
-        json_object_set_new(payload, "source_name", json_string(ctx->source_name)) != 0)
-        goto fail;
     if (start_transfer_timer(ctx) != 0)
         goto fail;
     mft_lock();
     add_transfer(ctx);
     mft_unlock();
-    if (g_plugin.host && g_plugin.host->log_info) {
-        char msg[256];
-
-        snprintf(msg,
-                 sizeof(msg),
-                 "mft start send offer tx=%s bytes=%llu",
-                 ctx->transfer_id ? ctx->transfer_id : "",
-                 (unsigned long long)bytes_total);
-        g_plugin.host->log_info(g_plugin.host->host_context, msg);
-    }
-    if (send_json_frame(server_id, MFT_FRAME_OFFER, payload) != 0) {
+    if (queue_prepare_transfer(ctx) != 0) {
         mft_lock();
         unlink_transfer(ctx);
         mft_unlock();
         goto fail;
     }
-    json_decref(payload);
     return 0;
 
 fail:
-    json_decref(payload);
-    json_decref(manifest);
     free_transfer(ctx);
     return -1;
 }
@@ -3247,10 +3364,6 @@ static void handle_fetch_request(unsigned int server_id, json_t *payload)
     json_t *local_path = json_object_get(payload, "local_path");
     const char *transfer_id_value;
     struct transfer_context *ctx;
-    json_t *manifest = NULL;
-    json_t *offer = NULL;
-    struct stat st;
-    size_t capacity = 0;
 
     if (!json_is_string(transfer_id) || !json_is_string(remote_path) || !json_is_string(local_path))
         return;
@@ -3265,64 +3378,24 @@ static void handle_fetch_request(unsigned int server_id, json_t *payload)
     ctx->server_id = server_id;
     ctx->timeout_ms = payload_timeout_ms(payload);
     ctx->started_ms = g_plugin.host->now_ms(g_plugin.host->host_context);
+    ctx->prepare_fetch = true;
     strcpy(ctx->direction, "send");
     if (!ctx->transfer_id || !ctx->local_path || !ctx->remote_path)
         goto fail;
-    if (stat(ctx->local_path, &st) != 0)
-        goto fail;
-    if (S_ISDIR(st.st_mode)) {
-        ctx->source_name = path_basename_dup(ctx->local_path);
-        if (!ctx->source_name)
-            goto fail;
-        free(ctx->local_path);
-        ctx->local_path = path_dirname_dup(json_string_value(remote_path));
-        if (!ctx->local_path)
-            goto fail;
-        if (scan_path(ctx->local_path, ctx->source_name, &ctx->entries, &ctx->entry_count, &capacity) != 0)
-            goto fail;
-    } else {
-        if (scan_path(json_string_value(remote_path), ".", &ctx->entries, &ctx->entry_count, &capacity) != 0)
-            goto fail;
-        if (manifest_is_single_file_root(ctx->entries, ctx->entry_count)) {
-            ctx->source_name = path_basename_dup(json_string_value(remote_path));
-            if (!ctx->source_name)
-                goto fail;
-        }
-    }
-
-    manifest = entries_to_manifest(ctx->entries, ctx->entry_count);
-    if (!manifest)
-        goto fail;
-    offer = json_pack("{s:s,s:s,s:o}",
-                      "transfer_id",
-                      ctx->transfer_id,
-                      "remote_path",
-                      ctx->remote_path,
-                      "manifest",
-                      manifest);
-    manifest = NULL;
-    if (!offer)
-        goto fail;
-    if (json_object_set_new(offer, "timeout_ms", json_integer((json_int_t)ctx->timeout_ms)) != 0)
-        goto fail;
-    if (ctx->source_name &&
-        json_object_set_new(offer, "source_name", json_string(ctx->source_name)) != 0)
+    if (start_transfer_timer(ctx) != 0)
         goto fail;
     mft_lock();
     add_transfer(ctx);
     mft_unlock();
-    if (send_json_frame(server_id, MFT_FRAME_OFFER, offer) != 0) {
+    if (queue_prepare_transfer(ctx) != 0) {
         mft_lock();
         unlink_transfer(ctx);
         mft_unlock();
         goto fail;
     }
-    json_decref(offer);
     return;
 
 fail:
-    json_decref(offer);
-    json_decref(manifest);
     send_abort_frame(server_id, transfer_id_value, "Remote path is not a readable regular file or directory.");
     free_transfer(ctx);
 }
@@ -3888,7 +3961,8 @@ MFT_PLUGIN_EXPORT int MFT_PLUGIN_INIT(const struct mcp_plugin_host_api *host,
 {
     (void)config_json;
     g_plugin.host = host;
-    if (!host || !host->register_tool || !host->peer_transport_register_handler) {
+    if (!host || !host->get_loop || !host->register_tool ||
+        !host->peer_transport_register_handler) {
         snprintf(result_json, result_size, "Missing ABI 1.1 host API.");
         return -1;
     }
@@ -3993,6 +4067,15 @@ MFT_PLUGIN_EXPORT int MFT_PLUGIN_INVOKE(const char *invocation_id,
 
 MFT_PLUGIN_EXPORT int MFT_PLUGIN_SHUTDOWN(void)
 {
+    if (g_plugin.sync_initialized) {
+        mft_lock();
+        if (g_plugin.io_jobs != 0) {
+            mft_unlock();
+            return -1;
+        }
+        g_plugin.shutting_down = true;
+        mft_unlock();
+    }
     stop_timer_thread();
     while (g_transfers) {
         struct transfer_context *ctx = g_transfers;

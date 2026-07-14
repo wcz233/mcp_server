@@ -873,12 +873,14 @@ static int init_linked_plugin(struct mcp_plugin_manager *manager,
     return 0;
 }
 
-static void unload_plugin(struct mcp_plugin_manager *manager, struct plugin_module *plugin)
+static int unload_plugin(struct mcp_plugin_manager *manager, struct plugin_module *plugin)
 {
     struct plugin_tool *tool;
 
     if (!plugin)
-        return;
+        return 0;
+    if (plugin->shutdown && plugin->shutdown() != 0)
+        return -1;
 
     plugin->state = PLUGIN_STATE_UNLOADING;
     for (tool = plugin->tools; tool; tool = tool->next)
@@ -890,13 +892,12 @@ static void unload_plugin(struct mcp_plugin_manager *manager, struct plugin_modu
     plugin->frame_adapters = NULL;
     pending_call_list_free(plugin->pending_calls);
     plugin->pending_calls = NULL;
-    if (plugin->shutdown)
-        plugin->shutdown();
     if (plugin->library_open) {
         uv_dlclose(&plugin->library);
         plugin->library_open = false;
     }
     plugin->state = PLUGIN_STATE_UNLOADED;
+    return 0;
 }
 
 void mcp_plugin_manager_destroy(struct mcp_plugin_manager *manager)
@@ -920,7 +921,7 @@ void mcp_plugin_manager_destroy(struct mcp_plugin_manager *manager)
     }
     while ((plugin = manager->plugins) != NULL) {
         manager->plugins = plugin->next;
-        unload_plugin(manager, plugin);
+        (void)unload_plugin(manager, plugin);
         tool_list_free(plugin->tools);
         frame_adapter_list_free(plugin->frame_adapters);
         pending_call_list_free(plugin->pending_calls);
@@ -987,7 +988,7 @@ int mcp_plugin_manager_register_builtin(
     return 0;
 
 fail_linked:
-    unload_plugin(manager, plugin);
+    (void)unload_plugin(manager, plugin);
     unlink_plugin(manager, plugin);
 fail:
     tool_list_free(plugin->tools);
@@ -1066,7 +1067,7 @@ int mcp_plugin_manager_insmod(struct mcp_plugin_manager *manager,
     return 0;
 
 fail_linked:
-    unload_plugin(manager, plugin);
+    (void)unload_plugin(manager, plugin);
     unlink_plugin(manager, plugin);
 fail:
     tool_list_free(plugin->tools);
@@ -1107,7 +1108,11 @@ int mcp_plugin_manager_rmmod(struct mcp_plugin_manager *manager,
     }
 
     plugin->state = PLUGIN_STATE_DRAINING;
-    unload_plugin(manager, plugin);
+    if (unload_plugin(manager, plugin) != 0) {
+        plugin->state = PLUGIN_STATE_ACTIVE;
+        *out_error = "Plugin is busy and cannot be unloaded.";
+        return -1;
+    }
     unlink_plugin(manager, plugin);
 
     *out_payload = json_pack("{s:s,s:b,s:s}",

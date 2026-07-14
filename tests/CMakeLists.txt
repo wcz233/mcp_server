@@ -26,6 +26,29 @@ add_test(
     COMMAND mcp_file_transfer_offset_test
 )
 
+if(NOT "${MCP_TOOL_PLUGIN_MANAGER}" STREQUAL "n")
+    add_library(mcp_busy_shutdown_plugin MODULE
+        busy_shutdown_plugin.c
+    )
+
+    target_include_directories(mcp_busy_shutdown_plugin
+        PRIVATE
+            "${PROJECT_SOURCE_DIR}/include"
+    )
+
+    if(MSVC)
+        target_compile_definitions(mcp_busy_shutdown_plugin PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_compile_options(mcp_busy_shutdown_plugin PRIVATE /W4)
+    else()
+        target_compile_options(mcp_busy_shutdown_plugin PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    set_target_properties(mcp_busy_shutdown_plugin PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "mcp_busy_shutdown_plugin"
+    )
+endif()
+
 if(Python3_Interpreter_FOUND)
     set(_mcp_file_transfer_path_plugin "-")
     if(TARGET mcp_file_transfer_plugin)
@@ -48,6 +71,13 @@ if(Python3_Interpreter_FOUND)
         NAME mcp_tools_dynamic_smoke
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools_dynamic_smoke.py" "$<TARGET_FILE:mcp_server>"
     )
+
+    if(TARGET mcp_busy_shutdown_plugin)
+        add_test(
+            NAME mcp_plugin_busy_unload_smoke
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/plugin_busy_unload_smoke.py" "$<TARGET_FILE:mcp_server>" "$<TARGET_FILE:mcp_busy_shutdown_plugin>"
+        )
+    endif()
 
     add_test(
         NAME mcp_shell_exec_policy_smoke

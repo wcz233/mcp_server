@@ -86,6 +86,7 @@ if(MCP_FILE_TRANSFER_PLUGIN STREQUAL "m")
     target_link_libraries(mcp_file_transfer_plugin
         PRIVATE
             MCP::jansson
+            MCP::libuv
             Threads::Threads
     )
 
