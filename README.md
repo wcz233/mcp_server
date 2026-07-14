@@ -220,11 +220,11 @@ After=network.target
 Type=simple
 Environment=MCP_ENABLE_STDIO=0
 Environment=MCP_ENABLE_TCP=1
-Environment=MCP_TCP_HOST=192.168.16.3
+Environment=MCP_TCP_HOST=192.168.16.135
 Environment=MCP_TCP_PORT=18767
 Environment=MCP_ENABLE_SHELL_EXEC=1
-ExecStart=/home/alinx/prj/mcp/mcp_server/build/src/mcp_server
-WorkingDirectory=/home/alinx/prj/mcp/mcp_server/build/src
+ExecStart=/opt/mcp_server/mcp_server
+WorkingDirectory=/root/
 Restart=always
 RestartSec=3
 
@@ -240,6 +240,17 @@ WantedBy=multi-user.target
 sudo systemctl enable mcp_server.service
 sudo systemctl restart mcp_server.service
 ```
+
+建议在服务启动后立即验证：
+
+```shell
+tools_list | grep -E 'server.send|server.recv'
+```
+
+若没有看到这两个工具，优先检查：
+
+1. `ExecStart` 指向的是否是实际部署并正在运行的那份二进制。
+2. 当前服务对应的构建模式是否真为 `MCP_FILE_TRANSFER_PLUGIN=y`；若仍是 `m`，则需要额外加载 `mcp_file_transfer_plugin.so`。
 
 ### Windows
 
