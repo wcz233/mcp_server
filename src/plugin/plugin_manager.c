@@ -44,6 +44,15 @@ struct plugin_pending_call {
     struct plugin_pending_call *next;
 };
 
+struct plugin_async_complete {
+    struct plugin_module *plugin;
+    char *invocation_id;
+    char *payload_json;
+    char *message;
+    bool ok;
+    struct plugin_async_complete *next;
+};
+
 struct plugin_module {
     struct mcp_plugin_manager *manager;
     char *plugin_id;
@@ -65,6 +74,15 @@ struct plugin_module {
 
 struct mcp_plugin_manager {
     struct mcp_server *server;
+    uv_thread_t loop_thread;
+    bool loop_thread_valid;
+    bool closing;
+    uv_async_t complete_async;
+    bool complete_async_initialized;
+    uv_mutex_t complete_mutex;
+    bool complete_mutex_initialized;
+    struct plugin_async_complete *complete_head;
+    struct plugin_async_complete *complete_tail;
     unsigned int next_plugin_id;
     struct plugin_module *plugins;
 };
@@ -162,6 +180,36 @@ static void pending_call_list_free(struct plugin_pending_call *call)
         pending_call_free(call);
         call = next;
     }
+}
+
+static void plugin_async_complete_free(struct plugin_async_complete *complete)
+{
+    if (!complete)
+        return;
+    free(complete->invocation_id);
+    free(complete->payload_json);
+    free(complete->message);
+    free(complete);
+}
+
+static void plugin_async_complete_list_free(struct plugin_async_complete *complete)
+{
+    while (complete) {
+        struct plugin_async_complete *next = complete->next;
+
+        plugin_async_complete_free(complete);
+        complete = next;
+    }
+}
+
+static bool plugin_manager_on_loop_thread(struct mcp_plugin_manager *manager)
+{
+    uv_thread_t current;
+
+    if (!manager || !manager->loop_thread_valid)
+        return true;
+    current = uv_thread_self();
+    return uv_thread_equal(&current, &manager->loop_thread) != 0;
 }
 
 static int plugin_add_pending_call(struct plugin_module *plugin,
@@ -402,11 +450,10 @@ static json_t *parse_payload_json(const char *payload_json)
     return payload;
 }
 
-static int host_complete_async_ok(void *host_context,
-                                  const char *invocation_id,
-                                  const char *payload_json)
+static int complete_async_ok_on_loop(struct plugin_module *plugin,
+                                     const char *invocation_id,
+                                     const char *payload_json)
 {
-    struct plugin_module *plugin = host_context;
     struct mcp_plugin_manager *manager;
     struct plugin_pending_call *call;
     json_t *payload;
@@ -436,11 +483,10 @@ static int host_complete_async_ok(void *host_context,
     return 0;
 }
 
-static int host_complete_async_error(void *host_context,
-                                     const char *invocation_id,
-                                     const char *message)
+static int complete_async_error_on_loop(struct plugin_module *plugin,
+                                        const char *invocation_id,
+                                        const char *message)
 {
-    struct plugin_module *plugin = host_context;
     struct mcp_plugin_manager *manager;
     struct plugin_pending_call *call;
     json_t *result;
@@ -460,6 +506,122 @@ static int host_complete_async_error(void *host_context,
     if (plugin->in_flight > 0)
         plugin->in_flight--;
     return 0;
+}
+
+static void complete_async_cb(uv_async_t *handle)
+{
+    struct mcp_plugin_manager *manager = handle->data;
+    struct plugin_async_complete *complete;
+
+    if (!manager || !manager->complete_mutex_initialized)
+        return;
+
+    for (;;) {
+        uv_mutex_lock(&manager->complete_mutex);
+        complete = manager->complete_head;
+        if (complete) {
+            manager->complete_head = complete->next;
+            if (!manager->complete_head)
+                manager->complete_tail = NULL;
+            complete->next = NULL;
+        }
+        uv_mutex_unlock(&manager->complete_mutex);
+        if (!complete)
+            break;
+
+        if (complete->ok)
+            complete_async_ok_on_loop(complete->plugin,
+                                      complete->invocation_id,
+                                      complete->payload_json);
+        else
+            complete_async_error_on_loop(complete->plugin,
+                                         complete->invocation_id,
+                                         complete->message);
+        plugin_async_complete_free(complete);
+    }
+}
+
+static void complete_async_close_cb(uv_handle_t *handle)
+{
+    struct mcp_plugin_manager *manager = handle->data;
+
+    if (manager)
+        manager->complete_async_initialized = false;
+}
+
+static int enqueue_async_complete(struct plugin_module *plugin,
+                                  const char *invocation_id,
+                                  const char *payload_json,
+                                  const char *message,
+                                  bool ok)
+{
+    struct mcp_plugin_manager *manager;
+    struct plugin_async_complete *complete;
+
+    if (!plugin || !invocation_id || !plugin->manager)
+        return -1;
+    manager = plugin->manager;
+    if (!manager->complete_mutex_initialized || !manager->complete_async_initialized)
+        return -1;
+
+    complete = calloc(1, sizeof(*complete));
+    if (!complete)
+        return -1;
+    complete->plugin = plugin;
+    complete->ok = ok;
+    complete->invocation_id = mcp_strdup(invocation_id);
+    if (ok)
+        complete->payload_json = mcp_strdup(payload_json ? payload_json : "");
+    else
+        complete->message = mcp_strdup(message ? message : "");
+    if (!complete->invocation_id || (ok && !complete->payload_json) ||
+        (!ok && !complete->message)) {
+        plugin_async_complete_free(complete);
+        return -1;
+    }
+
+    uv_mutex_lock(&manager->complete_mutex);
+    if (manager->closing ||
+        !manager->complete_async_initialized ||
+        uv_is_closing((uv_handle_t *)&manager->complete_async)) {
+        uv_mutex_unlock(&manager->complete_mutex);
+        plugin_async_complete_free(complete);
+        return -1;
+    }
+    if (manager->complete_tail)
+        manager->complete_tail->next = complete;
+    else
+        manager->complete_head = complete;
+    manager->complete_tail = complete;
+    uv_async_send(&manager->complete_async);
+    uv_mutex_unlock(&manager->complete_mutex);
+    return 0;
+}
+
+static int host_complete_async_ok(void *host_context,
+                                  const char *invocation_id,
+                                  const char *payload_json)
+{
+    struct plugin_module *plugin = host_context;
+
+    if (!plugin || !invocation_id)
+        return -1;
+    if (!plugin_manager_on_loop_thread(plugin->manager))
+        return enqueue_async_complete(plugin, invocation_id, payload_json, NULL, true);
+    return complete_async_ok_on_loop(plugin, invocation_id, payload_json);
+}
+
+static int host_complete_async_error(void *host_context,
+                                     const char *invocation_id,
+                                     const char *message)
+{
+    struct plugin_module *plugin = host_context;
+
+    if (!plugin || !invocation_id)
+        return -1;
+    if (!plugin_manager_on_loop_thread(plugin->manager))
+        return enqueue_async_complete(plugin, invocation_id, NULL, message, false);
+    return complete_async_error_on_loop(plugin, invocation_id, message);
 }
 
 static int host_peer_send_frame(void *host_context,
@@ -651,9 +813,41 @@ int mcp_plugin_manager_create(struct mcp_plugin_manager **out, struct mcp_server
         return -1;
 
     manager->server = server;
+    manager->loop_thread = uv_thread_self();
+    manager->loop_thread_valid = true;
     manager->next_plugin_id = 1;
+    if (uv_mutex_init(&manager->complete_mutex) != 0) {
+        free(manager);
+        return -1;
+    }
+    manager->complete_mutex_initialized = true;
+    if (uv_async_init(server->loop, &manager->complete_async, complete_async_cb) != 0) {
+        uv_mutex_destroy(&manager->complete_mutex);
+        free(manager);
+        return -1;
+    }
+    manager->complete_async_initialized = true;
+    manager->complete_async.data = manager;
+    uv_unref((uv_handle_t *)&manager->complete_async);
     *out = manager;
     return 0;
+}
+
+void mcp_plugin_manager_close(struct mcp_plugin_manager *manager)
+{
+    if (!manager)
+        return;
+
+    if (manager->complete_mutex_initialized) {
+        uv_mutex_lock(&manager->complete_mutex);
+        manager->closing = true;
+        uv_mutex_unlock(&manager->complete_mutex);
+    } else {
+        manager->closing = true;
+    }
+    if (manager->complete_async_initialized &&
+        !uv_is_closing((uv_handle_t *)&manager->complete_async))
+        uv_close((uv_handle_t *)&manager->complete_async, complete_async_close_cb);
 }
 
 static int init_linked_plugin(struct mcp_plugin_manager *manager,
@@ -712,6 +906,18 @@ void mcp_plugin_manager_destroy(struct mcp_plugin_manager *manager)
     if (!manager)
         return;
 
+    mcp_plugin_manager_close(manager);
+    while (manager->server &&
+           manager->server->loop &&
+           manager->complete_async_initialized)
+        uv_run(manager->server->loop, UV_RUN_DEFAULT);
+    if (manager->complete_mutex_initialized) {
+        uv_mutex_lock(&manager->complete_mutex);
+        plugin_async_complete_list_free(manager->complete_head);
+        manager->complete_head = NULL;
+        manager->complete_tail = NULL;
+        uv_mutex_unlock(&manager->complete_mutex);
+    }
     while ((plugin = manager->plugins) != NULL) {
         manager->plugins = plugin->next;
         unload_plugin(manager, plugin);
@@ -721,6 +927,10 @@ void mcp_plugin_manager_destroy(struct mcp_plugin_manager *manager)
         free(plugin->plugin_id);
         free(plugin->path);
         free(plugin);
+    }
+    if (manager->complete_mutex_initialized) {
+        uv_mutex_destroy(&manager->complete_mutex);
+        manager->complete_mutex_initialized = false;
     }
     free(manager);
 }

@@ -20,6 +20,7 @@ struct mcp_builtin_plugin_descriptor {
 };
 
 int mcp_plugin_manager_create(struct mcp_plugin_manager **out, struct mcp_server *server);
+void mcp_plugin_manager_close(struct mcp_plugin_manager *manager);
 void mcp_plugin_manager_destroy(struct mcp_plugin_manager *manager);
 
 int mcp_plugin_manager_register_builtin(
