@@ -156,6 +156,27 @@ def assert_tree_equal(src, dst):
             assert sha256(src_file) == sha256(dst_file), (src_file, dst_file)
 
 
+def write_repeated_file(path, size, value):
+    chunk = bytes([value]) * (1024 * 1024)
+    remaining = size
+    with open(path, "wb") as f:
+        while remaining:
+            write_size = min(remaining, len(chunk))
+            f.write(chunk[:write_size])
+            remaining -= write_size
+
+
+def copy_prefix(source, target, size):
+    remaining = size
+    with open(source, "rb") as src, open(target, "wb") as dst:
+        while remaining:
+            chunk = src.read(min(remaining, 1024 * 1024))
+            if not chunk:
+                raise RuntimeError("source ended before resume prefix")
+            dst.write(chunk)
+            remaining -= len(chunk)
+
+
 def main():
     exe = sys.argv[1]
     plugin_path = sys.argv[2]
@@ -293,6 +314,36 @@ def main():
         assert missing_recv["isError"] is True, missing_recv
         assert "Remote path" in missing_recv["content"][0]["text"], missing_recv
 
+        logical_block_size = 64 * 1024 * 1024
+        resume_tail_size = 1024 * 1024
+        resume_size = logical_block_size + resume_tail_size
+        resume_src = file_src_dir / "resume-large.bin"
+        resume_target = Path(tmp) / "resume-large-target.bin"
+        resume_part = Path(str(resume_target) + ".part")
+        write_repeated_file(resume_src, resume_size, ord("r"))
+        copy_prefix(resume_src, resume_part, logical_block_size)
+        with resume_part.open("ab") as f:
+            f.write(b"invalid partial block")
+        resume_large = json_text(
+            call_tool(
+                sock_a,
+                17,
+                "server.send",
+                {
+                    "server_id": peer_b,
+                    "local_path": str(resume_src),
+                    "remote_path": str(resume_target),
+                    "timeout_ms": 120000,
+                },
+                timeout=120.0,
+            )
+        )
+        assert resume_large["files_transferred"] == 1, resume_large
+        assert resume_large["bytes_total"] == resume_size, resume_large
+        assert resume_large["bytes_transferred"] == resume_tail_size, resume_large
+        assert sha256(resume_src) == sha256(resume_target)
+        assert not resume_part.exists(), resume_part
+
         corrupt_src = file_src_dir / "corrupt.bin"
         corrupt_target = Path(tmp) / "corrupt-target.bin"
         corrupt_part = Path(str(corrupt_target) + ".part")
@@ -303,7 +354,7 @@ def main():
             try:
                 transfer["result"] = call_tool(
                     sock_a,
-                    17,
+                    18,
                     "server.send",
                     {
                         "server_id": peer_b,
