@@ -406,6 +406,18 @@ def verify_descriptor_and_auth(exe, config_path):
     assert schema["properties"]["overrides"]["properties"]["execution"][
         "additionalProperties"
     ] is False, schema
+    assert schema["properties"]["overrides"]["properties"]["limits"][
+        "additionalProperties"
+    ] is False, schema
+    assert schema["properties"]["overrides"]["properties"]["isolation"][
+        "additionalProperties"
+    ] is False, schema
+    max_output_options = schema["properties"]["overrides"]["properties"]["max_output_bytes"][
+        "anyOf"
+    ]
+    max_output_integer = next(item for item in max_output_options if item["type"] == "integer")
+    assert max_output_integer["minimum"] == 256, max_output_integer
+    assert max_output_integer["maximum"] == 2147483648, max_output_integer
 
     error = client.control({"action": "get", "token": TOKEN}, expect_error=True)
     assert error == {
@@ -514,6 +526,30 @@ def verify_control_contract(exe, config_path, config):
     ]
     for arguments, field in invalid_requests:
         assert_error_unchanged(client, arguments, field=field)
+
+    for value in ["", 0, [], {}]:
+        assert_error_unchanged(
+            client,
+            update_arguments(state, shell_enabled=value),
+            field="shell_enabled",
+        )
+    for value in [None, "", 0, [], {}]:
+        assert_error_unchanged(
+            client,
+            update_arguments(state, sandbox_enabled=value),
+            field="sandbox_enabled",
+        )
+    for value in [-(2**63) - 1, 2**63]:
+        assert_error_unchanged(
+            client,
+            {
+                "action": "update",
+                "token": TOKEN,
+                "expected_revision": value,
+                "shell_enabled": True,
+            },
+            field=None,
+        )
 
     assert_error_unchanged(
         client,
@@ -688,6 +724,27 @@ def verify_capabilities(exe, config_path, config):
         assert statuses == {"enforced", "unsupported", "ignored", "reject_only"}, statuses
     state = client.control(update_arguments(state, sandbox_enabled=True))
     assert state["sandbox_enabled"] is True, state
+
+    allowed_env_status = nested_get(
+        state["capabilities"], ("execution", "allowed_env")
+    )
+    if allowed_env_status != "unsupported":
+        state = reset_state(client, state)
+        state = client.control(
+            update_arguments(
+                state,
+                overrides={"execution": {"clear_environment": False, "allowed_env": []}},
+            )
+        )
+        assert state["effective"]["execution"]["parent_environment_mode"] == "none", state
+        state = client.control(
+            update_arguments(
+                state,
+                overrides={"execution": {"allowed_env": ["PATH", "PATH"]}},
+            )
+        )
+        assert state["overrides"]["execution"]["allowed_env"] == ["PATH", "PATH"], state
+        assert state["effective"]["execution"]["parent_environment_mode"] == "allowlist", state
     reset_state(client, state)
     client.close()
 
