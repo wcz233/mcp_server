@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 
 
 TOKEN = "s2-token-must-not-appear-7f51b36e"
@@ -917,6 +918,21 @@ def verify_synchronous_bypass(exe, config_path, config):
     result, text = shell_result(client, {"command": command, "timeout_ms": 300001})
     assert result["isError"] is True and "timeout_ms" in text, result
     assert not timeout_marker.exists(), timeout_marker
+
+    lifecycle_marker = config_path.parent / "timeout-lifecycle.marker"
+    lifecycle_marker.unlink(missing_ok=True)
+    command = shell_command(
+        f'ping 127.0.0.1 -n 3 >nul & echo late>"{lifecycle_marker}"',
+        f"sh -c 'sleep 1; touch \"{lifecycle_marker}\"' & wait",
+    )
+    result, text = shell_result(client, {"command": command, "timeout_ms": 50})
+    assert result["isError"] is True, result
+    assert json.loads(text)["timed_out"] is True, text
+    time.sleep(2.2 if os.name == "nt" else 1.2)
+    marker_created = lifecycle_marker.exists()
+    lifecycle_marker.unlink(missing_ok=True)
+    assert not marker_created, lifecycle_marker
+
     assert_error_unchanged(
         client,
         update_arguments(state, overrides={"max_output_bytes": 2147483649}),
