@@ -192,6 +192,42 @@ mcp_stdio_proxy_adapter\build\Release\mcp_stdio_proxy_adapter.exe
 
 `system.shell_exec` 默认禁用。只有在可信环境中才设置 `MCP_ENABLE_SHELL_EXEC=1`。
 
+### Runtime Sandbox Control
+
+`system.sandbox_ctl` 在 `tools/list` 中始终可见，但默认不可调用。只有同时在
+启动 server 前设置以下两个环境变量时，持有 bearer token 的调用方才能使用它：
+
+```text
+MCP_ENABLE_SANDBOX_CTL=1
+MCP_SANDBOX_CTL_TOKEN=<non-empty bearer token>
+```
+
+`MCP_ENABLE_SANDBOX_CTL` 只能是未设置、空、`0` 或 `1`；设为 `1` 时 token 必须
+非空，否则 server 启动失败。token 只适合可信 stdio/pipe、loopback，或已由外部
+加密隧道保护的连接。不要在未加密且可被其他主体访问的 TCP listener 上发送它。
+
+控制状态只存在于当前 server 进程内，不写回 JSON 配置；重启后 revision 恢复为
+`0`，runtime overrides 清空。`sandbox_enabled=false` 只旁路本工具可配置的限制，
+不是强隔离开关，也不会提升 mcp_server 的 OS 权限。
+
+使用前先读取状态，再通过 revision 执行 compare-and-swap 更新或重置：
+
+```json
+{"action":"get","token":"<token>"}
+```
+
+```json
+{"action":"update","token":"<token>","expected_revision":0,"shell_enabled":true,"overrides":{"max_timeout_ms":1000}}
+```
+
+```json
+{"action":"reset","token":"<token>","expected_revision":1}
+```
+
+更新和 reset 只影响之后的新 `system.shell_exec` 或 Unix `system.shell_start` 执行，
+不会终止既有 job。Windows 上五项 rlimit 与非空身份切换不支持；
+`require_non_root` 是 reject-only，`system.shell_start` 仍未实现。
+
 ### Linux
 
 把 `MCP_TCP_HOST` 改成 Codex 所在机器能访问到的地址：
