@@ -162,6 +162,12 @@ struct shell_job {
     struct shell_job *next;
 };
 
+struct mcp_shell_sandbox_control {
+    bool enabled;
+    char *token;
+    size_t token_length;
+};
+
 struct mcp_shell_job_store {
     struct mcp_server *server;
     uv_loop_t *loop;
@@ -175,6 +181,73 @@ struct mcp_shell_job_store {
 };
 
 static int shell_exec_prepare_working_directory(const struct shell_exec_config *cfg);
+
+static void shell_sandbox_token_zero(char *token, size_t token_length)
+{
+    volatile unsigned char *bytes = (volatile unsigned char *)token;
+    size_t i;
+
+    for (i = 0; i < token_length; i++)
+        bytes[i] = 0;
+}
+
+int mcp_shell_sandbox_control_create(struct mcp_shell_sandbox_control **out)
+{
+    const char *enable_value;
+    const char *token;
+    struct mcp_shell_sandbox_control *control;
+
+    if (!out)
+        return -1;
+    *out = NULL;
+
+    enable_value = getenv("MCP_ENABLE_SANDBOX_CTL");
+    if (enable_value && enable_value[0] != '\0' &&
+        strcmp(enable_value, "0") != 0 && strcmp(enable_value, "1") != 0) {
+        fputs("MCP_ENABLE_SANDBOX_CTL must be unset, empty, 0, or 1\n", stderr);
+        return -1;
+    }
+
+    control = calloc(1, sizeof(*control));
+    if (!control)
+        return -1;
+
+    control->enabled = enable_value && strcmp(enable_value, "1") == 0;
+    if (control->enabled) {
+        token = getenv("MCP_SANDBOX_CTL_TOKEN");
+        if (!token || token[0] == '\0') {
+            fputs("MCP_SANDBOX_CTL_TOKEN must be non-empty when MCP_ENABLE_SANDBOX_CTL=1\n",
+                  stderr);
+            free(control);
+            return -1;
+        }
+
+        control->token = mcp_strdup(token);
+        if (!control->token) {
+            free(control);
+            return -1;
+        }
+        control->token_length = strlen(token);
+    }
+
+    *out = control;
+    return 0;
+}
+
+void mcp_shell_sandbox_control_destroy(struct mcp_shell_sandbox_control *control)
+{
+    if (!control)
+        return;
+
+    shell_sandbox_token_zero(control->token, control->token_length);
+    free(control->token);
+    free(control);
+}
+
+bool mcp_shell_sandbox_control_is_enabled(const struct mcp_shell_sandbox_control *control)
+{
+    return control && control->enabled;
+}
 
 static const char *shell_job_state_name(enum shell_job_state state)
 {

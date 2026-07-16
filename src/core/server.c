@@ -891,12 +891,17 @@ int mcp_server_init(struct mcp_server **out, uv_loop_t *loop, struct mcp_server_
     server->stdio_session.state = MCP_SESSION_NOT_INITIALIZED;
     mcp_in_flight_init(&server->in_flight);
 
+    if (mcp_shell_sandbox_control_create(&server->sandbox_control) != 0) {
+        mcp_server_destroy(server);
+        return -1;
+    }
+
     if (mcp_stdio_transport_create(&server->stdio,
                                    loop,
                                    (struct mcp_stdio_transport_config){
                                        .max_line_bytes = config.max_line_bytes,
                                    }) != 0) {
-        free(server);
+        mcp_server_destroy(server);
         return -1;
     }
 
@@ -906,8 +911,7 @@ int mcp_server_init(struct mcp_server **out, uv_loop_t *loop, struct mcp_server_
                                  (struct mcp_udp_transport_config){
                                      .max_datagram_bytes = config.max_line_bytes,
                                  }) != 0) {
-        mcp_stdio_transport_destroy(server->stdio);
-        free(server);
+        mcp_server_destroy(server);
         return -1;
     }
 #endif
@@ -966,6 +970,7 @@ void mcp_server_destroy(struct mcp_server *server)
     mcp_plugin_manager_destroy(server->plugin_manager);
     mcp_server_discovery_destroy(server->discovery);
     mcp_shell_jobs_destroy(server->shell_jobs);
+    mcp_shell_sandbox_control_destroy(server->sandbox_control);
     mcp_peer_transport_destroy(server->peer_transport);
     mcp_tool_registry_destroy(server->registry);
     mcp_in_flight_destroy(&server->in_flight);
