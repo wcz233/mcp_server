@@ -314,6 +314,46 @@ def main():
         assert missing_recv["isError"] is True, missing_recv
         assert "Remote path" in missing_recv["content"][0]["text"], missing_recv
 
+        window_size = 16 * 1024 * 1024
+        window_src = file_src_dir / "window-src.bin"
+        window_target = Path(tmp) / "window-target.bin"
+        window_pull = Path(tmp) / "window-pull"
+        window_pull.mkdir()
+        write_repeated_file(window_src, window_size, ord("w"))
+        window_send = json_text(
+            call_tool(
+                sock_a,
+                19,
+                "server.send",
+                {
+                    "server_id": peer_b,
+                    "local_path": str(window_src),
+                    "remote_path": str(window_target),
+                    "timeout_ms": 60000,
+                },
+                timeout=60.0,
+            )
+        )
+        assert window_send["bytes_transferred"] == window_size, window_send
+        assert sha256(window_src) == sha256(window_target)
+        window_recv = json_text(
+            call_tool(
+                sock_a,
+                20,
+                "server.recv",
+                {
+                    "server_id": peer_b,
+                    "remote_path": str(window_target),
+                    "local_path": str(window_pull),
+                    "timeout_ms": 60000,
+                },
+                timeout=60.0,
+            )
+        )
+        window_pulled = window_pull / window_target.name
+        assert window_recv["bytes_transferred"] == window_size, window_recv
+        assert sha256(window_target) == sha256(window_pulled)
+
         logical_block_size = 64 * 1024 * 1024
         resume_tail_size = 1024 * 1024
         resume_size = logical_block_size + resume_tail_size

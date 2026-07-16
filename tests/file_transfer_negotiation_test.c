@@ -6,6 +6,7 @@
 struct negotiation_test_context {
     unsigned long long now_ms;
     bool block_ack;
+    bool chunk_window;
     unsigned int hello_frames;
     unsigned int fetch_frames;
     unsigned int errors;
@@ -56,7 +57,11 @@ static int negotiation_test_has_capability(void *host_context,
     struct negotiation_test_context *context = host_context;
 
     (void)server_id;
-    return strcmp(capability, MFT_CAP_BLOCK_ACK) == 0 && context->block_ack;
+    if (strcmp(capability, MFT_CAP_BLOCK_ACK) == 0)
+        return context->block_ack;
+    if (strcmp(capability, MFT_CAP_CHUNK_WINDOW) == 0)
+        return context->chunk_window;
+    return 0;
 }
 
 static int negotiation_test_set_capability(void *host_context,
@@ -69,6 +74,8 @@ static int negotiation_test_set_capability(void *host_context,
     (void)server_id;
     if (strcmp(capability, MFT_CAP_BLOCK_ACK) == 0)
         context->block_ack = enabled != 0;
+    else if (strcmp(capability, MFT_CAP_CHUNK_WINDOW) == 0)
+        context->chunk_window = enabled != 0;
     return 0;
 }
 
@@ -116,14 +123,25 @@ int main(void)
     if (invoke_recv("resume-on-hello") != MCP_PLUGIN_CALL_PENDING ||
         !g_pending_negotiations || g_transfers || context.hello_frames != 1)
         goto cleanup;
-    hello = json_pack("{s:[s]}", "capabilities", MFT_CAP_BLOCK_ACK);
+    hello = json_pack("{s:[s,s]}",
+                      "capabilities",
+                      MFT_CAP_BLOCK_ACK,
+                      MFT_CAP_CHUNK_WINDOW);
     if (!hello)
         goto cleanup;
     handle_hello(7, hello);
     json_decref(hello);
     hello = NULL;
-    if (!context.block_ack || g_pending_negotiations || !g_transfers ||
+    if (!context.block_ack || !context.chunk_window ||
+        g_pending_negotiations || !g_transfers ||
         context.hello_frames != 2 || context.fetch_frames != 1)
+        goto cleanup;
+    free_test_transfers();
+
+    context.chunk_window = false;
+    if (invoke_recv("legacy-block-ack") != MCP_PLUGIN_CALL_PENDING ||
+        g_pending_negotiations || !g_transfers ||
+        context.hello_frames != 2 || context.fetch_frames != 2)
         goto cleanup;
     free_test_transfers();
 
