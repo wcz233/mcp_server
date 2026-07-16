@@ -622,9 +622,12 @@ def verify_control_contract(exe, config_path, config):
             client,
             {"command": "echo timeout-valid", "timeout_ms": timeout_value},
         )
-        assert result["isError"] is False, (timeout_value, result)
         payload = json.loads(text)
-        assert payload["stdout"].strip() == "timeout-valid", payload
+        if timeout_value == 1 and result["isError"] is True:
+            assert payload["timed_out"] is True, payload
+        else:
+            assert result["isError"] is False, (timeout_value, result)
+            assert payload["stdout"].strip() == "timeout-valid", payload
 
     for index, timeout_value in enumerate((None, "100", 0, 201, 300001), start=1):
         marker = config_path.parent / f"invalid-timeout-{index}.marker"
