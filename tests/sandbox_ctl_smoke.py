@@ -60,7 +60,7 @@ def write_config(path, value):
 
 
 class Client:
-    def __init__(self, exe, env):
+    def __init__(self, exe, env, preexec_fn=None):
         self.stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
         self.proc = subprocess.Popen(
             [exe],
@@ -70,6 +70,7 @@ class Client:
             env=env,
             text=True,
             encoding="utf-8",
+            preexec_fn=preexec_fn,
         )
         self.next_id = 1
         self.responses = []
@@ -858,6 +859,70 @@ def verify_reject_only_execution(exe, config_path, config):
     client.close()
 
 
+def verify_windows_async_unsupported(exe, config_path):
+    if os.name != "nt":
+        return
+
+    client = Client(exe, control_env(config_path, gate="1", token=TOKEN))
+    marker = config_path.parent / "windows-async-unsupported.marker"
+    marker.unlink(missing_ok=True)
+    result, text = shell_result(
+        client,
+        {"command": f'echo must-not-run>"{marker}"'},
+    )
+    assert result["isError"] is True, result
+    assert "not implemented" in text, text
+    assert not marker.exists(), marker
+    client.close()
+
+
+def verify_isolated_memory_failure(exe, config_path, config):
+    if os.name == "nt":
+        return
+
+    try:
+        import resource
+    except ImportError:
+        print("SKIP isolated memory failure: resource module unavailable")
+        return
+    if not hasattr(resource, "RLIMIT_AS"):
+        print("SKIP isolated memory failure: RLIMIT_AS unavailable")
+        return
+
+    write_config(config_path, config)
+    server_limit = 24 * 1024 * 1024
+
+    def limit_server_memory():
+        resource.setrlimit(resource.RLIMIT_AS, (server_limit, server_limit))
+
+    client = Client(
+        exe,
+        control_env(config_path, gate="1", token=TOKEN),
+        preexec_fn=limit_server_memory,
+    )
+    try:
+        state = client.get()
+        state = client.control(
+            update_arguments(
+                state,
+                shell_enabled=True,
+                overrides={"max_output_bytes": 16 * 1024 * 1024},
+            )
+        )
+        revision = state["revision"]
+        result, text = shell_result(
+            client,
+            {"command": "head -c 16777216 /dev/zero", "timeout_ms": 5000},
+        )
+        assert result["isError"] is True, result
+        assert text, result
+        after = client.get()
+        assert after["revision"] == revision, after
+        assert after["overrides"] == state["overrides"], after
+    finally:
+        client.close()
+
+
 def verify_synchronous_bypass(exe, config_path, config):
     write_config(config_path, config)
     env = control_env(config_path, gate="1", token=TOKEN)
@@ -1304,11 +1369,13 @@ def main():
         verify_control_contract(exe, config_path, copy.deepcopy(config))
         verify_capabilities(exe, config_path, copy.deepcopy(config))
         verify_reject_only_execution(exe, config_path, copy.deepcopy(config))
+        verify_windows_async_unsupported(exe, config_path)
         verify_synchronous_bypass(exe, config_path, copy.deepcopy(config))
         verify_async_effective_policy(exe, config_path, copy.deepcopy(config))
         verify_async_job_snapshot_boundary(exe, config_path, copy.deepcopy(config))
         verify_restart_clears_state(exe, config_path, copy.deepcopy(config))
         verify_base_drift_and_conflict(exe, config_path, copy.deepcopy(config))
+        verify_isolated_memory_failure(exe, config_path, copy.deepcopy(config))
     return 0
 
 
