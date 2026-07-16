@@ -86,6 +86,25 @@ int main(void)
                      &entry,
                      sizeof(expected) - 1) != 0)
         goto cleanup;
+    entry.block_crc32 = true;
+    for (i = 0; i < entry.block_count; i++)
+        bytes_crc32(expected + blocks[i].offset, 4, blocks[i].hash);
+    if (check_resume(fp,
+                     bad_second,
+                     sizeof(bad_second) - 1,
+                     &entry,
+                     4) != 0 ||
+        check_resume(fp,
+                     partial_third,
+                     sizeof(partial_third) - 1,
+                     &entry,
+                     8) != 0 ||
+        check_resume(fp,
+                     expected,
+                     sizeof(expected) - 1,
+                     &entry,
+                     sizeof(expected) - 1) != 0)
+        goto cleanup;
     rc = 0;
 
 cleanup:

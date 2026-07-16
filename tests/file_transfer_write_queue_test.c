@@ -126,6 +126,8 @@ static int run_parallel_window_test(void)
     if (!ctx)
         goto cleanup_file;
     ctx->chunk_window_enabled = true;
+    ctx->crc32_enabled = true;
+    ctx->entries[0].block_crc32 = true;
 
     expected = malloc(total_size);
     actual = malloc(total_size);
@@ -133,7 +135,7 @@ static int run_parallel_window_test(void)
     if (!expected || !actual || !frame)
         goto cleanup_transfer;
     memset(expected, 0x5a, total_size);
-    bytes_sha256(expected, total_size, block_hash);
+    bytes_crc32(expected, total_size, block_hash);
     snprintf(ctx->entries[0].blocks[0].hash,
              sizeof(ctx->entries[0].blocks[0].hash),
              "%s",
@@ -156,8 +158,8 @@ static int run_parallel_window_test(void)
     memcpy(frame + 88, transfer_id, sizeof(transfer_id) - 1);
     data = frame + 88 + sizeof(transfer_id) - 1;
     memset(data, 0x5a, MFT_MAX_CHUNK);
-    bytes_sha256(data, MFT_MAX_CHUNK, chunk_hash);
-    memcpy(frame + 24, chunk_hash, 64);
+    bytes_crc32(data, MFT_MAX_CHUNK, chunk_hash);
+    memcpy(frame + 24, chunk_hash, 8);
 
     for (i = 0; i < chunk_count; i++) {
         write_u64_be(frame + 12, (uint64_t)i * MFT_MAX_CHUNK);

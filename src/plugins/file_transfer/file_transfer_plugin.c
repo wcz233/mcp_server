@@ -164,6 +164,7 @@ typedef int mode_t;
 #define MFT_CAP_RESUME "mft.v1.resume"
 #define MFT_CAP_BLOCK_ACK "mft.v1.block_ack"
 #define MFT_CAP_CHUNK_WINDOW "mft.v1.chunk_window"
+#define MFT_CAP_CRC32 "mft.v1.crc32"
 #define MFT_MAX_FRAME_SIZE (1024u * 1024u)
 #define MFT_MAX_MANIFEST_ENTRIES 4096u
 #define MFT_MAX_BLOCKS_PER_FILE 8192u
@@ -222,6 +223,7 @@ struct block_entry {
     bool receive_failed;
     bool receive_hash_started;
     bool receive_hash_failed;
+    uint32_t receive_crc32;
     uint64_t send_next_offset;
     uint64_t receive_next_offset;
     uint64_t receive_queued_offset;
@@ -242,6 +244,7 @@ struct manifest_entry {
     size_t block_count;
     int receive_fd;
     bool receive_fd_open;
+    bool block_crc32;
     uint64_t send_window_bytes;
     size_t receive_window_pending;
 };
@@ -342,6 +345,7 @@ struct transfer_context {
     bool free_after_io;
     bool completed;
     bool chunk_window_enabled;
+    bool crc32_enabled;
     bool prepare_queued;
     bool prepare_fetch;
     bool prepare_receive;
@@ -646,12 +650,47 @@ static void bytes_sha256(const unsigned char *data, size_t len, char out[65])
     hash_to_hex(hash, out);
 }
 
+static uint32_t crc32_update(uint32_t crc, const unsigned char *data, size_t len)
+{
+    static const uint32_t table[16] = {
+        0x00000000u, 0x1db71064u, 0x3b6e20c8u, 0x26d930acu,
+        0x76dc4190u, 0x6b6b51f4u, 0x4db26158u, 0x5005713cu,
+        0xedb88320u, 0xf00f9344u, 0xd6d6a3e8u, 0xcb61b38cu,
+        0x9b64c2b0u, 0x86d3d2d4u, 0xa00ae278u, 0xbdbdf21cu,
+    };
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        crc ^= data[i];
+        crc = (crc >> 4) ^ table[crc & 0x0fu];
+        crc = (crc >> 4) ^ table[crc & 0x0fu];
+    }
+    return crc;
+}
+
+static void crc32_to_hex(uint32_t crc, char out[9])
+{
+    static const char hex[] = "0123456789abcdef";
+    size_t i;
+
+    crc ^= UINT32_MAX;
+    for (i = 0; i < 8; i++)
+        out[i] = hex[(crc >> (28 - i * 4)) & 0x0fu];
+    out[8] = '\0';
+}
+
+static void bytes_crc32(const unsigned char *data, size_t len, char out[9])
+{
+    crc32_to_hex(crc32_update(UINT32_MAX, data, len), out);
+}
+
 static int fill_file_hashes(FILE *fp, struct manifest_entry *entry)
 {
     unsigned char buf[32768];
     unsigned char hash[32];
     struct sha256_ctx file_ctx;
     struct sha256_ctx block_ctx;
+    uint32_t block_crc32 = UINT32_MAX;
     uint64_t remaining = entry->size;
     uint64_t block_remaining = 0;
     size_t block_index = 0;
@@ -675,19 +714,29 @@ static int fill_file_hashes(FILE *fp, struct manifest_entry *entry)
             if (!block_active) {
                 if (block_index >= entry->block_count)
                     return -1;
-                sha256_init(&block_ctx);
+                if (entry->block_crc32)
+                    block_crc32 = UINT32_MAX;
+                else
+                    sha256_init(&block_ctx);
                 block_remaining = entry->blocks[block_index].size;
                 block_active = true;
             }
             take = n - used;
             if (take > block_remaining)
                 take = (size_t)block_remaining;
-            sha256_update(&block_ctx, buf + used, take);
+            if (entry->block_crc32)
+                block_crc32 = crc32_update(block_crc32, buf + used, take);
+            else
+                sha256_update(&block_ctx, buf + used, take);
             used += take;
             block_remaining -= take;
             if (block_remaining == 0) {
-                sha256_final(&block_ctx, hash);
-                hash_to_hex(hash, entry->blocks[block_index].hash);
+                if (entry->block_crc32)
+                    crc32_to_hex(block_crc32, entry->blocks[block_index].hash);
+                else {
+                    sha256_final(&block_ctx, hash);
+                    hash_to_hex(hash, entry->blocks[block_index].hash);
+                }
                 block_index++;
                 block_active = false;
             }
@@ -1126,6 +1175,30 @@ static int stream_range_sha256(FILE *fp,
     return 0;
 }
 
+static int stream_range_crc32(FILE *fp,
+                              uint64_t offset,
+                              uint64_t size,
+                              char out[9])
+{
+    unsigned char buffer[32768];
+    uint32_t crc = UINT32_MAX;
+    uint64_t remaining = size;
+
+    if (mft_seek_stream(fp, offset) != 0)
+        return -1;
+    while (remaining > 0) {
+        size_t chunk = remaining > sizeof(buffer) ? sizeof(buffer) : (size_t)remaining;
+        size_t read_count = fread(buffer, 1, chunk, fp);
+
+        if (read_count != chunk)
+            return -1;
+        crc = crc32_update(crc, buffer, read_count);
+        remaining -= read_count;
+    }
+    crc32_to_hex(crc, out);
+    return 0;
+}
+
 static int truncate_stream(FILE *fp, uint64_t size)
 {
     mft_file_offset_t native_size;
@@ -1156,7 +1229,10 @@ static int validated_resume_stream(FILE *fp,
 
         if (block->offset > part_size || block->size > part_size - block->offset)
             break;
-        if (stream_range_sha256(fp, block->offset, block->size, hash) != 0)
+        if ((entry->block_crc32 &&
+             stream_range_crc32(fp, block->offset, block->size, hash) != 0) ||
+            (!entry->block_crc32 &&
+             stream_range_sha256(fp, block->offset, block->size, hash) != 0))
             return -1;
         if (strcmp(hash, block->hash) != 0)
             break;
@@ -1280,7 +1356,10 @@ static int copy_file_range_chunks(FILE *fp,
             return -1;
         if (header_len > MFT_MAX_FRAME_SIZE || n > MFT_MAX_FRAME_SIZE - header_len)
             return -1;
-        bytes_sha256(buf, n, chunk_hash);
+        if (ctx->crc32_enabled)
+            bytes_crc32(buf, n, chunk_hash);
+        else
+            bytes_sha256(buf, n, chunk_hash);
         frame = malloc(header_len + n);
         if (!frame)
             return -1;
@@ -1292,7 +1371,8 @@ static int copy_file_range_chunks(FILE *fp,
         write_u32_be(frame + 8, stream_id);
         write_u64_be(frame + 12, pos);
         write_u32_be(frame + 20, (uint32_t)n);
-        memcpy(frame + 24, chunk_hash, 64);
+        memset(frame + 24, 0, 64);
+        memcpy(frame + 24, chunk_hash, ctx->crc32_enabled ? 8u : 64u);
         memcpy(frame + 88, transfer_id, tid_len);
         memcpy(frame + header_len, buf, n);
         mft_unlock();
@@ -1415,6 +1495,7 @@ static int append_entry(struct manifest_entry **entries,
 
 static int build_entry(const char *path,
                        const char *relpath,
+                       bool block_crc32,
                        struct manifest_entry *entry)
 {
     struct stat st;
@@ -1446,6 +1527,7 @@ static int build_entry(const char *path,
         return -2;
     }
     entry->type = 'f';
+    entry->block_crc32 = block_crc32;
     if (st.st_size < 0) {
         free(entry->relpath);
         memset(entry, 0, sizeof(*entry));
@@ -1503,6 +1585,7 @@ static int build_entry(const char *path,
 
 static int scan_path(const char *root,
                      const char *relpath,
+                     bool block_crc32,
                      struct manifest_entry **entries,
                      size_t *count,
                      size_t *capacity)
@@ -1517,7 +1600,7 @@ static int scan_path(const char *root,
         return -1;
     if (join_path(path, sizeof(path), root, relpath) != 0)
         return -1;
-    rc = build_entry(path, relpath, &entry);
+    rc = build_entry(path, relpath, block_crc32, &entry);
     if (rc != 0)
         return rc;
     if (append_entry(entries, count, capacity, &entry) != 0) {
@@ -1545,7 +1628,7 @@ static int scan_path(const char *root,
             closedir(dir);
             return -1;
         }
-        if (scan_path(root, child_rel, entries, count, capacity) != 0) {
+        if (scan_path(root, child_rel, block_crc32, entries, count, capacity) != 0) {
             closedir(dir);
             return -1;
         }
@@ -1666,6 +1749,7 @@ static int validate_manifest_bounds(json_t *array)
 }
 
 static int manifest_to_entries(json_t *manifest,
+                               bool block_crc32,
                                struct manifest_entry **out_entries,
                                size_t *out_count)
 {
@@ -1726,6 +1810,7 @@ static int manifest_to_entries(json_t *manifest,
                 return -1;
             }
             snprintf(entry->hash, sizeof(entry->hash), "%s", json_string_value(hash));
+            entry->block_crc32 = block_crc32;
             entry->block_count = json_array_size(blocks);
             if (entry->block_count > MFT_MAX_BLOCKS_PER_FILE ||
                 (entry->size == 0 && entry->block_count != 0) ||
@@ -1758,7 +1843,7 @@ static int manifest_to_entries(json_t *manifest,
                 if (json_nonnegative_u64(offset, &block->offset) != 0 ||
                     json_nonnegative_u64(block_size, &block->size) != 0 ||
                     !json_is_string(block_hash) ||
-                    strlen(json_string_value(block_hash)) != 64) {
+                    strlen(json_string_value(block_hash)) != (block_crc32 ? 8u : 64u)) {
                     free_entries(entries, count + 1);
                     return -1;
                 }
@@ -1787,7 +1872,7 @@ static int manifest_to_entries(json_t *manifest,
 
 static int send_hello(unsigned int server_id)
 {
-    json_t *payload = json_pack("{s:i,s:[s,s,s,s],s:i,s:i,s:i,s:i}",
+    json_t *payload = json_pack("{s:i,s:[s,s,s,s,s],s:i,s:i,s:i,s:i}",
                                 "version",
                                 1,
                                 "capabilities",
@@ -1795,6 +1880,7 @@ static int send_hello(unsigned int server_id)
                                 MFT_CAP_RESUME,
                                 MFT_CAP_BLOCK_ACK,
                                 MFT_CAP_CHUNK_WINDOW,
+                                MFT_CAP_CRC32,
                                 "max_frame_size",
                                 (int)MFT_MAX_FRAME_SIZE,
                                 "initial_session_window",
@@ -1963,7 +2049,8 @@ static void handle_hello(unsigned int server_id, json_t *payload)
         if (strcmp(name, MFT_CAP_WHOLE_FILE) == 0 ||
             strcmp(name, MFT_CAP_RESUME) == 0 ||
             strcmp(name, MFT_CAP_BLOCK_ACK) == 0 ||
-            strcmp(name, MFT_CAP_CHUNK_WINDOW) == 0) {
+            strcmp(name, MFT_CAP_CHUNK_WINDOW) == 0 ||
+            strcmp(name, MFT_CAP_CRC32) == 0) {
             if (!g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
                                                               server_id,
                                                               name))
@@ -2897,7 +2984,10 @@ static void receive_write_work(uv_work_t *req)
     struct receive_write_job *job = req->data;
     char actual_hash[65];
 
-    bytes_sha256(job->data, job->data_len, actual_hash);
+    if (job->ctx->crc32_enabled)
+        bytes_crc32(job->data, job->data_len, actual_hash);
+    else
+        bytes_sha256(job->data, job->data_len, actual_hash);
     if (strcmp(actual_hash, job->chunk_hash) != 0) {
         job->result = RECEIVE_WRITE_CHUNK_MISMATCH;
         return;
@@ -3022,6 +3112,15 @@ static int commit_receive_write_job(struct transfer_context *ctx,
         !block->receive_hash_started || block->receive_hash_failed ||
         job->offset != block->receive_next_offset) {
         nack = true;
+    } else if (ctx->crc32_enabled) {
+        block->receive_crc32 = crc32_update(block->receive_crc32,
+                                            job->data,
+                                            job->data_len);
+        if (job->block_tail) {
+            crc32_to_hex(block->receive_crc32, actual_hash);
+            if (strcmp(actual_hash, job->block_hash) != 0)
+                nack = true;
+        }
     } else {
         sha256_update(&block->receive_hash_ctx, job->data, job->data_len);
         if (job->block_tail) {
@@ -3782,6 +3881,7 @@ static int prepare_source_entries(struct transfer_context *ctx)
         ctx->local_path = root;
         if (scan_path(ctx->local_path,
                       ctx->source_name,
+                      ctx->crc32_enabled,
                       &ctx->entries,
                       &ctx->entry_count,
                       &capacity) != 0)
@@ -3790,6 +3890,7 @@ static int prepare_source_entries(struct transfer_context *ctx)
         if (!S_ISREG(st.st_mode) ||
             scan_path(ctx->local_path,
                       ".",
+                      ctx->crc32_enabled,
                       &ctx->entries,
                       &ctx->entry_count,
                       &capacity) != 0)
@@ -4014,6 +4115,11 @@ static int start_send(const char *invocation_id,
     ctx->local_path = mft_strdup(local_path);
     ctx->remote_path = mft_strdup(remote_path);
     ctx->server_id = server_id;
+    ctx->crc32_enabled =
+        g_plugin.host && g_plugin.host->peer_transport_has_capability &&
+        g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
+                                                     server_id,
+                                                     MFT_CAP_CRC32);
     ctx->timeout_ms = timeout_ms;
     ctx->started_ms = g_plugin.host->now_ms(g_plugin.host->host_context);
     strcpy(ctx->direction, "send");
@@ -4055,6 +4161,11 @@ static int start_recv(const char *invocation_id,
     ctx->remote_path = mft_strdup(remote_path);
     ctx->source_name = path_remote_basename_dup(remote_path);
     ctx->server_id = server_id;
+    ctx->crc32_enabled =
+        g_plugin.host && g_plugin.host->peer_transport_has_capability &&
+        g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
+                                                     server_id,
+                                                     MFT_CAP_CRC32);
     ctx->timeout_ms = timeout_ms;
     ctx->started_ms = g_plugin.host->now_ms(g_plugin.host->host_context);
     strcpy(ctx->direction, "receive");
@@ -4143,10 +4254,15 @@ static void handle_offer(unsigned int server_id, json_t *payload)
     char target_root[PATH_MAX];
     const char *source_name_value = NULL;
     bool created_ctx = false;
+    bool crc32_enabled =
+        g_plugin.host && g_plugin.host->peer_transport_has_capability &&
+        g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
+                                                     server_id,
+                                                     MFT_CAP_CRC32);
     char *transfer_id_value = NULL;
 
     if (!json_is_string(transfer_id) || !json_is_string(remote_path) ||
-        manifest_to_entries(manifest, &entries, &count) != 0)
+        manifest_to_entries(manifest, crc32_enabled, &entries, &count) != 0)
         return;
     transfer_id_value = mft_strdup(json_string_value(transfer_id));
     if (!transfer_id_value) {
@@ -4262,6 +4378,7 @@ static void handle_offer(unsigned int server_id, json_t *payload)
         g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
                                                      server_id,
                                                      MFT_CAP_CHUNK_WINDOW);
+    ctx->crc32_enabled = crc32_enabled;
     ctx->timeout_ms = payload_timeout_ms(payload);
     ctx->entries = entries;
     ctx->entry_count = count;
@@ -4313,6 +4430,11 @@ static void handle_fetch_request(unsigned int server_id, json_t *payload)
     ctx->local_path = mft_strdup(json_string_value(remote_path));
     ctx->remote_path = mft_strdup(json_string_value(local_path));
     ctx->server_id = server_id;
+    ctx->crc32_enabled =
+        g_plugin.host && g_plugin.host->peer_transport_has_capability &&
+        g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
+                                                     server_id,
+                                                     MFT_CAP_CRC32);
     ctx->timeout_ms = payload_timeout_ms(payload);
     ctx->started_ms = g_plugin.host->now_ms(g_plugin.host->host_context);
     ctx->prepare_fetch = true;
@@ -4400,6 +4522,22 @@ static bool valid_frame_envelope(const unsigned char *payload, size_t len)
 {
     return payload && len >= 8 && len <= MFT_MAX_FRAME_SIZE &&
            memcmp(payload, MFT_MAGIC, 4) == 0 && payload[4] == MFT_VERSION;
+}
+
+static bool valid_crc32_field(const unsigned char field[64])
+{
+    size_t i;
+
+    for (i = 0; i < 8; i++) {
+        if (!((field[i] >= '0' && field[i] <= '9') ||
+              (field[i] >= 'a' && field[i] <= 'f')))
+            return false;
+    }
+    for (i = 8; i < 64; i++) {
+        if (field[i] != 0)
+            return false;
+    }
+    return true;
 }
 
 static int parse_data_frame(const unsigned char *payload,
@@ -4495,8 +4633,15 @@ static void handle_data(unsigned int server_id,
         block_offset = block->offset;
         block_size = block->size;
         snprintf(block_hash, sizeof(block_hash), "%s", block->hash);
+        if (ctx->crc32_enabled && !valid_crc32_field(frame.chunk_hash)) {
+            mft_unlock();
+            return;
+        }
         if (offset == block->offset && !block->receive_hash_started) {
-            sha256_init(&block->receive_hash_ctx);
+            if (ctx->crc32_enabled)
+                block->receive_crc32 = UINT32_MAX;
+            else
+                sha256_init(&block->receive_hash_ctx);
             block->receive_hash_started = true;
             block->receive_hash_failed = false;
             block->receive_next_offset = block->offset;

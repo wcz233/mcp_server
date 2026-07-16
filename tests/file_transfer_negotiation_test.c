@@ -7,6 +7,7 @@ struct negotiation_test_context {
     unsigned long long now_ms;
     bool block_ack;
     bool chunk_window;
+    bool crc32;
     unsigned int hello_frames;
     unsigned int fetch_frames;
     unsigned int errors;
@@ -61,6 +62,8 @@ static int negotiation_test_has_capability(void *host_context,
         return context->block_ack;
     if (strcmp(capability, MFT_CAP_CHUNK_WINDOW) == 0)
         return context->chunk_window;
+    if (strcmp(capability, MFT_CAP_CRC32) == 0)
+        return context->crc32;
     return 0;
 }
 
@@ -76,6 +79,8 @@ static int negotiation_test_set_capability(void *host_context,
         context->block_ack = enabled != 0;
     else if (strcmp(capability, MFT_CAP_CHUNK_WINDOW) == 0)
         context->chunk_window = enabled != 0;
+    else if (strcmp(capability, MFT_CAP_CRC32) == 0)
+        context->crc32 = enabled != 0;
     return 0;
 }
 
@@ -123,24 +128,28 @@ int main(void)
     if (invoke_recv("resume-on-hello") != MCP_PLUGIN_CALL_PENDING ||
         !g_pending_negotiations || g_transfers || context.hello_frames != 1)
         goto cleanup;
-    hello = json_pack("{s:[s,s]}",
+    hello = json_pack("{s:[s,s,s]}",
                       "capabilities",
                       MFT_CAP_BLOCK_ACK,
-                      MFT_CAP_CHUNK_WINDOW);
+                      MFT_CAP_CHUNK_WINDOW,
+                      MFT_CAP_CRC32);
     if (!hello)
         goto cleanup;
     handle_hello(7, hello);
     json_decref(hello);
     hello = NULL;
-    if (!context.block_ack || !context.chunk_window ||
+    if (!context.block_ack || !context.chunk_window || !context.crc32 ||
         g_pending_negotiations || !g_transfers ||
+        !g_transfers->crc32_enabled ||
         context.hello_frames != 2 || context.fetch_frames != 1)
         goto cleanup;
     free_test_transfers();
 
     context.chunk_window = false;
+    context.crc32 = false;
     if (invoke_recv("legacy-block-ack") != MCP_PLUGIN_CALL_PENDING ||
         g_pending_negotiations || !g_transfers ||
+        g_transfers->crc32_enabled ||
         context.hello_frames != 2 || context.fetch_frames != 2)
         goto cleanup;
     free_test_transfers();

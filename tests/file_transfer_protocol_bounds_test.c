@@ -106,12 +106,73 @@ static int manifest_result(json_t *manifest, int expected_success, size_t expect
 {
     struct manifest_entry *entries = NULL;
     size_t count = 0;
-    int rc = manifest_to_entries(manifest, &entries, &count);
+    int rc = manifest_to_entries(manifest, false, &entries, &count);
     int success = rc == 0;
 
     if (success)
         free_entries(entries, count);
     return success == expected_success && (!success || count == expected_count) ? 0 : -1;
+}
+
+static int test_crc32_contract(void)
+{
+    static const unsigned char input[] = "123456789";
+    struct transfer_context ctx = {0};
+    struct receive_write_job *job = NULL;
+    unsigned char field[64] = {0};
+    char crc[9];
+    json_t *manifest = make_file_manifest(1);
+    json_t *item;
+    json_t *block;
+    struct manifest_entry *entries = NULL;
+    size_t count = 0;
+    int rc = -1;
+
+    bytes_crc32(input, sizeof(input) - 1, crc);
+    if (strcmp(crc, "cbf43926") != 0 || !manifest)
+        goto cleanup;
+    memcpy(field, crc, 8);
+    if (!valid_crc32_field(field))
+        goto cleanup;
+    field[8] = 1;
+    if (valid_crc32_field(field))
+        goto cleanup;
+    field[8] = 0;
+    job = calloc(1, sizeof(*job) + sizeof(input) - 1);
+    if (!job)
+        goto cleanup;
+    ctx.crc32_enabled = true;
+    job->ctx = &ctx;
+    job->req.data = job;
+    job->data_len = sizeof(input) - 1;
+    memcpy(job->data, input, job->data_len);
+    strcpy(job->chunk_hash, "00000000");
+    receive_write_work(&job->req);
+    if (job->result != RECEIVE_WRITE_CHUNK_MISMATCH)
+        goto cleanup;
+    strcpy(job->chunk_hash, crc);
+    receive_write_work(&job->req);
+    if (job->result != RECEIVE_WRITE_OK)
+        goto cleanup;
+    item = json_array_get(json_object_get(manifest, "entries"), 0);
+    block = json_array_get(json_object_get(item, "blocks"), 0);
+    if (json_object_set_new(block, "hash", json_string(crc)) != 0 ||
+        manifest_to_entries(manifest, true, &entries, &count) != 0 ||
+        count != 1 || !entries[0].block_crc32 ||
+        strcmp(entries[0].blocks[0].hash, crc) != 0)
+        goto cleanup;
+    free_entries(entries, count);
+    entries = NULL;
+    count = 0;
+    if (manifest_to_entries(manifest, false, &entries, &count) == 0)
+        goto cleanup;
+    rc = 0;
+
+cleanup:
+    free(job);
+    free_entries(entries, count);
+    json_decref(manifest);
+    return rc;
 }
 
 struct frame_capture {
@@ -443,6 +504,7 @@ static int test_accept_bounds(void)
 int main(void)
 {
     if (test_outgoing_frame_bound() != 0 ||
+        test_crc32_contract() != 0 ||
         test_frame_bounds() != 0 ||
         test_manifest_count_bounds() != 0 ||
         test_manifest_block_bounds() != 0 ||
