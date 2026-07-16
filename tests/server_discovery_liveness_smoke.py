@@ -13,7 +13,7 @@ def encode(payload):
     return struct.pack(">I", len(data)) + data
 
 
-def recv_frame(conn, timeout=5.0):
+def recv_payload(conn, timeout=5.0):
     conn.settimeout(timeout)
     header = conn.recv(4)
     if len(header) != 4:
@@ -25,7 +25,11 @@ def recv_frame(conn, timeout=5.0):
         if not chunk:
             raise RuntimeError("short frame body")
         data.extend(chunk)
-    return json.loads(data.decode("utf-8"))
+    return bytes(data)
+
+
+def recv_frame(conn, timeout=5.0):
+    return json.loads(recv_payload(conn, timeout).decode("utf-8"))
 
 
 def send_frame(conn, payload):
@@ -223,11 +227,14 @@ class FakePeer:
         with conn:
             while not self._stop.is_set():
                 try:
-                    request = recv_frame(conn, timeout=2.0)
+                    payload = recv_payload(conn, timeout=2.0)
                 except socket.timeout:
                     continue
                 except (OSError, RuntimeError):
                     return
+                if not payload.startswith(b"{"):
+                    continue
+                request = json.loads(payload.decode("utf-8"))
                 if request.get("method") != "ping":
                     continue
                 self.heartbeats.append(time.time())
