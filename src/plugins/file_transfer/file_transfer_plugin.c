@@ -165,6 +165,7 @@ typedef int mode_t;
 #define MFT_CAP_BLOCK_ACK "mft.v1.block_ack"
 #define MFT_CAP_CHUNK_WINDOW "mft.v1.chunk_window"
 #define MFT_CAP_CRC32 "mft.v1.crc32"
+#define MFT_CAP_DATA_CHANNEL "mft.v1.data_channel"
 #define MFT_MAX_FRAME_SIZE (1024u * 1024u)
 #define MFT_MAX_MANIFEST_ENTRIES 4096u
 #define MFT_MAX_BLOCKS_PER_FILE 8192u
@@ -1872,7 +1873,7 @@ static int manifest_to_entries(json_t *manifest,
 
 static int send_hello(unsigned int server_id)
 {
-    json_t *payload = json_pack("{s:i,s:[s,s,s,s,s],s:i,s:i,s:i,s:i}",
+    json_t *payload = json_pack("{s:i,s:[s,s,s,s,s,s],s:i,s:i,s:i,s:i}",
                                 "version",
                                 1,
                                 "capabilities",
@@ -1881,6 +1882,7 @@ static int send_hello(unsigned int server_id)
                                 MFT_CAP_BLOCK_ACK,
                                 MFT_CAP_CHUNK_WINDOW,
                                 MFT_CAP_CRC32,
+                                MFT_CAP_DATA_CHANNEL,
                                 "max_frame_size",
                                 (int)MFT_MAX_FRAME_SIZE,
                                 "initial_session_window",
@@ -2050,7 +2052,8 @@ static void handle_hello(unsigned int server_id, json_t *payload)
             strcmp(name, MFT_CAP_RESUME) == 0 ||
             strcmp(name, MFT_CAP_BLOCK_ACK) == 0 ||
             strcmp(name, MFT_CAP_CHUNK_WINDOW) == 0 ||
-            strcmp(name, MFT_CAP_CRC32) == 0) {
+            strcmp(name, MFT_CAP_CRC32) == 0 ||
+            strcmp(name, MFT_CAP_DATA_CHANNEL) == 0) {
             if (!g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
                                                               server_id,
                                                               name))

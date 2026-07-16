@@ -288,7 +288,7 @@ if(Python3_Interpreter_FOUND)
 
     add_test(
         NAME mcp_server_discovery_liveness_smoke
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/server_discovery_liveness_smoke.py" "$<TARGET_FILE:mcp_server>" 18772 18773 18774 18775 18776 18777 18778 18779
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/server_discovery_liveness_smoke.py" "$<TARGET_FILE:mcp_server>" 18772 18773 18774 18775 18776 18777 18778 18779 "${MCP_FILE_TRANSFER_PLUGIN}" "${_mcp_file_transfer_path_plugin}"
     )
 
     if(TARGET mcp_file_transfer_plugin)

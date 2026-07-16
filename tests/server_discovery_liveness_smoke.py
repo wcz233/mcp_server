@@ -4,6 +4,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -34,6 +35,15 @@ def recv_frame(conn, timeout=5.0):
 
 def send_frame(conn, payload):
     conn.sendall(encode(payload))
+
+
+def send_payload(conn, payload):
+    conn.sendall(struct.pack(">I", len(payload)) + payload)
+
+
+def mft_json_frame(frame_type, payload):
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return b"MFT1" + bytes((1, frame_type, 0, 0)) + encoded
 
 
 def call(sock, request_id, method, params=None):
@@ -191,10 +201,16 @@ def wait_for_udp(sock, deadline):
 
 
 class FakePeer:
-    def __init__(self, tcp_port, respond_to_ping):
+    def __init__(self, tcp_port, respond_to_ping, support_data_channel=False):
         self.tcp_port = tcp_port
         self.respond_to_ping = respond_to_ping
+        self.support_data_channel = support_data_channel
         self.heartbeats = []
+        self.data_connections = 0
+        self.control_data_frames = 0
+        self.hello_seen = threading.Event()
+        self.data_link_failed = threading.Event()
+        self._lock = threading.Lock()
         self._stop = threading.Event()
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -227,6 +243,7 @@ class FakePeer:
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
     def _handle(self, conn):
+        data_channel = False
         with conn:
             while not self._stop.is_set():
                 try:
@@ -235,9 +252,81 @@ class FakePeer:
                     continue
                 except (OSError, RuntimeError):
                     return
+                if payload.startswith(b"MFT1"):
+                    if len(payload) < 8:
+                        continue
+                    frame_type = payload[5]
+                    if frame_type == 1:
+                        hello = json.loads(payload[8:].decode("utf-8"))
+                        if self.support_data_channel:
+                            assert "mft.v1.data_channel" in hello.get("capabilities", []), hello
+                            self.hello_seen.set()
+                            send_payload(
+                                conn,
+                                mft_json_frame(
+                                    1,
+                                    {
+                                        "version": 1,
+                                        "capabilities": [
+                                            "mft.v1.block_ack",
+                                            "mft.v1.crc32",
+                                            "mft.v1.data_channel",
+                                        ],
+                                    },
+                                ),
+                            )
+                    elif frame_type == 2 and self.support_data_channel:
+                        offer = json.loads(payload[8:].decode("utf-8"))
+                        accept = [
+                            {
+                                "decision": (
+                                    "create_directory"
+                                    if entry["type"] == "directory"
+                                    else "receive"
+                                ),
+                                "resume_offset": 0,
+                            }
+                            for entry in offer["manifest"]["entries"]
+                        ]
+                        send_payload(
+                            conn,
+                            mft_json_frame(
+                                4,
+                                {"transfer_id": offer["transfer_id"], "accept": accept},
+                            ),
+                        )
+                    elif frame_type == 5:
+                        if not data_channel:
+                            self.control_data_frames += 1
+                        else:
+                            try:
+                                conn.shutdown(socket.SHUT_RDWR)
+                            except OSError:
+                                pass
+                            self.data_link_failed.set()
+                            return
+                    continue
                 if not payload.startswith(b"{"):
                     continue
                 request = json.loads(payload.decode("utf-8"))
+                if request.get("method") == "initialize":
+                    identity = request.get("params", {}).get("mcp_peer_identity", {})
+                    data_channel = identity.get("data_channel") is True
+                    if data_channel:
+                        with self._lock:
+                            self.data_connections += 1
+                            data_index = self.data_connections
+                        if data_index > 1:
+                            continue
+                    send_frame(
+                        conn,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": {},
+                        },
+                    )
+                    continue
                 if request.get("method") != "ping":
                     continue
                 self.heartbeats.append(time.time())
@@ -276,13 +365,19 @@ def main():
     broadcast_tcp = int(sys.argv[7])
     broadcast_discovery = int(sys.argv[8])
     broadcast_target = int(sys.argv[9])
+    file_transfer_mode = sys.argv[10]
+    file_transfer_plugin = sys.argv[11]
 
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     udp_sock.bind(("127.0.0.1", fake_discovery))
     udp_sock.settimeout(0.5)
 
-    online_peer = FakePeer(fake_tcp_online, respond_to_ping=True)
+    online_peer = FakePeer(
+        fake_tcp_online,
+        respond_to_ping=True,
+        support_data_channel=file_transfer_mode != "n",
+    )
     timeout_peer = FakePeer(fake_tcp_timeout, respond_to_ping=False)
     online_peer.start()
     timeout_peer.start()
@@ -290,10 +385,20 @@ def main():
     proc = start_server(exe, tcp_server, discovery_server, fake_discovery)
     broadcast_proc = None
     sock = None
+    transfer_sock = None
+    transfer_path = None
     try:
         sock = wait_for_tcp(tcp_server, proc)
         sock.settimeout(3.0)
         initialize(sock)
+        if file_transfer_mode == "m":
+            loaded = call_tool(
+                sock,
+                19,
+                "plugin_tools.insmod",
+                {"package_path": file_transfer_plugin},
+            )
+            assert "server.send" in loaded["tools"], loaded
 
         first = wait_for_udp(udp_sock, time.time() + 5)
         second = wait_for_udp(udp_sock, time.time() + 12)
@@ -314,6 +419,43 @@ def main():
         assert peer and peer["state"] == "online", payload
         assert len(online_peer.heartbeats) >= 2, online_peer.heartbeats
         assert online_peer.heartbeats[-1] - online_peer.heartbeats[0] >= 0.8, online_peer.heartbeats
+        if file_transfer_mode != "n":
+            assert online_peer.hello_seen.wait(2), "missing MFT1 data-channel negotiation"
+
+            with tempfile.NamedTemporaryFile(delete=False) as transfer_file:
+                transfer_file.write(b"d" * (1024 * 1024))
+                transfer_path = transfer_file.name
+            transfer_sock = wait_for_tcp(tcp_server, proc)
+            transfer_sock.settimeout(10.0)
+            initialize(transfer_sock)
+            transfer = {}
+
+            def send_file():
+                try:
+                    transfer["result"] = call_tool(
+                        transfer_sock,
+                        30,
+                        "server.send",
+                        {
+                            "server_id": peer["server_id"],
+                            "local_path": transfer_path,
+                            "remote_path": ".",
+                            "timeout_ms": 5000,
+                        },
+                    )
+                except Exception as exc:
+                    transfer["error"] = exc
+
+            transfer_thread = threading.Thread(target=send_file, daemon=True)
+            transfer_thread.start()
+            assert online_peer.data_link_failed.wait(5), "DATA did not use the negotiated data link"
+            time.sleep(0.5)
+            assert online_peer.data_connections >= 1, online_peer.data_connections
+            assert online_peer.control_data_frames == 0, online_peer.control_data_frames
+            assert transfer_thread.is_alive(), transfer
+            payload = call_tool(sock, 22, "server.list_servers", {"wait_ms": 100})
+            peer = peer_entry(payload, fake_tcp_online)
+            assert peer and peer["state"] == "online" and peer["tcp_connected"] is True, payload
 
         sock.settimeout(8.0)
         blocked = call_tool(
@@ -388,6 +530,8 @@ def main():
     finally:
         if sock:
             sock.close()
+        if transfer_sock:
+            transfer_sock.close()
         proc.terminate()
         try:
             proc.wait(timeout=5)
@@ -404,6 +548,11 @@ def main():
         online_peer.close()
         timeout_peer.close()
         udp_sock.close()
+        if transfer_path:
+            try:
+                os.unlink(transfer_path)
+            except FileNotFoundError:
+                pass
 
     return 0
 

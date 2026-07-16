@@ -26,6 +26,7 @@ struct mcp_client_session {
     struct mcp_reply_target reply_to;
     json_t *tool_snapshot;
     unsigned int peer_server_id;
+    bool data_channel;
     struct mcp_client_session *next;
 };
 

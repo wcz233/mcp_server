@@ -512,10 +512,16 @@ static void handle_request(struct mcp_server *server,
 
     if (strcmp(message->method, "initialize") == 0) {
         json_t *peer_identity = json_object_get(message->params, "mcp_peer_identity");
+        bool data_channel = peer_identity &&
+                            json_is_true(json_object_get(peer_identity, "data_channel"));
 
-        if (peer_identity && mcp_server_discovery_enabled(server))
+        if (peer_identity && mcp_server_discovery_enabled(server)) {
             session->peer_server_id =
-                mcp_server_discovery_note_peer_identity(server->discovery, peer_identity);
+                mcp_server_discovery_note_peer_identity(server->discovery,
+                                                        peer_identity,
+                                                        data_channel);
+            session->data_channel = data_channel && session->peer_server_id != 0;
+        }
 
         result = build_initialize_result();
         send_result_to(server, reply_to, message->id, result);
@@ -805,7 +811,10 @@ static bool framed_maybe_dispatch_binary(struct mcp_server *server,
     session = client_session_for_reply(server, &reply_to, false);
     if (!session || session->peer_server_id == 0)
         return false;
-    if (server->discovery)
+    if (session->data_channel &&
+        (len < 6 || memcmp(data, "MFT1", 4) != 0 || (unsigned char)data[5] != 5u))
+        return false;
+    if (server->discovery && !session->data_channel)
         mcp_server_discovery_mark_peer_active(server->discovery, session->peer_server_id);
 
     return mcp_peer_transport_dispatch_frame(server->peer_transport,

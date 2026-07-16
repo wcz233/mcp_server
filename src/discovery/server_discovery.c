@@ -31,6 +31,9 @@
 #define MCP_DISCOVERY_PROXY_TIMEOUT_MS_MAX 300000u
 #define MCP_DISCOVERY_INITIALIZE_ID "mcp_gateway_initialize"
 #define MCP_DISCOVERY_REMOTE_REGISTRY_LIST_TOOLS "registry.list_tools"
+#define MCP_DISCOVERY_MFT_DATA_CAPABILITY "mft.v1.data_channel"
+#define MCP_DISCOVERY_MFT_MAGIC "MFT1"
+#define MCP_DISCOVERY_MFT_DATA_FRAME 5u
 
 enum discovery_peer_state {
     DISCOVERY_PEER_ONLINE = 1,
@@ -53,6 +56,7 @@ struct discovery_peer {
     unsigned long seen_generation;
     enum discovery_peer_state state;
     struct discovery_peer_conn *conn;
+    struct discovery_peer_conn *data_conn;
     struct discovery_peer *next;
 };
 
@@ -81,6 +85,7 @@ struct discovery_peer_conn {
     bool closing;
     bool mcp_initialize_sent;
     bool mcp_initialized;
+    bool data_channel;
     char *rx_buf;
     size_t rx_len;
     size_t rx_cap;
@@ -681,7 +686,7 @@ static void peer_mark_heartbeat_ok(struct discovery_peer *peer)
 
 static void peer_mark_activity(struct discovery_peer_conn *conn)
 {
-    if (!conn)
+    if (!conn || conn->data_channel)
         return;
     peer_mark_heartbeat_ok(conn->peer);
 }
@@ -691,10 +696,16 @@ static void peer_conn_fail(struct discovery_peer_conn *conn)
     if (!conn)
         return;
 
+    if (conn->data_channel) {
+        peer_conn_close(conn);
+        return;
+    }
+
     peer_mark_timeout(conn->peer);
     pending_proxy_complete_for_peer(conn->discovery,
                                     conn->peer,
                                     "Remote server connection failed.");
+    peer_conn_close(conn->peer ? conn->peer->data_conn : NULL);
     peer_conn_close(conn);
 }
 
@@ -708,6 +719,7 @@ static void discovery_mark_stale_peers(struct mcp_server_discovery *discovery,
             peer->last_heartbeat_ms > 0 &&
             now - peer->last_heartbeat_ms > MCP_DISCOVERY_HEARTBEAT_TIMEOUT_MS) {
             peer->state = DISCOVERY_PEER_TIMEOUT;
+            peer_conn_close(peer->data_conn);
             peer_conn_close(peer->conn);
         }
     }
@@ -729,8 +741,12 @@ static void peer_conn_free(struct discovery_peer_conn *conn)
     if (!conn)
         return;
 
-    if (conn->peer && conn->peer->conn == conn)
-        conn->peer->conn = NULL;
+    if (conn->peer) {
+        if (conn->data_channel && conn->peer->data_conn == conn)
+            conn->peer->data_conn = NULL;
+        else if (!conn->data_channel && conn->peer->conn == conn)
+            conn->peer->conn = NULL;
+    }
     free(conn->rx_buf);
     free(conn);
 }
@@ -740,7 +756,9 @@ static void peer_conn_close_cb(uv_handle_t *handle)
     struct discovery_peer_conn *conn = handle->data;
     struct mcp_server_discovery *discovery = conn ? conn->discovery : NULL;
 
-    if (discovery && conn && conn->peer)
+    if (conn && !conn->data_channel && conn->peer)
+        peer_conn_close(conn->peer->data_conn);
+    if (discovery && conn && conn->peer && !conn->data_channel)
         mcp_peer_transport_notify_closed(discovery->server->peer_transport,
                                          conn->peer->server_id);
     peer_conn_free(conn);
@@ -822,14 +840,14 @@ static void peer_conn_handle_frame(struct discovery_peer_conn *conn, const char 
     result = json_object_get(root, "result");
     params = json_object_get(root, "params");
 
-    if (json_is_string(method) &&
+    if (peer_handle_initialize_response(conn, root)) {
+        /* Handled by gateway client session setup. */
+    } else if (!conn->data_channel && json_is_string(method) &&
         strcmp(json_string_value(method), MCP_SERVER_DISCOVERY_OFFLINE_METHOD) == 0) {
         mcp_server_discovery_handle_offline_notification(conn->discovery, params);
-    } else if (peer_handle_initialize_response(conn, root)) {
-        /* Handled by gateway client session setup. */
-    } else if (pending_proxy_complete_response(conn, root)) {
+    } else if (!conn->data_channel && pending_proxy_complete_response(conn, root)) {
         /* Handled by gateway proxy completion. */
-    } else if (result || json_object_get(root, "error")) {
+    } else if (!conn->data_channel && (result || json_object_get(root, "error"))) {
         peer_mark_activity(conn);
     }
 
@@ -903,21 +921,27 @@ static void peer_connect_cb(uv_connect_t *req, int status)
     }
 
     conn->connected = true;
-    peer_mark_heartbeat_ok(conn->peer);
-    mcp_peer_transport_notify_connected(conn->discovery->server->peer_transport,
-                                        conn->peer->server_id);
+    if (!conn->data_channel) {
+        peer_mark_heartbeat_ok(conn->peer);
+        mcp_peer_transport_notify_connected(conn->discovery->server->peer_transport,
+                                            conn->peer->server_id);
+    }
     if (uv_read_start((uv_stream_t *)&conn->tcp, peer_conn_alloc_cb, peer_conn_read_cb) != 0)
         peer_conn_fail(conn);
     else if (peer_send_initialize(conn) != 0)
         peer_conn_fail(conn);
 }
 
-static void peer_connect(struct mcp_server_discovery *discovery, struct discovery_peer *peer)
+static void peer_connect(struct mcp_server_discovery *discovery,
+                         struct discovery_peer *peer,
+                         bool data_channel)
 {
     struct discovery_peer_conn *conn;
+    struct discovery_peer_conn **slot;
     struct sockaddr_storage addr;
 
-    if (peer->state == DISCOVERY_PEER_OFFLINE || peer->conn || discovery->closing)
+    slot = data_channel ? &peer->data_conn : &peer->conn;
+    if (peer->state == DISCOVERY_PEER_OFFLINE || *slot || discovery->closing)
         return;
     if (sockaddr_from_host_port(peer->ip, peer->port, &addr) != 0)
         return;
@@ -928,6 +952,7 @@ static void peer_connect(struct mcp_server_discovery *discovery, struct discover
 
     conn->discovery = discovery;
     conn->peer = peer;
+    conn->data_channel = data_channel;
     if (uv_tcp_init(discovery->loop, &conn->tcp) != 0) {
         free(conn);
         return;
@@ -937,7 +962,7 @@ static void peer_connect(struct mcp_server_discovery *discovery, struct discover
     conn->connecting = true;
     conn->tcp.data = conn;
     conn->connect_req.data = conn;
-    peer->conn = conn;
+    *slot = conn;
 
     if (uv_tcp_connect(&conn->connect_req,
                        &conn->tcp,
@@ -1023,8 +1048,23 @@ static int discovery_external_send_frame(void *arg,
         return -1;
 
     for (peer = discovery->peers; peer; peer = peer->next) {
-        if (peer->server_id == server_id)
-            return peer_send_frame(peer->conn, payload, len, false);
+        if (peer->server_id != server_id)
+            continue;
+        if (len >= 6 &&
+            memcmp(payload, MCP_DISCOVERY_MFT_MAGIC, 4) == 0 &&
+            ((const unsigned char *)payload)[5] == MCP_DISCOVERY_MFT_DATA_FRAME &&
+            mcp_peer_transport_has_capability(discovery->server->peer_transport,
+                                              server_id,
+                                              MCP_DISCOVERY_MFT_DATA_CAPABILITY)) {
+            if (!peer->data_conn) {
+                peer_connect(discovery, peer, true);
+                return -2;
+            }
+            if (!peer->data_conn->mcp_initialized)
+                return -2;
+            return peer_send_frame(peer->data_conn, payload, len, false);
+        }
+        return peer_send_frame(peer->conn, payload, len, false);
     }
 
     return -1;
@@ -1284,8 +1324,11 @@ static int peer_send_initialize(struct discovery_peer_conn *conn)
     json_object_set_new(params, "clientInfo", client_info);
     {
         json_t *identity = mcp_server_discovery_local_identity(conn->discovery);
-        if (identity)
+        if (identity) {
+            if (conn->data_channel)
+                json_object_set_new(identity, "data_channel", json_true());
             json_object_set_new(params, "mcp_peer_identity", identity);
+        }
     }
     json_object_set_new(request, "params", params);
 
@@ -1385,13 +1428,16 @@ static bool peer_handle_initialize_response(struct discovery_peer_conn *conn, js
 
     if (json_object_get(root, "result")) {
         conn->mcp_initialized = true;
-        peer_mark_heartbeat_ok(conn->peer);
         peer_send_initialized_notification(conn);
-        peer_send_pending_proxies(conn);
+        if (!conn->data_channel) {
+            peer_mark_heartbeat_ok(conn->peer);
+            peer_send_pending_proxies(conn);
+        }
     } else {
-        pending_proxy_complete_for_peer(conn->discovery,
-                                        conn->peer,
-                                        "Remote server initialization failed.");
+        if (!conn->data_channel)
+            pending_proxy_complete_for_peer(conn->discovery,
+                                            conn->peer,
+                                            "Remote server initialization failed.");
         peer_conn_fail(conn);
     }
 
@@ -1503,7 +1549,7 @@ static void heartbeat_timer_cb(uv_timer_t *timer)
         if (peer->state == DISCOVERY_PEER_OFFLINE)
             continue;
         if (!peer->conn)
-            peer_connect(discovery, peer);
+            peer_connect(discovery, peer, false);
         else if (peer->conn->connected)
             peer_send_heartbeat(discovery, peer);
     }
@@ -1558,6 +1604,7 @@ static struct discovery_peer *upsert_peer(struct mcp_server_discovery *discovery
     peer->seen_generation = discovery->current_generation;
     if (state == DISCOVERY_PEER_OFFLINE) {
         peer->state = DISCOVERY_PEER_OFFLINE;
+        peer_conn_close(peer->data_conn);
         peer_conn_close(peer->conn);
     } else if (state == DISCOVERY_PEER_ONLINE) {
         if (peer->conn && peer->conn->connected)
@@ -1584,6 +1631,7 @@ static bool mark_peer_offline(struct mcp_server_discovery *discovery,
 
     peer->last_seen_ms = mcp_now_ms();
     peer->state = DISCOVERY_PEER_OFFLINE;
+    peer_conn_close(peer->data_conn);
     peer_conn_close(peer->conn);
     return true;
 }
@@ -1644,7 +1692,8 @@ json_t *mcp_server_discovery_local_identity(struct mcp_server_discovery *discove
 }
 
 unsigned int mcp_server_discovery_note_peer_identity(struct mcp_server_discovery *discovery,
-                                                     json_t *identity)
+                                                     json_t *identity,
+                                                     bool data_channel)
 {
     json_t *ip;
     json_t *port;
@@ -1664,6 +1713,15 @@ unsigned int mcp_server_discovery_note_peer_identity(struct mcp_server_discovery
         return 0;
     if (status && !json_is_object(status))
         status = NULL;
+
+    if (data_channel) {
+        peer = find_peer(discovery,
+                         json_string_value(ip),
+                         (unsigned int)json_integer_value(port));
+        if (!peer || peer->state == DISCOVERY_PEER_OFFLINE)
+            return 0;
+        return peer->server_id;
+    }
 
     peer = upsert_peer(discovery,
                        json_string_value(ip),
@@ -1870,7 +1928,7 @@ static bool discovery_has_peer_connections(const struct mcp_server_discovery *di
         return false;
 
     for (peer = discovery->peers; peer; peer = peer->next) {
-        if (peer->conn)
+        if (peer->conn || peer->data_conn)
             return true;
     }
 
@@ -2057,8 +2115,10 @@ void mcp_server_discovery_close(struct mcp_server_discovery *discovery)
 
     discovery->closing = true;
 
-    for (peer = discovery->peers; peer; peer = peer->next)
+    for (peer = discovery->peers; peer; peer = peer->next) {
         peer_send_offline(peer->conn);
+        peer_conn_close(peer->data_conn);
+    }
     discovery_send_offline(discovery);
     pending_proxy_complete_for_peer(discovery,
                                     NULL,
@@ -2067,11 +2127,9 @@ void mcp_server_discovery_close(struct mcp_server_discovery *discovery)
     discovery->opened = false;
 
     for (peer = discovery->peers; peer; peer = peer->next) {
-        if (!peer->conn)
-            continue;
-        if (peer->conn->connected)
-            continue;
-        peer_conn_close(peer->conn);
+        if (peer->conn && !peer->conn->connected)
+            peer_conn_close(peer->conn);
+        peer_conn_close(peer->data_conn);
     }
 
     pending = discovery->pending_lists;
