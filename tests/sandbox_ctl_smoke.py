@@ -198,6 +198,12 @@ def shell_result(client, arguments):
     return result, content[0]["text"]
 
 
+def successful_shell_payload(client, arguments):
+    result, text = shell_result(client, arguments)
+    assert result["isError"] is False, result
+    return json.loads(text)
+
+
 def assert_error_unchanged(client, arguments, code="invalid_params", field=None):
     before = client.get()
     response = client.control_response(arguments)
@@ -836,6 +842,189 @@ def verify_reject_only_execution(exe, config_path, config):
     client.close()
 
 
+def verify_synchronous_bypass(exe, config_path, config):
+    write_config(config_path, config)
+    env = control_env(config_path, gate="1", token=TOKEN)
+    env["MCP_SANDBOX_BYPASS_SENTINEL"] = "bypass-parent-value"
+    client = Client(exe, env)
+
+    state = client.get()
+    state = client.control(
+        update_arguments(
+            state,
+            shell_enabled=True,
+            overrides={"max_command_length": 64},
+        )
+    )
+    restrictive_overrides = copy.deepcopy(state["overrides"])
+    long_command = "echo " + "b" * 80
+    result, text = shell_result(client, {"command": long_command})
+    assert result["isError"] is True and "maximum length" in text, result
+
+    state = client.control(update_arguments(state, sandbox_enabled=False))
+    assert state["overrides"] == restrictive_overrides, state
+    assert state["shell_enabled"] is True, state
+    effective = state["effective"]
+    assert effective["shell_enabled"] is True, effective
+    assert effective["sandbox_enabled"] is False, effective
+    assert effective["max_command_length"] == 65535, effective
+    assert effective["default_timeout_ms"] == 300000, effective
+    assert effective["max_timeout_ms"] == 300000, effective
+    assert effective["max_output_bytes"] == 2147483648, effective
+    assert effective["capture_stderr"] is True, effective
+    execution = effective["execution"]
+    assert Path(execution["working_directory"]).resolve() == Path.cwd().resolve(), execution
+    assert execution["request_cwd_allowed"] is True, execution
+    assert execution["clear_environment"] is False, execution
+    assert execution["allowed_env"] == [], execution
+    assert execution["request_env_allowed"] is True, execution
+    assert execution["kill_process_group_on_timeout"] is True, execution
+    assert execution["run_as_user"] is None and execution["run_as_group"] is None, execution
+    if os.name != "nt":
+        assert execution["parent_environment_mode"] == "all", execution
+    assert effective["limits"] == {
+        "max_cpu_seconds": 0,
+        "max_memory_bytes": 0,
+        "max_file_size_bytes": 0,
+        "max_open_files": 0,
+        "max_processes": 0,
+    }, effective
+    assert effective["isolation"]["require_non_root"] is False, effective
+
+    payload = successful_shell_payload(client, {"command": long_command})
+    assert payload["sandbox_revision"] == state["revision"], payload
+    assert payload["sandbox_enabled"] is False, payload
+    assert payload["shell_enabled"] is True, payload
+
+    hard_marker = config_path.parent / "hard-command.marker"
+    hard_marker.unlink(missing_ok=True)
+    prefix = shell_command(
+        f'echo hard>"{hard_marker}"&',
+        f"touch '{hard_marker}';",
+    )
+    oversized_command = prefix + "x" * (65536 - len(prefix))
+    assert len(oversized_command.encode("utf-8")) == 65536, len(oversized_command)
+    result, text = shell_result(client, {"command": oversized_command})
+    assert result["isError"] is True and "maximum length" in text, result
+    assert not hard_marker.exists(), hard_marker
+
+    timeout_marker = config_path.parent / "hard-timeout.marker"
+    timeout_marker.unlink(missing_ok=True)
+    command = shell_command(
+        f'echo hard>"{timeout_marker}"',
+        f"touch '{timeout_marker}'",
+    )
+    result, text = shell_result(client, {"command": command, "timeout_ms": 300001})
+    assert result["isError"] is True and "timeout_ms" in text, result
+    assert not timeout_marker.exists(), timeout_marker
+    assert_error_unchanged(
+        client,
+        update_arguments(state, overrides={"max_output_bytes": 2147483649}),
+        field="max_output_bytes",
+    )
+
+    state = client.get()
+    state = client.control(update_arguments(state, sandbox_enabled=True))
+    assert state["overrides"] == restrictive_overrides, state
+    result, text = shell_result(client, {"command": long_command})
+    assert result["isError"] is True and "maximum length" in text, result
+
+    execution_overrides = {
+        "working_directory": str(config_path.parent),
+        "clear_environment": os.name == "nt",
+    }
+    if os.name != "nt":
+        execution_overrides["allowed_env"] = []
+    state = client.control(
+        update_arguments(
+            state,
+            overrides={
+                "max_command_length": 65535,
+                "max_output_bytes": 256,
+                "capture_stderr": False,
+                "merge_stderr": False,
+                "execution": execution_overrides,
+            },
+        )
+    )
+    output_command = shell_command(
+        "echo " + "x" * 300,
+        "printf '%s' '" + "x" * 300 + "'",
+    )
+    cwd_command = shell_command("cd", "pwd")
+    env_command = shell_command(
+        "if defined MCP_SANDBOX_BYPASS_SENTINEL (echo %MCP_SANDBOX_BYPASS_SENTINEL%) else (echo unset)",
+        "printf '%s' \"${MCP_SANDBOX_BYPASS_SENTINEL-unset}\"",
+    )
+    stderr_command = shell_command(
+        "echo bypass-stderr 1>&2",
+        "printf '%s' bypass-stderr >&2",
+    )
+
+    normal_output = successful_shell_payload(client, {"command": output_command})
+    assert len(normal_output["stdout"]) == 256 and normal_output["truncated"] is True, normal_output
+    normal_cwd = successful_shell_payload(client, {"command": cwd_command})
+    assert Path(normal_cwd["stdout"].strip()).resolve() == config_path.parent.resolve(), normal_cwd
+    normal_env = successful_shell_payload(client, {"command": env_command})
+    assert normal_env["stdout"].strip() == "unset", normal_env
+    normal_stderr = successful_shell_payload(client, {"command": stderr_command})
+    assert normal_stderr["stderr"] == "", normal_stderr
+
+    saved_overrides = copy.deepcopy(state["overrides"])
+    state = client.control(update_arguments(state, sandbox_enabled=False))
+    assert state["overrides"] == saved_overrides, state
+    bypass_output = successful_shell_payload(client, {"command": output_command})
+    assert len(bypass_output["stdout"].strip()) == 300 and bypass_output["truncated"] is False, bypass_output
+    bypass_cwd = successful_shell_payload(client, {"command": cwd_command})
+    assert Path(bypass_cwd["stdout"].strip()).resolve() == Path.cwd().resolve(), bypass_cwd
+    bypass_env = successful_shell_payload(client, {"command": env_command})
+    assert bypass_env["stdout"].strip() == "bypass-parent-value", bypass_env
+    bypass_stderr = successful_shell_payload(client, {"command": stderr_command})
+    assert bypass_stderr["stderr"].strip() == "bypass-stderr", bypass_stderr
+
+    state = client.control(update_arguments(state, sandbox_enabled=True))
+    assert state["overrides"] == saved_overrides, state
+    restored_output = successful_shell_payload(client, {"command": output_command})
+    assert len(restored_output["stdout"]) == 256 and restored_output["truncated"] is True, restored_output
+    restored_env = successful_shell_payload(client, {"command": env_command})
+    assert restored_env["stdout"].strip() == "unset", restored_env
+    restored_stderr = successful_shell_payload(client, {"command": stderr_command})
+    assert restored_stderr["stderr"] == "", restored_stderr
+
+    state = client.control(
+        update_arguments(
+            state,
+            overrides={"capture_stderr": True, "merge_stderr": True},
+        )
+    )
+    merged = successful_shell_payload(client, {"command": stderr_command})
+    assert merged["stdout"].strip() == "bypass-stderr" and merged["stderr"] == "", merged
+
+    require_non_root = nested_get(
+        state["capabilities"], ("isolation", "require_non_root")
+    )
+    if require_non_root == "reject_only":
+        state = client.control(
+            update_arguments(state, overrides={"isolation": {"require_non_root": True}})
+        )
+        result, text = shell_result(client, {"command": "echo reject-only"})
+        assert result["isError"] is True and "low-privilege token" in text, result
+        state = client.control(update_arguments(state, sandbox_enabled=False))
+        assert nested_get(state["capabilities"], ("isolation", "require_non_root")) == "reject_only", state
+        payload = successful_shell_payload(client, {"command": "echo reject-only-bypassed"})
+        assert payload["stdout"].strip() == "reject-only-bypassed", payload
+        state = client.control(update_arguments(state, sandbox_enabled=True))
+        result, text = shell_result(client, {"command": "echo reject-only-restored"})
+        assert result["isError"] is True and "low-privilege token" in text, result
+
+    reset = reset_state(client, state)
+    assert reset["overrides"] == {}, reset
+    assert reset["sandbox_enabled"] is True, reset
+    result, text = shell_result(client, {"command": "echo reset-must-use-base"})
+    assert result["isError"] is True and "disabled by policy" in text, result
+    client.close()
+
+
 def verify_restart_clears_state(exe, config_path, config):
     write_config(config_path, config)
     client = Client(exe, control_env(config_path, gate="1", token=TOKEN))
@@ -925,6 +1114,7 @@ def main():
         verify_control_contract(exe, config_path, copy.deepcopy(config))
         verify_capabilities(exe, config_path, copy.deepcopy(config))
         verify_reject_only_execution(exe, config_path, copy.deepcopy(config))
+        verify_synchronous_bypass(exe, config_path, copy.deepcopy(config))
         verify_restart_clears_state(exe, config_path, copy.deepcopy(config))
         verify_base_drift_and_conflict(exe, config_path, copy.deepcopy(config))
     return 0

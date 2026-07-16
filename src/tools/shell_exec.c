@@ -1689,6 +1689,49 @@ static bool shell_sandbox_policy_is_valid(const struct shell_exec_config *cfg,
     return true;
 }
 
+static char *shell_sandbox_current_working_directory(void)
+{
+#ifdef _WIN32
+    return _getcwd(NULL, 0);
+#else
+    return getcwd(NULL, 0);
+#endif
+}
+
+static int shell_sandbox_apply_bypass_profile(struct shell_exec_config *cfg)
+{
+    char *working_directory = shell_sandbox_current_working_directory();
+
+    if (!working_directory)
+        return -1;
+
+    free(cfg->working_directory);
+    cfg->working_directory = working_directory;
+    free(cfg->run_as_user);
+    cfg->run_as_user = NULL;
+    free(cfg->run_as_group);
+    cfg->run_as_group = NULL;
+    shell_exec_allowed_env_destroy(cfg);
+    cfg->allowed_env_is_set = false;
+
+    cfg->max_command_length = MCP_SHELL_EXEC_MAX_COMMAND_LENGTH;
+    cfg->default_timeout_ms = MCP_SANDBOX_CTL_MAX_TIMEOUT_MS;
+    cfg->max_timeout_ms = MCP_SANDBOX_CTL_MAX_TIMEOUT_MS;
+    cfg->max_output_bytes = MCP_SANDBOX_CTL_MAX_OUTPUT_BYTES;
+    cfg->capture_stderr = true;
+    cfg->clear_environment = false;
+    cfg->request_cwd_allowed = true;
+    cfg->request_env_allowed = true;
+    cfg->kill_process_group_on_timeout = true;
+    cfg->max_cpu_seconds = 0u;
+    cfg->max_memory_bytes = 0u;
+    cfg->max_file_size_bytes = 0u;
+    cfg->max_open_files = 0u;
+    cfg->max_processes = 0u;
+    cfg->require_non_root = false;
+    return 0;
+}
+
 static int shell_sandbox_apply_effective_policy(struct shell_exec_config *cfg,
                                                 json_int_t revision,
                                                 bool sandbox_enabled,
@@ -1702,7 +1745,11 @@ static int shell_sandbox_apply_effective_policy(struct shell_exec_config *cfg,
             cfg, overrides, shell_enabled_is_set, shell_enabled) != 0)
         return -1;
     cfg->shell_enabled = cfg->enabled;
-    return shell_sandbox_policy_is_valid(cfg, NULL) ? 0 : 1;
+    if (!shell_sandbox_policy_is_valid(cfg, NULL))
+        return 1;
+    if (!sandbox_enabled && shell_sandbox_apply_bypass_profile(cfg) != 0)
+        return -1;
+    return 0;
 }
 
 static json_t *shell_sandbox_allowed_env_json(const struct shell_exec_config *cfg)
@@ -2743,7 +2790,7 @@ static char **shell_exec_build_envp(const struct shell_exec_config *cfg)
                     break;
                 }
             }
-            if (!allowed && cfg->allowed_env_count > 0)
+            if (!allowed && cfg->allowed_env_is_set)
                 continue;
             entry = mcp_strdup(*current);
             if (!entry || shell_exec_envp_append(&envp, &count, entry) != 0) {
