@@ -23,6 +23,7 @@
 #define MCP_DISCOVERY_HEARTBEAT_MS 1000u
 #define MCP_DISCOVERY_WAIT_MS 300u
 #define MCP_DISCOVERY_HEARTBEAT_TIMEOUT_MS 3000ull
+#define MCP_DISCOVERY_HEARTBEAT_STALL_MS 2000ull
 #define MCP_DISCOVERY_MAX_DATAGRAM 65536u
 #define MCP_DISCOVERY_MAX_FRAME (1024u * 1024u)
 #define MCP_DISCOVERY_WRITE_HIGH_WATERMARK (4u * 1024u * 1024u)
@@ -138,6 +139,7 @@ struct mcp_server_discovery {
     char *instance_id;
     unsigned long current_generation;
     unsigned long long heartbeat_id;
+    unsigned long long last_heartbeat_tick_ms;
     unsigned int next_server_id;
 
     struct discovery_peer *peers;
@@ -696,9 +698,9 @@ static void peer_conn_fail(struct discovery_peer_conn *conn)
     peer_conn_close(conn);
 }
 
-static void discovery_mark_stale_peers(struct mcp_server_discovery *discovery)
+static void discovery_mark_stale_peers(struct mcp_server_discovery *discovery,
+                                       unsigned long long now)
 {
-    unsigned long long now = mcp_now_ms();
     struct discovery_peer *peer;
 
     for (peer = discovery->peers; peer; peer = peer->next) {
@@ -708,6 +710,17 @@ static void discovery_mark_stale_peers(struct mcp_server_discovery *discovery)
             peer->state = DISCOVERY_PEER_TIMEOUT;
             peer_conn_close(peer->conn);
         }
+    }
+}
+
+static void discovery_rebase_peer_heartbeats(struct mcp_server_discovery *discovery,
+                                             unsigned long long now)
+{
+    struct discovery_peer *peer;
+
+    for (peer = discovery->peers; peer; peer = peer->next) {
+        if (peer->state == DISCOVERY_PEER_ONLINE && peer->conn && peer->conn->connected)
+            peer->last_heartbeat_ms = now;
     }
 }
 
@@ -1005,18 +1018,13 @@ static int discovery_external_send_frame(void *arg,
 {
     struct mcp_server_discovery *discovery = arg;
     struct discovery_peer *peer;
-    int rc;
 
     if (!discovery || server_id == 0 || !payload || len == 0)
         return -1;
 
     for (peer = discovery->peers; peer; peer = peer->next) {
-        if (peer->server_id == server_id) {
-            rc = peer_send_frame(peer->conn, payload, len, false);
-            if (rc == 0)
-                peer_mark_heartbeat_ok(peer);
-            return rc;
-        }
+        if (peer->server_id == server_id)
+            return peer_send_frame(peer->conn, payload, len, false);
     }
 
     return -1;
@@ -1480,8 +1488,17 @@ static void heartbeat_timer_cb(uv_timer_t *timer)
 {
     struct mcp_server_discovery *discovery = timer->data;
     struct discovery_peer *peer;
+    unsigned long long now = mcp_now_ms();
+    bool local_stall = discovery->last_heartbeat_tick_ms > 0 &&
+                       now >= discovery->last_heartbeat_tick_ms &&
+                       now - discovery->last_heartbeat_tick_ms >
+                           MCP_DISCOVERY_HEARTBEAT_STALL_MS;
 
-    discovery_mark_stale_peers(discovery);
+    discovery->last_heartbeat_tick_ms = now;
+    if (local_stall)
+        discovery_rebase_peer_heartbeats(discovery, now);
+    else
+        discovery_mark_stale_peers(discovery, now);
     for (peer = discovery->peers; peer; peer = peer->next) {
         if (peer->state == DISCOVERY_PEER_OFFLINE)
             continue;
@@ -2017,6 +2034,7 @@ int mcp_server_discovery_start(struct mcp_server_discovery *discovery,
     discovery->heartbeat_timer.data = discovery;
 
     discovery->opened = true;
+    discovery->last_heartbeat_tick_ms = mcp_now_ms();
     uv_timer_start(&discovery->announce_timer,
                    announce_timer_cb,
                    MCP_DISCOVERY_ANNOUNCE_MS,
@@ -2317,9 +2335,6 @@ json_t *mcp_server_discovery_snapshot_json(struct mcp_server_discovery *discover
 
     if (!root || !servers)
         goto fail;
-
-    if (discovery)
-        discovery_mark_stale_peers(discovery);
 
     if (discovery) {
         json_t *entry = build_local_server_entry(discovery);

@@ -85,7 +85,10 @@ def start_server(exe, tcp_port, discovery_port, peer_discovery_port):
     env["MCP_DISCOVERY_ADVERTISE_HOST"] = "127.0.0.1"
     env["MCP_DISCOVERY_HOSTS"] = f"127.0.0.1:{peer_discovery_port}"
     env["MCP_STRICT_INIT"] = "0"
-    env["MCP_ENABLE_SHELL_EXEC"] = "0"
+    env["MCP_ENABLE_SHELL_EXEC"] = "1"
+    env["MCP_SHELL_EXEC_CONFIG"] = os.path.join(
+        os.path.dirname(__file__), "shell_exec_test_config.json"
+    )
     return subprocess.Popen(
         [exe],
         stdin=subprocess.DEVNULL,
@@ -256,6 +259,13 @@ def peer_entry(payload, port):
     )
 
 
+def blocking_command():
+    if os.name == "nt":
+        ping = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "ping.exe")
+        return f"{ping} -n 5 127.0.0.1 > NUL"
+    return "sleep 4"
+
+
 def main():
     exe = sys.argv[1]
     tcp_server = int(sys.argv[2])
@@ -304,6 +314,19 @@ def main():
         assert peer and peer["state"] == "online", payload
         assert len(online_peer.heartbeats) >= 2, online_peer.heartbeats
         assert online_peer.heartbeats[-1] - online_peer.heartbeats[0] >= 0.8, online_peer.heartbeats
+
+        sock.settimeout(8.0)
+        blocked = call_tool(
+            sock,
+            20,
+            "system.shell_exec",
+            {"command": blocking_command(), "timeout_ms": 5000},
+        )
+        assert blocked["exit_code"] == 0 and blocked["timed_out"] is False, blocked
+        payload = call_tool(sock, 21, "server.list_servers", {"wait_ms": 100})
+        peer = peer_entry(payload, fake_tcp_online)
+        assert peer and peer["state"] == "online" and peer["tcp_connected"] is True, payload
+        sock.settimeout(3.0)
 
         udp_sock.sendto(udp_packet("fake-timeout", fake_tcp_timeout), ("127.0.0.1", discovery_server))
         deadline = time.time() + 7
