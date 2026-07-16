@@ -138,6 +138,9 @@ def main():
         assert start_payload["pid"] > 0, start_payload
         assert start_payload["process_group_id"] == start_payload["pid"], start_payload
         assert start_payload["rollback"]["tool_name"] == "system.shell_kill", start_payload
+        assert start_payload["sandbox_revision"] == 0, start_payload
+        assert start_payload["sandbox_enabled"] is True, start_payload
+        assert start_payload["shell_enabled"] is True, start_payload
 
         wait_payload = json_content(
             call_tool(proc, 5, "system.shell_wait", {"job_id": job_id, "timeout_ms": 3000})
@@ -145,10 +148,12 @@ def main():
         assert wait_payload["wait_result"] == "finished", wait_payload
         assert wait_payload["state"] == "exited", wait_payload
         assert wait_payload["exit_code"] == 0, wait_payload
+        assert wait_payload["sandbox_revision"] == start_payload["sandbox_revision"], wait_payload
 
         tail_payload = json_content(call_tool(proc, 6, "system.shell_tail", {"job_id": job_id}))
         assert tail_payload["stdout"] == "startdone", tail_payload
         assert tail_payload["next_stdout_offset"] == len("startdone"), tail_payload
+        assert tail_payload["sandbox_revision"] == start_payload["sandbox_revision"], tail_payload
 
         env_started = json_content(
             call_tool(
@@ -241,6 +246,8 @@ def main():
         ids = {job["job_id"] for job in jobs}
         assert job_id in ids and kill_job_id in ids and timed_started["job_id"] in ids, jobs
         assert env_job_id in ids and truncated_job_id in ids, jobs
+        listed = next(job for job in jobs if job["job_id"] == job_id)
+        assert listed["sandbox_revision"] == start_payload["sandbox_revision"], listed
     finally:
         if proc.stdin:
             proc.stdin.close()

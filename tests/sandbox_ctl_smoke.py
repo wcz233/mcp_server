@@ -205,6 +205,21 @@ def successful_shell_payload(client, arguments):
     return json.loads(text)
 
 
+def successful_job_payload(client, name, arguments):
+    response = client.call(name, arguments)
+    assert "result" in response, response
+    result = response["result"]
+    assert result["isError"] is False, result
+    return json.loads(result["content"][0]["text"])
+
+
+def assert_job_error(client, name, arguments, expected_text):
+    response = client.call(name, arguments)
+    result = response["result"]
+    assert result["isError"] is True, result
+    assert expected_text in result["content"][0]["text"], result
+
+
 def assert_error_unchanged(client, arguments, code="invalid_params", field=None):
     before = client.get()
     response = client.control_response(arguments)
@@ -1041,6 +1056,78 @@ def verify_synchronous_bypass(exe, config_path, config):
     client.close()
 
 
+def verify_async_effective_policy(exe, config_path, config):
+    if os.name == "nt":
+        return
+
+    write_config(config_path, config)
+    client = Client(exe, control_env(config_path, gate="1", token=TOKEN))
+    state = client.get()
+    state = client.control(
+        update_arguments(
+            state,
+            shell_enabled=True,
+            overrides={
+                "default_timeout_ms": 100,
+                "max_timeout_ms": 100,
+                "max_output_bytes": 1024,
+                "execution": {
+                    "request_cwd_allowed": False,
+                    "request_env_allowed": False,
+                },
+            },
+        )
+    )
+
+    assert_job_error(
+        client,
+        "system.shell_start",
+        {"command": "pwd", "cwd": str(config_path.parent)},
+        "cwd is disabled",
+    )
+    assert_job_error(
+        client,
+        "system.shell_start",
+        {"command": "true", "env": {"MCP_ASYNC_VALUE": "blocked"}},
+        "env is disabled",
+    )
+
+    started = successful_job_payload(
+        client,
+        "system.shell_start",
+        {"command": "printf 'x%.0s' $(seq 1 300)", "output_limit_bytes": 256},
+    )
+    assert started["sandbox_revision"] == state["revision"], started
+    assert started["sandbox_enabled"] is True and started["shell_enabled"] is True, started
+    waited = successful_job_payload(
+        client, "system.shell_wait", {"job_id": started["job_id"], "timeout_ms": 3000}
+    )
+    tailed = successful_job_payload(client, "system.shell_tail", {"job_id": started["job_id"]})
+    listed = successful_job_payload(client, "system.shell_list", {})
+    for payload in (waited, tailed, next(job for job in listed["jobs"] if job["job_id"] == started["job_id"])):
+        assert payload["sandbox_revision"] == state["revision"], payload
+        assert payload["sandbox_enabled"] is True and payload["shell_enabled"] is True, payload
+    assert tailed["stdout"] == "x" * 256 and tailed["stdout_truncated"] is True, tailed
+
+    marker = config_path.parent / "async-timeout.marker"
+    marker.unlink(missing_ok=True)
+    timed = successful_job_payload(
+        client,
+        "system.shell_start",
+        {"command": f"sh -c 'sleep 0.3; touch {marker}'"},
+    )
+    timed_wait = successful_job_payload(
+        client, "system.shell_wait", {"job_id": timed["job_id"], "timeout_ms": 3000}
+    )
+    assert timed_wait["state"] == "timed_out", timed_wait
+    time.sleep(0.4)
+    assert not marker.exists(), marker
+    marker.unlink(missing_ok=True)
+
+    reset_state(client, state)
+    client.close()
+
+
 def verify_restart_clears_state(exe, config_path, config):
     write_config(config_path, config)
     client = Client(exe, control_env(config_path, gate="1", token=TOKEN))
@@ -1131,6 +1218,7 @@ def main():
         verify_capabilities(exe, config_path, copy.deepcopy(config))
         verify_reject_only_execution(exe, config_path, copy.deepcopy(config))
         verify_synchronous_bypass(exe, config_path, copy.deepcopy(config))
+        verify_async_effective_policy(exe, config_path, copy.deepcopy(config))
         verify_restart_clears_state(exe, config_path, copy.deepcopy(config))
         verify_base_drift_and_conflict(exe, config_path, copy.deepcopy(config))
     return 0

@@ -161,6 +161,9 @@ struct shell_job {
     bool stderr_open;
     bool process_reaped;
     bool kill_process_group;
+    json_int_t sandbox_revision;
+    bool sandbox_enabled;
+    bool shell_enabled;
 #ifndef _WIN32
     pid_t pid;
     pid_t process_group_id;
@@ -3642,7 +3645,7 @@ static json_t *shell_job_status_json(const struct shell_job *job)
     if (!job)
         return NULL;
 
-    payload = json_pack("{s:s,s:s,s:i,s:i,s:s,s:s,s:i,s:i,s:i,s:i,s:b,s:b,s:i,s:i}",
+    payload = json_pack("{s:s,s:s,s:i,s:i,s:s,s:s,s:i,s:i,s:i,s:i,s:b,s:b,s:i,s:i,s:I,s:b,s:b}",
                         "job_id",
                         job->job_id,
                         "state",
@@ -3670,7 +3673,13 @@ static json_t *shell_job_status_json(const struct shell_job *job)
                         "exit_code",
                         (json_int_t)job->exit_code,
                         "signal",
-                        (json_int_t)job->signal_number);
+                        (json_int_t)job->signal_number,
+                        "sandbox_revision",
+                        job->sandbox_revision,
+                        "sandbox_enabled",
+                        job->sandbox_enabled,
+                        "shell_enabled",
+                        job->shell_enabled);
     if (!payload)
         return NULL;
 
@@ -3718,6 +3727,10 @@ static int shell_job_apply_start_overrides(struct shell_exec_config *cfg,
 
     cwd = json_object_get(arguments, "cwd");
     if (cwd) {
+        if (!cfg->request_cwd_allowed) {
+            *out_error = mcp_strdup("Invalid params: cwd is disabled by the effective sandbox policy.");
+            return 0;
+        }
         if (!json_is_string(cwd)) {
             *out_error = mcp_strdup("Invalid params: cwd must be a string.");
             return 0;
@@ -3729,6 +3742,10 @@ static int shell_job_apply_start_overrides(struct shell_exec_config *cfg,
     env = json_object_get(arguments, "env");
     if (!env)
         return 0;
+    if (!cfg->request_env_allowed) {
+        *out_error = mcp_strdup("Invalid params: env is disabled by the effective sandbox policy.");
+        return 0;
+    }
     if (!json_is_object(env)) {
         *out_error = mcp_strdup("Invalid params: env must be an object of string values.");
         return 0;
@@ -4343,6 +4360,7 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
                                 json_t **out_result)
 {
     struct shell_exec_config cfg;
+    const struct mcp_shell_sandbox_control *control = server ? server->sandbox_control : NULL;
     struct shell_exec_request request;
     struct shell_job *job = NULL;
     json_t *command_value;
@@ -4379,6 +4397,30 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
         rc = 0;
         goto cleanup;
     }
+    if (!control) {
+        *out_result = mcp_tool_result_text("Failed to initialize shell sandbox policy.", true);
+        goto cleanup;
+    }
+    {
+        int effective_status = shell_sandbox_apply_effective_policy(&cfg,
+                                                                     control->revision,
+                                                                     control->sandbox_enabled,
+                                                                     control->shell_enabled_is_set,
+                                                                     control->shell_enabled,
+                                                                     control->overrides);
+        if (effective_status < 0) {
+            *out_result = mcp_tool_result_text("Failed to merge shell sandbox policy.", true);
+            goto cleanup;
+        }
+        if (effective_status > 0) {
+            *out_result = mcp_tool_result_text(
+                "system.shell_start is disabled because the effective sandbox policy is invalid.",
+                true);
+            rc = 0;
+            goto cleanup;
+        }
+    }
+
     if (!cfg.enabled) {
         *out_result = mcp_tool_result_text(
             "system.shell_start is disabled by policy. Enable it in shell_exec.json or MCP_ENABLE_SHELL_EXEC=1 for a trusted session.",
@@ -4480,6 +4522,9 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
     job->timeout_ms = request.timeout_ms;
     job->output_limit_bytes = output_limit_bytes;
     job->chunk_size = cfg.chunk_size;
+    job->sandbox_revision = cfg.sandbox_revision;
+    job->sandbox_enabled = cfg.sandbox_enabled;
+    job->shell_enabled = cfg.shell_enabled;
     job->started_ms = mcp_now_ms();
     job->deadline_ms = job->started_ms + job->timeout_ms;
     job->exit_code = -1;
