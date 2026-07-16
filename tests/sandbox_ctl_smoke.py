@@ -1128,6 +1128,93 @@ def verify_async_effective_policy(exe, config_path, config):
     client.close()
 
 
+def verify_async_job_snapshot_boundary(exe, config_path, config):
+    if os.name == "nt":
+        return
+
+    write_config(config_path, config)
+    client = Client(exe, control_env(config_path, gate="1", token=TOKEN))
+    state = client.get()
+    state = client.control(
+        update_arguments(
+            state,
+            shell_enabled=True,
+            overrides={
+                "default_timeout_ms": 1000,
+                "max_timeout_ms": 1000,
+                "max_output_bytes": 1024,
+            },
+        )
+    )
+    revision_a = state["revision"]
+    started_a = successful_job_payload(
+        client,
+        "system.shell_start",
+        {"command": "sh -c 'printf first; sleep 0.4; printf second'"},
+    )
+    assert started_a["sandbox_revision"] == revision_a, started_a
+
+    state = client.control(
+        update_arguments(
+            state,
+            overrides={
+                "default_timeout_ms": 50,
+                "max_timeout_ms": 50,
+                "max_output_bytes": 256,
+            },
+        )
+    )
+    revision_b = state["revision"]
+    assert revision_b == revision_a + 1, state
+
+    poll_a = successful_job_payload(client, "system.shell_poll", {"job_id": started_a["job_id"]})
+    tail_a = successful_job_payload(client, "system.shell_tail", {"job_id": started_a["job_id"]})
+    wait_a = successful_job_payload(
+        client, "system.shell_wait", {"job_id": started_a["job_id"], "timeout_ms": 3000}
+    )
+    listed_a = successful_job_payload(client, "system.shell_list", {})
+    for payload in (poll_a, tail_a, wait_a, next(job for job in listed_a["jobs"] if job["job_id"] == started_a["job_id"])):
+        assert payload["sandbox_revision"] == revision_a, payload
+        assert payload["sandbox_enabled"] is True and payload["shell_enabled"] is True, payload
+    final_a = successful_job_payload(client, "system.shell_tail", {"job_id": started_a["job_id"]})
+    assert final_a["state"] == "exited" and final_a["stdout"] == "firstsecond", final_a
+    assert final_a["stdout_truncated"] is False, final_a
+
+    marker_b = config_path.parent / "async-job-b.marker"
+    marker_b.unlink(missing_ok=True)
+    started_b = successful_job_payload(
+        client,
+        "system.shell_start",
+        {"command": f"sh -c 'sleep 0.2; touch {marker_b}'"},
+    )
+    assert started_b["sandbox_revision"] == revision_b, started_b
+    wait_b = successful_job_payload(
+        client, "system.shell_wait", {"job_id": started_b["job_id"], "timeout_ms": 3000}
+    )
+    assert wait_b["state"] == "timed_out", wait_b
+    time.sleep(0.3)
+    assert not marker_b.exists(), marker_b
+    marker_b.unlink(missing_ok=True)
+
+    state = client.control(update_arguments(state, shell_enabled=False))
+    marker_c = config_path.parent / "async-job-c.marker"
+    marker_c.unlink(missing_ok=True)
+    assert_job_error(
+        client,
+        "system.shell_start",
+        {"command": f"touch {marker_c}"},
+        "disabled by policy",
+    )
+    assert not marker_c.exists(), marker_c
+    marker_c.unlink(missing_ok=True)
+    for job_id, revision in ((started_a["job_id"], revision_a), (started_b["job_id"], revision_b)):
+        payload = successful_job_payload(client, "system.shell_poll", {"job_id": job_id})
+        assert payload["sandbox_revision"] == revision, payload
+
+    reset_state(client, state)
+    client.close()
+
+
 def verify_restart_clears_state(exe, config_path, config):
     write_config(config_path, config)
     client = Client(exe, control_env(config_path, gate="1", token=TOKEN))
@@ -1219,6 +1306,7 @@ def main():
         verify_reject_only_execution(exe, config_path, copy.deepcopy(config))
         verify_synchronous_bypass(exe, config_path, copy.deepcopy(config))
         verify_async_effective_policy(exe, config_path, copy.deepcopy(config))
+        verify_async_job_snapshot_boundary(exe, config_path, copy.deepcopy(config))
         verify_restart_clears_state(exe, config_path, copy.deepcopy(config))
         verify_base_drift_and_conflict(exe, config_path, copy.deepcopy(config))
     return 0
