@@ -572,6 +572,219 @@ def verify_control_contract(exe, config_path, config):
     assert "changed=" in stderr, stderr
 
 
+def reset_state(client, state):
+    return client.control(
+        {"action": "reset", "token": TOKEN, "expected_revision": state["revision"]}
+    )
+
+
+def capability_values(value):
+    values = []
+    if isinstance(value, dict):
+        for item in value.values():
+            values.extend(capability_values(item))
+    elif isinstance(value, str):
+        values.append(value)
+    return values
+
+
+def capability_patch(path, value):
+    patch = override_patch(path, value)
+    if path == ("default_timeout_ms",):
+        patch["max_timeout_ms"] = 300000
+    elif path == ("max_timeout_ms",):
+        patch["default_timeout_ms"] = 1
+    elif path == ("capture_stderr",) and value is False:
+        patch["merge_stderr"] = False
+    return patch
+
+
+def verify_capabilities(exe, config_path, config):
+    write_config(config_path, config)
+    client = Client(exe, control_env(config_path, gate="1", token=TOKEN))
+    state = client.get()
+    assert state["capabilities"]["shell_enabled"] == "enforced", state
+    assert state["capabilities"]["sandbox_enabled"] == "enforced", state
+
+    cases = [
+        (("max_command_length",), 4096),
+        (("default_timeout_ms",), 10000),
+        (("max_timeout_ms",), 10000),
+        (("max_output_bytes",), 32768),
+        (("capture_stderr",), False),
+        (("merge_stderr",), False),
+        (("execution", "working_directory"), "capability-cwd"),
+        (("execution", "request_cwd_allowed"), False),
+        (("execution", "clear_environment"), False),
+        (("execution", "allowed_env"), ["PATH"]),
+        (("execution", "request_env_allowed"), False),
+        (("execution", "kill_process_group_on_timeout"), False),
+        (("limits", "max_cpu_seconds"), 10),
+        (("limits", "max_memory_bytes"), 1048576),
+        (("limits", "max_file_size_bytes"), 1048576),
+        (("limits", "max_open_files"), 32),
+        (("limits", "max_processes"), 4),
+        (("isolation", "require_non_root"), True),
+    ]
+    for path, value in cases:
+        state = client.get()
+        status = nested_get(state["capabilities"], path)
+        assert status in {"enforced", "unsupported", "ignored", "reject_only"}, (path, state)
+        arguments = update_arguments(state, overrides=capability_patch(path, value))
+        if status == "unsupported":
+            assert_error_unchanged(
+                client,
+                arguments,
+                code="unsupported_on_platform",
+                field=".".join(path),
+            )
+            state = client.get()
+        else:
+            state = client.control(arguments)
+            assert nested_get(state["effective"], path) == value, (path, status, state)
+
+        state = client.control(
+            update_arguments(state, overrides=override_patch(path, None))
+        )
+        assert not nested_has(state["overrides"], path), (path, state)
+        state = reset_state(client, state)
+        assert state["overrides"] == {}, state
+
+    for path in [("execution", "run_as_user"), ("execution", "run_as_group")]:
+        state = client.get()
+        status = nested_get(state["capabilities"], path)
+        nonempty = update_arguments(state, overrides=override_patch(path, "sandbox-user"))
+        if status == "unsupported":
+            assert_error_unchanged(
+                client,
+                nonempty,
+                code="unsupported_on_platform",
+                field=".".join(path),
+            )
+            state = client.get()
+        else:
+            state = client.control(nonempty)
+            assert nested_get(state["effective"], path) == "sandbox-user", state
+        state = client.control(update_arguments(state, overrides=override_patch(path, "")))
+        assert nested_get(state["overrides"], path) == "", state
+        state = client.control(update_arguments(state, overrides=override_patch(path, None)))
+        assert not nested_has(state["overrides"], path), state
+        state = reset_state(client, state)
+
+    state = client.get()
+    state = client.control(update_arguments(state, shell_enabled=True))
+    assert state["capabilities"]["shell_enabled"] == "enforced", state
+    state = client.control(update_arguments(state, sandbox_enabled=False))
+    assert state["capabilities"]["sandbox_enabled"] == "enforced", state
+    assert state["capabilities"]["max_command_length"] == "ignored", state
+    assert nested_get(state["capabilities"], ("isolation", "require_non_root")) in {
+        "ignored",
+        "reject_only",
+    }, state
+    statuses = set(capability_values(state["capabilities"]))
+    assert "enforced" in statuses and "ignored" in statuses, statuses
+    if "reject_only" in statuses:
+        assert "unsupported" in statuses, statuses
+        assert statuses == {"enforced", "unsupported", "ignored", "reject_only"}, statuses
+    state = client.control(update_arguments(state, sandbox_enabled=True))
+    assert state["sandbox_enabled"] is True, state
+    reset_state(client, state)
+    client.close()
+
+
+def verify_reject_only_execution(exe, config_path, config):
+    reject_config = copy.deepcopy(config)
+    reject_config["enabled"] = True
+    reject_config["isolation"]["require_non_root"] = True
+    write_config(config_path, reject_config)
+    client = Client(exe, control_env(config_path, gate="1", token=TOKEN))
+    state = client.get()
+    status = nested_get(state["capabilities"], ("isolation", "require_non_root"))
+    if status == "reject_only":
+        response = client.call("system.shell_exec", {"command": "echo must-not-run"})
+        result = response["result"]
+        assert result["isError"] is True, result
+        assert "low-privilege token" in result["content"][0]["text"], result
+    client.close()
+
+
+def verify_restart_clears_state(exe, config_path, config):
+    write_config(config_path, config)
+    client = Client(exe, control_env(config_path, gate="1", token=TOKEN))
+    state = client.get()
+    state = client.control(
+        update_arguments(
+            state,
+            shell_enabled=True,
+            overrides={"max_command_length": 4096},
+        )
+    )
+    assert state["revision"] == 1 and state["overrides"], state
+    client.close()
+
+    restarted = Client(exe, control_env(config_path, gate="1", token=TOKEN))
+    state = restarted.get()
+    assert state["revision"] == 0, state
+    assert state["overrides"] == {}, state
+    assert state["shell_enabled_override"] is None, state
+    assert state["sandbox_enabled"] is True, state
+    restarted.close()
+
+
+def verify_base_drift_and_conflict(exe, config_path, config):
+    write_config(config_path, config)
+    client = Client(exe, control_env(config_path, gate="1", token=TOKEN))
+    initial = client.get()
+
+    drifted = copy.deepcopy(config)
+    drifted["max_command_length"] = 4096
+    write_config(config_path, drifted)
+    after_drift = client.get()
+    assert after_drift["revision"] == initial["revision"], (initial, after_drift)
+    assert after_drift["base"]["max_command_length"] == 4096, after_drift
+    assert after_drift["effective"]["max_command_length"] == 4096, after_drift
+
+    state = client.control(
+        update_arguments(after_drift, overrides={"default_timeout_ms": 20000})
+    )
+    assert state["policy_valid"] is True, state
+    saved_revision = state["revision"]
+    saved_overrides = copy.deepcopy(state["overrides"])
+
+    conflicting = copy.deepcopy(drifted)
+    conflicting["default_timeout_ms"] = 500
+    conflicting["max_timeout_ms"] = 1000
+    write_config(config_path, conflicting)
+    conflicted = client.get()
+    assert conflicted["revision"] == saved_revision, conflicted
+    assert conflicted["base"]["max_timeout_ms"] == 1000, conflicted
+    assert conflicted["overrides"] == saved_overrides, conflicted
+    assert conflicted["policy_valid"] is False, conflicted
+    assert conflicted["effective"] is None, conflicted
+
+    assert_error_unchanged(
+        client,
+        update_arguments(conflicted, shell_enabled=True),
+        code="config_unavailable",
+    )
+    assert_error_unchanged(
+        client,
+        {"action": "reset", "token": TOKEN, "expected_revision": conflicted["revision"]},
+        code="config_unavailable",
+    )
+
+    restored = copy.deepcopy(drifted)
+    restored["default_timeout_ms"] = 500
+    restored["max_timeout_ms"] = 30000
+    write_config(config_path, restored)
+    recovered = client.get()
+    assert recovered["revision"] == saved_revision, recovered
+    assert recovered["policy_valid"] is True, recovered
+    reset = reset_state(client, recovered)
+    assert reset["overrides"] == {}, reset
+    client.close()
+
+
 def main():
     exe = sys.argv[1]
     with tempfile.TemporaryDirectory(prefix="mcp-sandbox-ctl-") as temp_dir:
@@ -582,6 +795,10 @@ def main():
         verify_descriptor_and_auth(exe, config_path)
         verify_invalid_config(exe, config_path)
         verify_control_contract(exe, config_path, copy.deepcopy(config))
+        verify_capabilities(exe, config_path, copy.deepcopy(config))
+        verify_reject_only_execution(exe, config_path, copy.deepcopy(config))
+        verify_restart_clears_state(exe, config_path, copy.deepcopy(config))
+        verify_base_drift_and_conflict(exe, config_path, copy.deepcopy(config))
     return 0
 
 
