@@ -236,7 +236,8 @@ static int run_window_credit_test(void)
         goto cleanup;
     handle_window_update(1, payload);
     if (ctx->send_session_window != MFT_INITIAL_SESSION_WINDOW ||
-        ctx->entries[0].send_window_bytes != MFT_INITIAL_STREAM_WINDOW)
+        ctx->entries[0].send_window_bytes != MFT_INITIAL_STREAM_WINDOW ||
+        !ctx->send_paused)
         goto cleanup;
 
     handle_window_update(1, payload);

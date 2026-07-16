@@ -2241,7 +2241,6 @@ static void handle_window_update(unsigned int server_id, json_t *payload)
     struct manifest_entry *entry;
     json_int_t stream_id_raw;
     json_int_t bytes_raw;
-    bool failed = false;
 
     if (!json_is_string(transfer_id) ||
         !json_is_integer(stream_id_json) ||
@@ -2272,15 +2271,15 @@ static void handle_window_update(unsigned int server_id, json_t *payload)
     }
     ctx->send_session_window += (uint64_t)bytes_raw;
     entry->send_window_bytes += (uint64_t)bytes_raw;
-    if (touch_transfer_activity(ctx) != 0 || send_pump(ctx) != 0) {
+    if (touch_transfer_activity(ctx) != 0) {
         unlink_transfer(ctx);
-        failed = true;
-    }
-    mft_unlock();
-    if (failed)
+        mft_unlock();
         complete_transfer_error_unlinked(ctx, "Failed to continue file transfer data.", true);
-    else
-        mft_signal_timer();
+        return;
+    }
+    schedule_send_pump(ctx, 0);
+    mft_unlock();
+    mft_signal_timer();
 }
 
 static bool entry_should_receive(struct transfer_context *ctx, size_t index)
@@ -4344,7 +4343,6 @@ static void handle_accept(unsigned int server_id, json_t *payload)
     json_t *accept = json_object_get(payload, "accept");
     struct transfer_context *ctx;
     int prepare_failed = 0;
-    int pump_failed = 0;
     char *transfer_id_value = NULL;
 
     if (!json_is_string(transfer_id) || !json_is_array(accept))
@@ -4372,22 +4370,14 @@ static void handle_accept(unsigned int server_id, json_t *payload)
     (void)server_id;
     if (prepare_send_entries(ctx, accept) != 0)
         prepare_failed = 1;
-    else {
-        touch_transfer_activity(ctx);
-        if (send_pump(ctx) != 0)
-            pump_failed = 1;
-    }
+    else if (touch_transfer_activity(ctx) != 0)
+        prepare_failed = 1;
+    else
+        schedule_send_pump(ctx, 0);
     mft_unlock();
     if (prepare_failed) {
         complete_transfer_error_by_id(transfer_id_value,
                                       "Failed to send file transfer data.",
-                                      true);
-        free(transfer_id_value);
-        return;
-    }
-    if (pump_failed) {
-        complete_transfer_error_by_id(transfer_id_value,
-                                      "Failed to start file transfer data.",
                                       true);
         free(transfer_id_value);
         return;
