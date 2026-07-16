@@ -301,6 +301,19 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
         return -1;
 
     if (register_tool(registry,
+                      "system.sandbox_ctl",
+                      "Query and atomically update process-local shell sandbox policy overrides.",
+                      mcp_schema_sandbox_ctl(),
+                      "builtin",
+                      "L4",
+                      "system.sandbox.control",
+                      false,
+                      false,
+                      1000,
+                      mcp_tool_system_sandbox_ctl) != 0)
+        return -1;
+
+    if (register_tool(registry,
                       "system.shell_exec",
                       "Execute a host shell command with OS-level isolation, timeout and structured output.",
                       mcp_schema_shell_exec(),

@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 json_t *mcp_schema_empty_object(void);
+json_t *mcp_schema_sandbox_ctl(void);
 json_t *mcp_schema_shell_exec(void);
 json_t *mcp_schema_shell_start(void);
 json_t *mcp_schema_shell_job_id(void);

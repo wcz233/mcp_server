@@ -1,23 +1,18 @@
+import copy
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 
-def send(proc, payload):
-    proc.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
-    proc.stdin.flush()
+TOKEN = "s2-token-must-not-appear-7f51b36e"
 
 
-def recv(proc):
-    line = proc.stdout.readline()
-    if not line:
-        raise RuntimeError("server closed stdout")
-    return json.loads(line)
-
-
-def control_env(gate=None, token=None):
+def control_env(config_path, gate=None, token=None):
     env = os.environ.copy()
+    env["MCP_SHELL_EXEC_CONFIG"] = str(config_path)
     env.pop("MCP_ENABLE_SANDBOX_CTL", None)
     env.pop("MCP_SANDBOX_CTL_TOKEN", None)
     if gate is not None:
@@ -27,100 +22,566 @@ def control_env(gate=None, token=None):
     return env
 
 
-def assert_startup_failure(exe, gate, token, expected_error):
-    proc = subprocess.run(
-        [exe],
-        input="",
-        capture_output=True,
-        env=control_env(gate, token),
-        text=True,
-        encoding="utf-8",
-        timeout=5,
-    )
+def valid_config(working_directory):
+    return {
+        "enabled": False,
+        "max_command_length": 3500,
+        "default_timeout_ms": 5000,
+        "max_timeout_ms": 30000,
+        "max_output_bytes": 16384,
+        "chunk_size": 1024,
+        "capture_stderr": True,
+        "merge_stderr": False,
+        "execution": {
+            "mode": "shell",
+            "working_directory": str(working_directory),
+            "request_cwd_allowed": True,
+            "clear_environment": True,
+            "allowed_env": ["PATH"],
+            "request_env_allowed": True,
+            "run_as_user": "",
+            "run_as_group": "",
+            "kill_process_group_on_timeout": True,
+        },
+        "limits": {
+            "max_cpu_seconds": 5,
+            "max_memory_bytes": 134217728,
+            "max_file_size_bytes": 10485760,
+            "max_open_files": 64,
+            "max_processes": 16,
+        },
+        "isolation": {"require_non_root": False},
+    }
 
-    assert proc.returncode == 1, (proc.returncode, proc.stdout, proc.stderr)
-    assert expected_error in proc.stderr, proc.stderr
-    assert "uv_loop_close" not in proc.stderr, proc.stderr
-    if token:
-        assert token not in proc.stdout, proc.stdout
-        assert token not in proc.stderr, proc.stderr
+
+def write_config(path, value):
+    path.write_text(json.dumps(value, separators=(",", ":")), encoding="utf-8")
 
 
-def assert_starts_without_registered_tool(exe, gate=None, token=None):
-    proc = subprocess.Popen(
-        [exe],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=control_env(gate, token),
-        text=True,
-        encoding="utf-8",
-    )
-
-    try:
-        send(
-            proc,
+class Client:
+    def __init__(self, exe, env):
+        self.stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+        self.proc = subprocess.Popen(
+            [exe],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self.stderr_file,
+            env=env,
+            text=True,
+            encoding="utf-8",
+        )
+        self.next_id = 1
+        self.responses = []
+        self.stderr = ""
+        init = self.request(
+            "initialize",
             {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "sandbox-ctl-smoke", "version": "0.1"},
-                },
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "sandbox-ctl-smoke", "version": "0.2"},
             },
         )
-        init = recv(proc)
-        assert init["id"] == 1, init
         assert init["result"]["serverInfo"]["name"] == "mcp_server", init
+        self.notify("notifications/initialized", {})
 
-        send(proc, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
-        send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-        tools = recv(proc)
-        names = {tool["name"] for tool in tools["result"]["tools"]}
-        assert "system.sandbox_ctl" not in names, names
-    finally:
-        if proc.stdin:
-            proc.stdin.close()
-            proc.stdin = None
+    def send(self, payload):
+        self.proc.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        self.proc.stdin.flush()
+
+    def receive(self):
+        line = self.proc.stdout.readline()
+        if not line:
+            raise RuntimeError("server closed stdout")
+        response = json.loads(line)
+        self.responses.append(response)
+        return response
+
+    def request(self, method, params):
+        request_id = self.next_id
+        self.next_id += 1
+        self.send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        response = self.receive()
+        if response.get("id") != request_id:
+            assert response.get("id") is None, response
+            assert response.get("error", {}).get("code") == -32700, response
+        return response
+
+    def notify(self, method, params):
+        self.send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def tools(self):
+        return self.request("tools/list", {})["result"]["tools"]
+
+    def call(self, name, arguments):
+        return self.request("tools/call", {"name": name, "arguments": arguments})
+
+    def control_response(self, arguments):
+        return self.call("system.sandbox_ctl", arguments)
+
+    def control(self, arguments, expect_error=False):
+        response = self.control_response(arguments)
+        assert "result" in response, response
+        result = response["result"]
+        assert result["isError"] is expect_error, result
+        content = result["content"]
+        assert content and content[0]["type"] == "text", result
+        return json.loads(content[0]["text"])
+
+    def get(self):
+        return self.control({"action": "get", "token": TOKEN})
+
+    def close(self):
+        if self.proc.stdin:
+            self.proc.stdin.close()
+            self.proc.stdin = None
         try:
-            stdout, stderr = proc.communicate(timeout=5)
+            self.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-            raise AssertionError(("server did not exit", stdout, stderr))
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+            raise AssertionError("server did not exit")
+        self.stderr_file.seek(0)
+        self.stderr = self.stderr_file.read()
+        self.stderr_file.close()
+        assert self.proc.returncode == 0, (self.proc.returncode, self.stderr)
+        assert "uv_loop_close" not in self.stderr, self.stderr
+        serialized_responses = json.dumps(self.responses, ensure_ascii=False)
+        assert TOKEN not in serialized_responses, serialized_responses
+        assert TOKEN not in self.stderr, self.stderr
+        return self.stderr
 
-    assert proc.returncode == 0, (proc.returncode, stdout, stderr)
-    assert "uv_loop_close" not in stderr, stderr
+
+def descriptor_by_name(tools, name):
+    return next(tool for tool in tools if tool["name"] == name)
+
+
+def nested_get(value, path):
+    for key in path:
+        value = value[key]
+    return value
+
+
+def nested_has(value, path):
+    for key in path[:-1]:
+        if key not in value:
+            return False
+        value = value[key]
+    return path[-1] in value
+
+
+def override_patch(path, value):
+    patch = value
+    for key in reversed(path):
+        patch = {key: patch}
+    return patch
+
+
+def update_arguments(state, **values):
+    return {
+        "action": "update",
+        "token": TOKEN,
+        "expected_revision": state["revision"],
+        **values,
+    }
+
+
+def assert_error_unchanged(client, arguments, code="invalid_params", field=None):
+    before = client.get()
+    response = client.control_response(arguments)
+    if "result" in response:
+        result = response["result"]
+        assert result["isError"] is True, result
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["code"] == code, payload
+        if field is not None:
+            assert payload.get("field") == field, payload
+    else:
+        assert "error" in response, response
+    after = client.get()
+    assert after == before, (before, response, after)
+    return response
+
+
+def assert_successful_update(client, state, path, value, extra_overrides=None):
+    patch = override_patch(path, value)
+    if extra_overrides:
+        for key, extra_value in extra_overrides.items():
+            patch[key] = extra_value
+    updated = client.control(update_arguments(state, overrides=patch))
+    assert updated["revision"] == state["revision"] + 1, updated
+    assert nested_get(updated["overrides"], path) == value, updated
+    assert nested_get(updated["effective"], path) == value, updated
+    return updated
+
+
+def assert_valid_or_unsupported(client, state, path, value, unsupported, extra_overrides=None):
+    patch = override_patch(path, value)
+    if extra_overrides:
+        for key, extra_value in extra_overrides.items():
+            patch[key] = extra_value
+    arguments = update_arguments(state, overrides=patch)
+    if unsupported:
+        assert_error_unchanged(
+            client, arguments, code="unsupported_on_platform", field=".".join(path)
+        )
+        return state
+    return assert_successful_update(client, state, path, value, extra_overrides)
+
+
+def numeric_patch(path, value):
+    patch = override_patch(path, value)
+    if path == ("default_timeout_ms",):
+        patch["max_timeout_ms"] = 300000
+    elif path == ("max_timeout_ms",):
+        patch["default_timeout_ms"] = 1
+    return patch
+
+
+def exercise_numeric_boundaries(client):
+    windows = sys.platform == "win32"
+    cases = [
+        (("max_command_length",), 64, 65535, [128, 4096, 64000], False),
+        (("default_timeout_ms",), 1, 300000, [100, 150000, 299000], False),
+        (("max_timeout_ms",), 1, 300000, [100, 150000, 299000], False),
+        (("max_output_bytes",), 256, 2147483648, [1024, 1048576, 1073741824], False),
+        (("limits", "max_cpu_seconds"), 0, 3600, [1, 1800, 3500], windows),
+        (("limits", "max_memory_bytes"), 0, 2147483647, [1, 1048576, 1073741824], windows),
+        (("limits", "max_file_size_bytes"), 0, 2147483647, [1, 1048576, 1073741824], windows),
+        (("limits", "max_open_files"), 0, 1048576, [1, 4096, 1000000], windows),
+        (("limits", "max_processes"), 0, 1048576, [1, 4096, 1000000], windows),
+    ]
+    for path, minimum, maximum, typical, unsupported in cases:
+        state = client.get()
+        if state["overrides"]:
+            state = client.control(
+                {"action": "reset", "token": TOKEN, "expected_revision": state["revision"]}
+            )
+        assert not nested_has(state["overrides"], path), (path, state)
+        for value in [*typical, minimum, maximum]:
+            patch = numeric_patch(path, value)
+            if unsupported:
+                assert_error_unchanged(
+                    client,
+                    update_arguments(state, overrides=patch),
+                    code="unsupported_on_platform",
+                    field=".".join(path),
+                )
+            else:
+                state = client.control(update_arguments(state, overrides=patch))
+                assert nested_get(state["effective"], path) == value, (path, value, state)
+
+        invalid_values = [minimum - 1, maximum + 1, minimum - 100000, maximum + 1000000, ""]
+        for value in invalid_values:
+            assert_error_unchanged(
+                client,
+                update_arguments(state, overrides=numeric_patch(path, value)),
+                field=".".join(path),
+            )
+        for value in [-(2**63) - 1, 2**63]:
+            assert_error_unchanged(
+                client,
+                update_arguments(state, overrides=numeric_patch(path, value)),
+                field=None,
+            )
+
+        state = client.control(update_arguments(state, overrides=override_patch(path, None)))
+        assert not nested_has(state["overrides"], path), (path, state)
+
+
+def exercise_working_directory_boundaries(client):
+    path = ("execution", "working_directory")
+    state = client.get()
+    for length in [2, 17, 1024, 1, 4096]:
+        value = "x" * length
+        state = assert_successful_update(client, state, path, value)
+    for value in ["", "x" * 4097, "x" * 5000, [], {}, "a\x00b"]:
+        assert_error_unchanged(
+            client,
+            update_arguments(state, overrides=override_patch(path, value)),
+            field="execution.working_directory",
+        )
+    state = client.control(update_arguments(state, overrides=override_patch(path, None)))
+    assert not nested_has(state["overrides"], path), state
+
+
+def exercise_allowed_env_boundaries(client):
+    path = ("execution", "allowed_env")
+    unsupported = sys.platform == "win32"
+    state = client.get()
+    for length in [2, 31, 200, 1, 255]:
+        value = ["A" * length]
+        state = assert_valid_or_unsupported(client, state, path, value, unsupported)
+    for count in [0, 3, 64, 127, 128]:
+        value = [f"V{index}" for index in range(count)]
+        state = assert_valid_or_unsupported(client, state, path, value, unsupported)
+
+    invalid_values = [
+        [""],
+        ["A" * 256],
+        ["A" * 300],
+        ["A=B"],
+        ["A\x00B"],
+        [1],
+        "",
+        {},
+        [f"V{index}" for index in range(129)],
+        [f"V{index}" for index in range(256)],
+    ]
+    for value in invalid_values:
+        assert_error_unchanged(
+            client,
+            update_arguments(state, overrides=override_patch(path, value)),
+            field="execution.allowed_env",
+        )
+    state = client.control(update_arguments(state, overrides=override_patch(path, None)))
+    assert not nested_has(state["overrides"], path), state
+
+
+def exercise_boolean_and_identity_fields(client):
+    windows = sys.platform == "win32"
+    boolean_cases = [
+        (("capture_stderr",), False),
+        (("merge_stderr",), False),
+        (("execution", "request_cwd_allowed"), windows),
+        (("execution", "clear_environment"), False),
+        (("execution", "request_env_allowed"), windows),
+        (("execution", "kill_process_group_on_timeout"), windows),
+        (("isolation", "require_non_root"), False),
+    ]
+    for path, unsupported in boolean_cases:
+        state = client.get()
+        for value in [True, False]:
+            extra = {"merge_stderr": False} if path == ("capture_stderr",) and not value else None
+            state = assert_valid_or_unsupported(client, state, path, value, unsupported, extra)
+        for value in ["", [], {}, 0]:
+            assert_error_unchanged(
+                client,
+                update_arguments(state, overrides=override_patch(path, value)),
+                field=".".join(path),
+            )
+        state = client.control(update_arguments(state, overrides=override_patch(path, None)))
+        assert not nested_has(state["overrides"], path), state
+
+    for path in [("execution", "run_as_user"), ("execution", "run_as_group")]:
+        state = client.get()
+        state = assert_successful_update(client, state, path, "")
+        if windows:
+            assert_error_unchanged(
+                client,
+                update_arguments(state, overrides=override_patch(path, "sandbox-user")),
+                code="unsupported_on_platform",
+                field=".".join(path),
+            )
+        else:
+            state = assert_successful_update(client, state, path, "sandbox-user")
+        for value in [1, [], {}, "a\x00b"]:
+            assert_error_unchanged(
+                client,
+                update_arguments(state, overrides=override_patch(path, value)),
+                field=".".join(path),
+            )
+        state = client.control(update_arguments(state, overrides=override_patch(path, None)))
+        assert not nested_has(state["overrides"], path), state
+
+
+def verify_descriptor_and_auth(exe, config_path):
+    client = Client(exe, control_env(config_path))
+    tools = client.tools()
+    descriptor = descriptor_by_name(tools, "system.sandbox_ctl")
+    annotations = descriptor["annotations"]
+    assert annotations == {
+        "source": "builtin",
+        "route": "local_builtin",
+        "risk_level": "L4",
+        "permission": "system.sandbox.control",
+        "idempotent": False,
+        "retryable": False,
+        "cancelable": False,
+        "timeout_ms": 1000,
+    }, annotations
+    schema = descriptor["inputSchema"]
+    assert schema["additionalProperties"] is False, schema
+    assert schema["required"] == ["action", "token"], schema
+    assert schema["properties"]["overrides"]["additionalProperties"] is False, schema
+    assert schema["properties"]["overrides"]["properties"]["execution"][
+        "additionalProperties"
+    ] is False, schema
+
+    error = client.control({"action": "get", "token": TOKEN}, expect_error=True)
+    assert error == {
+        "code": "unauthorized",
+        "message": "sandbox control authentication failed",
+    }, error
+    client.close()
+
+
+def verify_invalid_config(exe, config_path):
+    config_path.write_text("{invalid", encoding="utf-8")
+    client = Client(exe, control_env(config_path, gate="1", token=TOKEN))
+    state = client.get()
+    assert state["revision"] == 0, state
+    assert state["config_loaded"] is False, state
+    assert state["policy_valid"] is False, state
+    assert state["base"] is None and state["effective"] is None, state
+    assert state["shell_enabled"] is None, state
+    assert state["overrides"] == {}, state
+    assert state["config_error"], state
+
+    assert_error_unchanged(
+        client,
+        {"action": "update", "token": TOKEN, "expected_revision": 1, "shell_enabled": True},
+        code="revision_conflict",
+    )
+    assert_error_unchanged(
+        client,
+        {"action": "update", "token": TOKEN, "expected_revision": 0, "shell_enabled": True},
+        code="config_unavailable",
+    )
+    assert_error_unchanged(
+        client,
+        {"action": "reset", "token": TOKEN, "expected_revision": 0},
+        code="config_unavailable",
+    )
+    client.close()
+
+
+def verify_control_contract(exe, config_path, config):
+    write_config(config_path, config)
+    client = Client(exe, control_env(config_path, gate="1", token=TOKEN))
+    descriptor_by_name(client.tools(), "system.sandbox_ctl")
+
+    state = client.get()
+    assert state["revision"] == 0, state
+    assert state["persistence"] == "process", state
+    assert state["applies_to"] == "new_executions", state
+    assert state["shell_enabled"] is False, state
+    assert state["shell_enabled_override"] is None, state
+    assert state["sandbox_enabled"] is True, state
+    assert state["config_loaded"] is True and state["policy_valid"] is True, state
+    assert state["overrides"] == {}, state
+    assert "sandbox_enabled" not in state["base"], state
+    assert state["effective"]["sandbox_enabled"] is True, state
+
+    for arguments in [
+        {},
+        {"action": "get"},
+        {"action": "get", "token": ""},
+        {"action": "get", "token": "wrong"},
+        {"action": "get", "token": 1},
+        {"action": 1, "token": "wrong"},
+    ]:
+        error = client.control(arguments, expect_error=True)
+        assert error["code"] == "unauthorized", (arguments, error)
+
+    invalid_requests = [
+        ({"action": "unknown", "token": TOKEN}, "action"),
+        ({"action": "get", "token": TOKEN, "extra": True}, "extra"),
+        ({"action": "update", "token": TOKEN, "shell_enabled": True}, "expected_revision"),
+        (
+            {"action": "update", "token": TOKEN, "expected_revision": -1, "shell_enabled": True},
+            "expected_revision",
+        ),
+        (
+            {"action": "update", "token": TOKEN, "expected_revision": "0", "shell_enabled": True},
+            "expected_revision",
+        ),
+        (
+            {"action": "update", "token": TOKEN, "expected_revision": 0, "overrides": {}},
+            "overrides",
+        ),
+        (
+            {
+                "action": "update",
+                "token": TOKEN,
+                "expected_revision": 0,
+                "overrides": {"unknown": 1},
+            },
+            "overrides",
+        ),
+        (
+            {
+                "action": "update",
+                "token": TOKEN,
+                "expected_revision": 0,
+                "overrides": {"execution": {"unknown": 1}},
+            },
+            "overrides.execution",
+        ),
+        (
+            {"action": "reset", "token": TOKEN, "expected_revision": 0, "extra": True},
+            "extra",
+        ),
+    ]
+    for arguments, field in invalid_requests:
+        assert_error_unchanged(client, arguments, field=field)
+
+    assert_error_unchanged(
+        client,
+        {"action": "update", "token": TOKEN, "expected_revision": 1, "shell_enabled": True},
+        code="revision_conflict",
+    )
+    assert_error_unchanged(
+        client,
+        update_arguments(
+            state,
+            overrides={"default_timeout_ms": 2000, "max_timeout_ms": 1000},
+        ),
+        code="invalid_params",
+    )
+    assert_error_unchanged(
+        client,
+        update_arguments(state, overrides={"capture_stderr": False, "merge_stderr": True}),
+        code="invalid_params",
+    )
+
+    state = client.control(update_arguments(state, shell_enabled=False))
+    assert state["revision"] == 1 and state["overrides"]["shell_enabled"] is False, state
+    state = client.control(update_arguments(state, shell_enabled=False))
+    assert state["revision"] == 2 and state["overrides"]["shell_enabled"] is False, state
+    state = client.control(update_arguments(state, sandbox_enabled=False))
+    assert state["sandbox_enabled"] is False and state["revision"] == 3, state
+    state = client.control(update_arguments(state, sandbox_enabled=True))
+    assert state["sandbox_enabled"] is True and state["revision"] == 4, state
+    state = client.control(update_arguments(state, shell_enabled=None))
+    assert state["shell_enabled_override"] is None, state
+    assert "shell_enabled" not in state["overrides"], state
+
+    exercise_numeric_boundaries(client)
+    exercise_working_directory_boundaries(client)
+    exercise_allowed_env_boundaries(client)
+    exercise_boolean_and_identity_fields(client)
+
+    state = client.get()
+    state = client.control(update_arguments(state, shell_enabled=True))
+    assert state["shell_enabled"] is True, state
+    shell_response = client.call("system.shell_exec", {"command": "echo must-not-run"})
+    shell_result = shell_response["result"]
+    assert shell_result["isError"] is True, shell_result
+    assert "disabled by policy" in shell_result["content"][0]["text"], shell_result
+
+    reset = client.control(
+        {"action": "reset", "token": TOKEN, "expected_revision": state["revision"]}
+    )
+    assert reset["revision"] == state["revision"] + 1, reset
+    assert reset["overrides"] == {}, reset
+    assert reset["shell_enabled_override"] is None, reset
+    assert reset["sandbox_enabled"] is True, reset
+    assert reset["shell_enabled"] is False, reset
+    stderr = client.close()
+    assert "action=update" in stderr and "action=reset" in stderr, stderr
+    assert "changed=" in stderr, stderr
 
 
 def main():
     exe = sys.argv[1]
-    assert_starts_without_registered_tool(exe)
-    assert_starts_without_registered_tool(exe, gate="")
-    assert_starts_without_registered_tool(exe, gate="0")
-    assert_starts_without_registered_tool(exe, gate="1", token="x")
-
-    secret = "s1-token-must-not-appear-7f51b36e"
-    assert_startup_failure(
-        exe,
-        gate="off",
-        token=secret,
-        expected_error="MCP_ENABLE_SANDBOX_CTL must be unset, empty, 0, or 1",
-    )
-    assert_startup_failure(
-        exe,
-        gate="1",
-        token=None,
-        expected_error="MCP_SANDBOX_CTL_TOKEN must be non-empty when MCP_ENABLE_SANDBOX_CTL=1",
-    )
-    assert_startup_failure(
-        exe,
-        gate="1",
-        token="",
-        expected_error="MCP_SANDBOX_CTL_TOKEN must be non-empty when MCP_ENABLE_SANDBOX_CTL=1",
-    )
+    with tempfile.TemporaryDirectory(prefix="mcp-sandbox-ctl-") as temp_dir:
+        temp_path = Path(temp_dir)
+        config_path = temp_path / "shell_exec.json"
+        config = valid_config(temp_path)
+        write_config(config_path, config)
+        verify_descriptor_and_auth(exe, config_path)
+        verify_invalid_config(exe, config_path)
+        verify_control_contract(exe, config_path, copy.deepcopy(config))
     return 0
 
 

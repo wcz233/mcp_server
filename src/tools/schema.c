@@ -170,6 +170,263 @@ json_t *mcp_schema_empty_object(void)
     return json_pack("{s:s,s:o}", "type", "object", "properties", json_object());
 }
 
+static json_t *sandbox_schema_nullable(json_t *typed)
+{
+    json_t *options = json_array();
+    json_t *null_type = json_pack("{s:s}", "type", "null");
+    json_t *schema = json_object();
+
+    if (!typed || !options || !null_type || !schema)
+        goto fail;
+    if (json_array_append_new(options, typed) != 0)
+        goto fail;
+    typed = NULL;
+    if (json_array_append_new(options, null_type) != 0)
+        goto fail;
+    null_type = NULL;
+    if (json_object_set_new(schema, "anyOf", options) != 0)
+        goto fail;
+    options = NULL;
+    return schema;
+
+fail:
+    json_decref(typed);
+    json_decref(options);
+    json_decref(null_type);
+    json_decref(schema);
+    return NULL;
+}
+
+static json_t *sandbox_schema_nullable_boolean(void)
+{
+    return sandbox_schema_nullable(json_pack("{s:s}", "type", "boolean"));
+}
+
+static json_t *sandbox_schema_nullable_integer(json_int_t minimum, json_int_t maximum)
+{
+    return sandbox_schema_nullable(json_pack("{s:s,s:I,s:I}",
+                                             "type",
+                                             "integer",
+                                             "minimum",
+                                             minimum,
+                                             "maximum",
+                                             maximum));
+}
+
+static json_t *sandbox_schema_nullable_string(size_t minimum, size_t maximum)
+{
+    json_t *typed = json_pack("{s:s,s:I}", "type", "string", "minLength", (json_int_t)minimum);
+
+    if (!typed)
+        return NULL;
+    if (maximum > 0u &&
+        json_object_set_new(typed, "maxLength", json_integer((json_int_t)maximum)) != 0) {
+        json_decref(typed);
+        return NULL;
+    }
+    return sandbox_schema_nullable(typed);
+}
+
+static json_t *sandbox_schema_object(json_t *properties)
+{
+    json_t *schema = json_object();
+
+    if (!properties || !schema)
+        goto fail;
+    if (json_object_set_new(schema, "type", json_string("object")) != 0 ||
+        json_object_set_new(schema, "properties", properties) != 0 ||
+        json_object_set_new(schema, "additionalProperties", json_false()) != 0)
+        goto fail;
+    properties = NULL;
+    return schema;
+
+fail:
+    json_decref(properties);
+    json_decref(schema);
+    return NULL;
+}
+
+static int sandbox_schema_add(json_t *properties, const char *name, json_t *schema)
+{
+    if (!schema)
+        return -1;
+    if (json_object_set_new(properties, name, schema) != 0) {
+        json_decref(schema);
+        return -1;
+    }
+    return 0;
+}
+
+json_t *mcp_schema_sandbox_ctl(void)
+{
+    json_t *root_properties = json_object();
+    json_t *override_properties = json_object();
+    json_t *execution_properties = json_object();
+    json_t *limit_properties = json_object();
+    json_t *isolation_properties = json_object();
+    json_t *action = NULL;
+    json_t *allowed_env_typed = NULL;
+    json_t *allowed_env_items = NULL;
+    json_t *schema = NULL;
+    json_t *required = NULL;
+
+    if (!root_properties || !override_properties || !execution_properties || !limit_properties ||
+        !isolation_properties)
+        goto fail;
+
+    action = json_pack("{s:s,s:[s,s,s]}",
+                       "type",
+                       "string",
+                       "enum",
+                       "get",
+                       "update",
+                       "reset");
+    if (sandbox_schema_add(root_properties, "action", action) != 0)
+        goto fail;
+    action = NULL;
+    if (sandbox_schema_add(root_properties,
+                           "token",
+                           json_pack("{s:s}", "type", "string")) != 0 ||
+        sandbox_schema_add(root_properties,
+                           "expected_revision",
+                           json_pack("{s:s,s:I}", "type", "integer", "minimum", (json_int_t)0)) !=
+            0 ||
+        sandbox_schema_add(root_properties, "shell_enabled", sandbox_schema_nullable_boolean()) !=
+            0 ||
+        sandbox_schema_add(root_properties,
+                           "sandbox_enabled",
+                           json_pack("{s:s}", "type", "boolean")) != 0)
+        goto fail;
+
+    if (sandbox_schema_add(override_properties,
+                           "max_command_length",
+                           sandbox_schema_nullable_integer(64, 65535)) != 0 ||
+        sandbox_schema_add(override_properties,
+                           "default_timeout_ms",
+                           sandbox_schema_nullable_integer(1, 300000)) != 0 ||
+        sandbox_schema_add(override_properties,
+                           "max_timeout_ms",
+                           sandbox_schema_nullable_integer(1, 300000)) != 0 ||
+        sandbox_schema_add(override_properties,
+                           "max_output_bytes",
+                           sandbox_schema_nullable_integer(256, 2147483648LL)) != 0 ||
+        sandbox_schema_add(override_properties,
+                           "capture_stderr",
+                           sandbox_schema_nullable_boolean()) != 0 ||
+        sandbox_schema_add(override_properties,
+                           "merge_stderr",
+                           sandbox_schema_nullable_boolean()) != 0)
+        goto fail;
+
+    if (sandbox_schema_add(execution_properties,
+                           "working_directory",
+                           sandbox_schema_nullable_string(1u, 4096u)) != 0 ||
+        sandbox_schema_add(execution_properties,
+                           "request_cwd_allowed",
+                           sandbox_schema_nullable_boolean()) != 0 ||
+        sandbox_schema_add(execution_properties,
+                           "clear_environment",
+                           sandbox_schema_nullable_boolean()) != 0 ||
+        sandbox_schema_add(execution_properties,
+                           "request_env_allowed",
+                           sandbox_schema_nullable_boolean()) != 0 ||
+        sandbox_schema_add(execution_properties,
+                           "kill_process_group_on_timeout",
+                           sandbox_schema_nullable_boolean()) != 0 ||
+        sandbox_schema_add(execution_properties,
+                           "run_as_user",
+                           sandbox_schema_nullable_string(0u, 0u)) != 0 ||
+        sandbox_schema_add(execution_properties,
+                           "run_as_group",
+                           sandbox_schema_nullable_string(0u, 0u)) != 0)
+        goto fail;
+
+    allowed_env_items = json_pack("{s:s,s:I,s:I}",
+                                  "type",
+                                  "string",
+                                  "minLength",
+                                  (json_int_t)1,
+                                  "maxLength",
+                                  (json_int_t)255);
+    allowed_env_typed = json_pack("{s:s,s:I,s:o}",
+                                  "type",
+                                  "array",
+                                  "maxItems",
+                                  (json_int_t)128,
+                                  "items",
+                                  allowed_env_items);
+    allowed_env_items = NULL;
+    if (sandbox_schema_add(execution_properties,
+                           "allowed_env",
+                           sandbox_schema_nullable(allowed_env_typed)) != 0)
+        goto fail;
+    allowed_env_typed = NULL;
+
+    if (sandbox_schema_add(limit_properties,
+                           "max_cpu_seconds",
+                           sandbox_schema_nullable_integer(0, 3600)) != 0 ||
+        sandbox_schema_add(limit_properties,
+                           "max_memory_bytes",
+                           sandbox_schema_nullable_integer(0, 2147483647)) != 0 ||
+        sandbox_schema_add(limit_properties,
+                           "max_file_size_bytes",
+                           sandbox_schema_nullable_integer(0, 2147483647)) != 0 ||
+        sandbox_schema_add(limit_properties,
+                           "max_open_files",
+                           sandbox_schema_nullable_integer(0, 1048576)) != 0 ||
+        sandbox_schema_add(limit_properties,
+                           "max_processes",
+                           sandbox_schema_nullable_integer(0, 1048576)) != 0 ||
+        sandbox_schema_add(isolation_properties,
+                           "require_non_root",
+                           sandbox_schema_nullable_boolean()) != 0)
+        goto fail;
+
+    if (sandbox_schema_add(override_properties,
+                           "execution",
+                           sandbox_schema_object(execution_properties)) != 0)
+        goto fail;
+    execution_properties = NULL;
+    if (sandbox_schema_add(override_properties,
+                           "limits",
+                           sandbox_schema_object(limit_properties)) != 0)
+        goto fail;
+    limit_properties = NULL;
+    if (sandbox_schema_add(override_properties,
+                           "isolation",
+                           sandbox_schema_object(isolation_properties)) != 0)
+        goto fail;
+    isolation_properties = NULL;
+    if (sandbox_schema_add(root_properties,
+                           "overrides",
+                           sandbox_schema_object(override_properties)) != 0)
+        goto fail;
+    override_properties = NULL;
+
+    schema = sandbox_schema_object(root_properties);
+    root_properties = NULL;
+    if (!schema)
+        goto fail;
+    required = json_pack("[s,s]", "action", "token");
+    if (!required || json_object_set_new(schema, "required", required) != 0)
+        goto fail;
+    required = NULL;
+    return schema;
+
+fail:
+    json_decref(root_properties);
+    json_decref(override_properties);
+    json_decref(execution_properties);
+    json_decref(limit_properties);
+    json_decref(isolation_properties);
+    json_decref(action);
+    json_decref(allowed_env_typed);
+    json_decref(allowed_env_items);
+    json_decref(required);
+    json_decref(schema);
+    return NULL;
+}
+
 json_t *mcp_schema_shell_exec(void)
 {
     return json_pack("{s:s,s:{s:{s:s,s:s},s:{s:s,s:s}},s:[s]}",

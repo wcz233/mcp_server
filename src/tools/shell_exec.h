@@ -10,6 +10,9 @@ struct mcp_shell_sandbox_control;
 int mcp_shell_sandbox_control_create(struct mcp_shell_sandbox_control **out);
 void mcp_shell_sandbox_control_destroy(struct mcp_shell_sandbox_control *control);
 bool mcp_shell_sandbox_control_is_enabled(const struct mcp_shell_sandbox_control *control);
+int mcp_tool_system_sandbox_ctl(struct mcp_server *server,
+                                const struct mcp_tool_invocation *invocation,
+                                json_t **out_result);
 
 int mcp_shell_jobs_create(struct mcp_shell_job_store **out,
                           struct mcp_server *server,
