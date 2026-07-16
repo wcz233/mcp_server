@@ -185,6 +185,19 @@ def update_arguments(state, **values):
     }
 
 
+def shell_command(command_windows, command_unix):
+    return command_windows if os.name == "nt" else command_unix
+
+
+def shell_result(client, arguments):
+    response = client.call("system.shell_exec", arguments)
+    assert "result" in response, response
+    result = response["result"]
+    content = result["content"]
+    assert content and content[0]["type"] == "text", result
+    return result, content[0]["text"]
+
+
 def assert_error_unchanged(client, arguments, code="invalid_params", field=None):
     before = client.get()
     response = client.control_response(arguments)
@@ -590,10 +603,65 @@ def verify_control_contract(exe, config_path, config):
     state = client.get()
     state = client.control(update_arguments(state, shell_enabled=True))
     assert state["shell_enabled"] is True, state
-    shell_response = client.call("system.shell_exec", {"command": "echo must-not-run"})
-    shell_result = shell_response["result"]
-    assert shell_result["isError"] is True, shell_result
-    assert "disabled by policy" in shell_result["content"][0]["text"], shell_result
+    result, text = shell_result(client, {"command": "echo runtime-enabled"})
+    assert result["isError"] is False, result
+    payload = json.loads(text)
+    assert payload["stdout"].strip() == "runtime-enabled", payload
+    assert payload["sandbox_revision"] == state["revision"], payload
+    assert payload["sandbox_enabled"] is True, payload
+    assert payload["shell_enabled"] is True, payload
+
+    state = client.control(
+        update_arguments(
+            state,
+            overrides={"default_timeout_ms": 100, "max_timeout_ms": 200},
+        )
+    )
+    for timeout_value in (1, 50, 100, 199, 200):
+        result, text = shell_result(
+            client,
+            {"command": "echo timeout-valid", "timeout_ms": timeout_value},
+        )
+        assert result["isError"] is False, (timeout_value, result)
+        payload = json.loads(text)
+        assert payload["stdout"].strip() == "timeout-valid", payload
+
+    for index, timeout_value in enumerate((None, "100", 0, 201, 300001), start=1):
+        marker = config_path.parent / f"invalid-timeout-{index}.marker"
+        marker.unlink(missing_ok=True)
+        command = shell_command(
+            f'echo invalid>"{marker}"',
+            f"touch '{marker}'",
+        )
+        result, text = shell_result(
+            client,
+            {"command": command, "timeout_ms": timeout_value},
+        )
+        assert result["isError"] is True, (timeout_value, result)
+        assert "timeout_ms" in text, (timeout_value, text)
+        assert not marker.exists(), marker
+
+    state = client.control(
+        update_arguments(
+            state,
+            overrides={"default_timeout_ms": 5000, "max_timeout_ms": 300000},
+        )
+    )
+    result, text = shell_result(
+        client,
+        {"command": "echo timeout-hard-max", "timeout_ms": 300000},
+    )
+    assert result["isError"] is False, result
+    assert json.loads(text)["stdout"].strip() == "timeout-hard-max", text
+
+    state = client.control(update_arguments(state, shell_enabled=False))
+    marker = config_path.parent / "shell-gate.marker"
+    marker.unlink(missing_ok=True)
+    command = shell_command(f'echo blocked>"{marker}"', f"touch '{marker}'")
+    result, text = shell_result(client, {"command": command})
+    assert result["isError"] is True, result
+    assert "disabled by policy" in text, text
+    assert not marker.exists(), marker
 
     reset = client.control(
         {"action": "reset", "token": TOKEN, "expected_revision": state["revision"]}

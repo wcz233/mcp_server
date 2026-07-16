@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -52,6 +53,8 @@ def main():
     env = os.environ.copy()
     env["MCP_ENABLE_SHELL_EXEC"] = "1"
     env["MCP_SHOULD_NOT_LEAK"] = "secret"
+    env.pop("MCP_ENABLE_SANDBOX_CTL", None)
+    env.pop("MCP_SANDBOX_CTL_TOKEN", None)
     env["MCP_SHELL_EXEC_CONFIG"] = os.path.join(
         os.path.dirname(__file__), "shell_exec_test_config.json"
     )
@@ -147,6 +150,25 @@ def main():
         assert env_clean["isError"] is False, env_clean
         env_payload = json_content(env_clean)
         assert env_payload["stdout"].strip() == "unset", env_payload
+
+        for index, timeout_value in enumerate((None, "50", 0, 5001, 300001), start=40):
+            marker = Path(tempfile.gettempdir()) / f"mcp_shell_exec_invalid_timeout_{os.getpid()}_{index}"
+            marker.unlink(missing_ok=True)
+            command = shell_command(
+                f'echo invalid>"{marker}"',
+                f"touch '{marker}'",
+            )
+            invalid_timeout = call_tool(
+                proc,
+                index,
+                "system.shell_exec",
+                {"command": command, "timeout_ms": timeout_value},
+            )
+            marker_created = marker.exists()
+            marker.unlink(missing_ok=True)
+            assert invalid_timeout["isError"] is True, invalid_timeout
+            assert "timeout_ms" in text_content(invalid_timeout), invalid_timeout
+            assert not marker_created, marker
 
         if os.name != "nt":
             marker = f"/tmp/mcp_shell_exec_marker_{os.getpid()}"

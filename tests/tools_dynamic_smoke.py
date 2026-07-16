@@ -71,6 +71,13 @@ def verify_tool(proc, request_id, tool_name):
         assert "disabled" in parse_text_content(result), result
         return
 
+    if tool_name == "system.sandbox_ctl":
+        result = call_tool(proc, request_id, tool_name, {"action": "get", "token": "disabled"})
+        assert result["isError"] is True, result
+        payload = assert_json_text(result)
+        assert payload["code"] == "unauthorized", payload
+        return
+
     if tool_name == "system.shell_start":
         result = call_tool(proc, request_id, tool_name, {"command": "echo unsafe"})
         assert result["isError"] is True, result
@@ -129,7 +136,8 @@ def verify_tool(proc, request_id, tool_name):
     if tool_name == "plugin_tools.insmod":
         result = call_tool(proc, request_id, tool_name, {"package_path": "dummy"})
         assert result["isError"] is True, result
-        assert "dummy" in parse_text_content(result) or "Failed" in parse_text_content(result), result
+        text = parse_text_content(result)
+        assert "dummy" in text or "failed" in text.lower() or "could not be found" in text.lower(), result
         return
 
     if tool_name == "plugin_tools.rmmod":
@@ -193,8 +201,18 @@ def main():
         tools = tools_response["result"]["tools"]
         assert tools, tools_response
         tool_names = {tool["name"] for tool in tools}
+        assert "system.sandbox_ctl" in tool_names, tool_names
         shell_exec = next(tool for tool in tools if tool["name"] == "system.shell_exec")
-        assert shell_exec["annotations"]["timeout_ms"] == 5000, shell_exec
+        assert shell_exec["annotations"]["timeout_ms"] == 300000, shell_exec
+        exec_timeout = shell_exec["inputSchema"]["properties"]["timeout_ms"]
+        assert exec_timeout["minimum"] == 1, exec_timeout
+        assert exec_timeout["maximum"] == 300000, exec_timeout
+        shell_start = next(tool for tool in tools if tool["name"] == "system.shell_start")
+        start_properties = shell_start["inputSchema"]["properties"]
+        assert start_properties["timeout_ms"]["minimum"] == 1, start_properties
+        assert start_properties["timeout_ms"]["maximum"] == 300000, start_properties
+        assert start_properties["output_limit_bytes"]["minimum"] == 256, start_properties
+        assert start_properties["output_limit_bytes"]["maximum"] == 2147483648, start_properties
 
         if "server.send" in tool_names or "server.recv" in tool_names:
             assert {"server.send", "server.recv"}.issubset(tool_names), tool_names

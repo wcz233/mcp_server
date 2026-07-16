@@ -83,6 +83,8 @@ struct shell_exec_config {
     bool capture_stderr;
     bool merge_stderr;
     bool config_loaded;
+    bool sandbox_enabled;
+    bool shell_enabled;
     bool clear_environment;
     bool kill_process_group_on_timeout;
     bool request_cwd_allowed;
@@ -100,6 +102,7 @@ struct shell_exec_config {
     unsigned int max_file_size_bytes;
     unsigned int max_open_files;
     unsigned int max_processes;
+    json_int_t sandbox_revision;
     char *shell_path;
     char *shell_arg;
     char *working_directory;
@@ -479,6 +482,7 @@ static int shell_exec_config_defaults(struct shell_exec_config *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     cfg->enabled = false;
+    cfg->sandbox_enabled = true;
     cfg->capture_stderr = true;
     cfg->merge_stderr = false;
     cfg->clear_environment = true;
@@ -1685,6 +1689,22 @@ static bool shell_sandbox_policy_is_valid(const struct shell_exec_config *cfg,
     return true;
 }
 
+static int shell_sandbox_apply_effective_policy(struct shell_exec_config *cfg,
+                                                json_int_t revision,
+                                                bool sandbox_enabled,
+                                                bool shell_enabled_is_set,
+                                                bool shell_enabled,
+                                                const json_t *overrides)
+{
+    cfg->sandbox_revision = revision;
+    cfg->sandbox_enabled = sandbox_enabled;
+    if (shell_sandbox_apply_normalized_overrides(
+            cfg, overrides, shell_enabled_is_set, shell_enabled) != 0)
+        return -1;
+    cfg->shell_enabled = cfg->enabled;
+    return shell_sandbox_policy_is_valid(cfg, NULL) ? 0 : 1;
+}
+
 static json_t *shell_sandbox_allowed_env_json(const struct shell_exec_config *cfg)
 {
     json_t *array = json_array();
@@ -1943,6 +1963,7 @@ static json_t *shell_sandbox_state_json(json_int_t revision,
                                         struct shell_exec_config *cfg)
 {
     bool policy_valid = false;
+    int effective_status;
     json_t *root = json_object();
     json_t *base = NULL;
     json_t *effective = NULL;
@@ -1961,10 +1982,15 @@ static json_t *shell_sandbox_state_json(json_int_t revision,
         base = shell_sandbox_policy_json(cfg, false, true);
         if (!base)
             goto fail;
-        if (shell_sandbox_apply_normalized_overrides(
-                cfg, overrides, shell_enabled_is_set, shell_enabled) != 0)
+        effective_status = shell_sandbox_apply_effective_policy(cfg,
+                                                                 revision,
+                                                                 sandbox_enabled,
+                                                                 shell_enabled_is_set,
+                                                                 shell_enabled,
+                                                                 overrides);
+        if (effective_status < 0)
             goto fail;
-        policy_valid = shell_sandbox_policy_is_valid(cfg, NULL);
+        policy_valid = effective_status == 0;
         if (policy_valid) {
             effective = shell_sandbox_policy_json(cfg, true, sandbox_enabled);
             if (!effective)
@@ -2581,17 +2607,26 @@ static int shell_exec_request_parse_command(struct shell_exec_request *request,
     return 0;
 }
 
-static unsigned int shell_exec_resolve_timeout(const struct shell_exec_config *cfg,
-                                               const struct mcp_tool_invocation *invocation)
+static bool shell_exec_resolve_timeout(const struct shell_exec_config *cfg,
+                                       const struct mcp_tool_invocation *invocation,
+                                       unsigned int *out_timeout_ms)
 {
     json_t *value = json_object_get(invocation->arguments, "timeout_ms");
-    unsigned long parsed;
+    json_int_t parsed;
 
+    if (!value) {
+        *out_timeout_ms = cfg->default_timeout_ms;
+        return true;
+    }
     if (!json_is_integer(value))
-        return cfg->default_timeout_ms;
+        return false;
 
-    parsed = (unsigned long)json_integer_value(value);
-    return clamp_uint(parsed, cfg->default_timeout_ms, MCP_SHELL_EXEC_MIN_TIMEOUT_MS, cfg->max_timeout_ms);
+    parsed = json_integer_value(value);
+    if (parsed < (json_int_t)MCP_SHELL_EXEC_MIN_TIMEOUT_MS ||
+        parsed > (json_int_t)cfg->max_timeout_ms)
+        return false;
+    *out_timeout_ms = (unsigned int)parsed;
+    return true;
 }
 
 static bool shell_job_string_arg(json_t *arguments, const char *name, const char **out)
@@ -2749,9 +2784,15 @@ static void shell_exec_audit_log(const struct shell_exec_config *cfg,
         strcpy(timestamp, "unknown-time");
 
     fprintf(stderr,
-            "[shell_exec] time=%s config=\"%s\" mode=%s cwd=\"%s\" run_as_user=\"%s\" run_as_group=\"%s\" timeout_ms=%u command=\"%s\" exit_code=%d signal=%d timed_out=%s stdout_bytes=%zu stderr_bytes=%zu truncated=%s\n",
+            "[shell_exec] time=%s config=\"%s\" sandbox_revision=%" JSON_INTEGER_FORMAT
+            " sandbox_enabled=%s shell_enabled=%s mode=%s cwd=\"%s\" run_as_user=\"%s\" "
+            "run_as_group=\"%s\" timeout_ms=%u command=\"%s\" exit_code=%d signal=%d "
+            "timed_out=%s stdout_bytes=%zu stderr_bytes=%zu truncated=%s\n",
             timestamp,
             cfg && cfg->config_path ? cfg->config_path : "",
+            cfg ? cfg->sandbox_revision : 0,
+            cfg && cfg->sandbox_enabled ? "true" : "false",
+            cfg && cfg->shell_enabled ? "true" : "false",
             cfg ? shell_exec_mode_name(cfg->mode) : "unknown",
             cfg && cfg->working_directory ? cfg->working_directory : "",
             cfg && cfg->run_as_user ? cfg->run_as_user : "",
@@ -4047,7 +4088,8 @@ void mcp_shell_jobs_destroy(struct mcp_shell_job_store *store)
     free(store);
 }
 
-static json_t *shell_exec_build_result(const struct shell_exec_request *request,
+static json_t *shell_exec_build_result(const struct shell_exec_config *cfg,
+                                       const struct shell_exec_request *request,
                                        const struct shell_exec_outcome *outcome,
                                        bool is_error)
 {
@@ -4085,6 +4127,12 @@ static json_t *shell_exec_build_result(const struct shell_exec_request *request,
         goto fail;
     if (json_object_set_new(payload, "signal", json_integer(outcome->signal_number)) != 0)
         goto fail;
+    if (json_object_set_new(payload, "sandbox_revision", json_integer(cfg->sandbox_revision)) != 0)
+        goto fail;
+    if (json_object_set_new(payload, "sandbox_enabled", json_boolean(cfg->sandbox_enabled)) != 0)
+        goto fail;
+    if (json_object_set_new(payload, "shell_enabled", json_boolean(cfg->shell_enabled)) != 0)
+        goto fail;
 
     result = mcp_tool_result_json_text(payload, is_error);
     json_decref(payload);
@@ -4108,6 +4156,7 @@ int mcp_tool_system_shell_exec(struct mcp_server *server,
                                json_t **out_result)
 {
     struct shell_exec_config cfg;
+    const struct mcp_shell_sandbox_control *control = server ? server->sandbox_control : NULL;
     struct shell_exec_request request;
     struct shell_exec_outcome outcome;
     json_t *command_value;
@@ -4115,8 +4164,6 @@ int mcp_tool_system_shell_exec(struct mcp_server *server,
     size_t command_length;
     char *error_message = NULL;
     int rc = -1;
-
-    (void)server;
 
     memset(&request, 0, sizeof(request));
     memset(&outcome, 0, sizeof(outcome));
@@ -4139,6 +4186,30 @@ int mcp_tool_system_shell_exec(struct mcp_server *server,
         *out_result = mcp_tool_result_text(message, true);
         rc = 0;
         goto cleanup;
+    }
+
+    if (!control) {
+        *out_result = mcp_tool_result_text("Failed to initialize shell sandbox policy.", true);
+        goto cleanup;
+    }
+    {
+        int effective_status = shell_sandbox_apply_effective_policy(&cfg,
+                                                                     control->revision,
+                                                                     control->sandbox_enabled,
+                                                                     control->shell_enabled_is_set,
+                                                                     control->shell_enabled,
+                                                                     control->overrides);
+        if (effective_status < 0) {
+            *out_result = mcp_tool_result_text("Failed to merge shell sandbox policy.", true);
+            goto cleanup;
+        }
+        if (effective_status > 0) {
+            *out_result = mcp_tool_result_text(
+                "system.shell_exec is disabled because the effective sandbox policy is invalid.",
+                true);
+            rc = 0;
+            goto cleanup;
+        }
     }
 
     if (!cfg.enabled) {
@@ -4172,7 +4243,13 @@ int mcp_tool_system_shell_exec(struct mcp_server *server,
         goto cleanup;
     }
 
-    request.timeout_ms = shell_exec_resolve_timeout(&cfg, invocation);
+    if (!shell_exec_resolve_timeout(&cfg, invocation, &request.timeout_ms)) {
+        *out_result = mcp_tool_result_text(
+            "Invalid params: timeout_ms must be an integer from 1 to the current effective maximum.",
+            true);
+        rc = 0;
+        goto cleanup;
+    }
 
     if (shell_exec_spawn(&cfg, &request, &outcome) != 0) {
         *out_result = mcp_tool_result_text(outcome.spawn_error ? outcome.spawn_error
@@ -4188,7 +4265,8 @@ int mcp_tool_system_shell_exec(struct mcp_server *server,
         goto cleanup;
     }
 #endif
-    *out_result = shell_exec_build_result(&request,
+    *out_result = shell_exec_build_result(&cfg,
+                                          &request,
                                           &outcome,
                                           outcome.timed_out || outcome.exit_code != 0 ||
                                               outcome.signal_number != 0);
