@@ -195,9 +195,9 @@ def main():
         assert "env" in start_properties, start_properties
         assert "args" not in start_properties, start_properties
         assert start_properties["timeout_ms"]["minimum"] == 1, start_properties
-        assert start_properties["timeout_ms"]["maximum"] == 3600000, start_properties
+        assert start_properties["timeout_ms"]["maximum"] == 300000, start_properties
         assert start_properties["output_limit_bytes"]["minimum"] == 256, start_properties
-        assert start_properties["output_limit_bytes"]["maximum"] == 1048576, start_properties
+        assert start_properties["output_limit_bytes"]["maximum"] == 2147483648, start_properties
         assert start_properties["env"]["additionalProperties"]["type"] == "string", start_properties
         tail_properties = tool_schemas["system.shell_tail"]["properties"]
         assert "offset" not in tail_properties, tail_properties
