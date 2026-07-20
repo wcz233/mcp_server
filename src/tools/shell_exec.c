@@ -1123,10 +1123,8 @@ static const char *shell_v2_capability(
         return "unsupported";
     if (field->id == MCP_SHELL_POLICY_FIELD_REQUIRE_NON_ROOT)
         return "reject_only";
-#else
-    (void)field;
 #endif
-    return "ignored";
+    return "enforced";
 }
 
 static enum shell_sandbox_patch_status shell_v2_validate_patch_value(
