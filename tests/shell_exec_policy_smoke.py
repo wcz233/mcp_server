@@ -249,6 +249,10 @@ def verify_effective_policy(client, temp_path):
     state = client.get()
     assert state["effective"]["timeout_ms"] == 300000, state
     assert state["effective"]["limits"]["memory_bytes"] == 34359738367, state
+    assert state["capabilities"]["timeout_ms"] == "enforced", state
+    assert state["capabilities"]["execution"]["mode"] == "enforced", state
+    if os.name != "nt":
+        assert state["capabilities"]["limits"]["memory_bytes"] == "enforced", state
     payload = client.shell({"command": shell_command("echo smoke", "printf smoke")})
     assert payload["stdout"].strip() == "smoke", payload
     assert payload["sandbox_revision"] == state["revision"], payload
