@@ -294,6 +294,11 @@ def verify_cwd_and_environment(client, state, temp_path):
     cwd_payload = client.shell({"command": shell_command("cd", "pwd"), "cwd": str(requested_cwd)})
     assert Path(cwd_payload["stdout"].strip()).resolve() == requested_cwd.resolve(), cwd_payload
 
+    unicode_cwd = temp_path / "\u540c\u6b65\u76ee\u5f55"
+    unicode_cwd.mkdir()
+    cwd_payload = client.shell({"command": shell_command("cd", "pwd"), "cwd": str(unicode_cwd)})
+    assert Path(cwd_payload["stdout"].strip()).resolve() == unicode_cwd.resolve(), cwd_payload
+
     state = client.update(state, overrides={"execution": {"request_cwd_allowed": False}})
     marker = temp_path / "cwd-disabled.marker"
     assert_no_spawn(
@@ -309,6 +314,11 @@ def verify_cwd_and_environment(client, state, temp_path):
     request_env = {"S3_LAYER": "request", "S3_REQUEST_ONLY": "request", "S3_REQUEST_SECRET": REQUEST_SECRET}
     payload = client.shell({"command": env_value_command("S3_LAYER"), "env": request_env})
     assert payload["stdout"].strip() == "request", payload
+    utf8_value = "\u9636\u6bb5-S3"
+    payload = client.shell(
+        {"command": env_value_command("S3_UTF8_VALUE"), "env": {"S3_UTF8_VALUE": utf8_value}}
+    )
+    assert payload["stdout"].strip() == utf8_value, payload
     count_command = shell_command("set S3_LAYER", "env | grep -c '^S3_LAYER='")
     count_payload = client.shell({"command": count_command, "env": request_env})
     if os.name == "nt":
