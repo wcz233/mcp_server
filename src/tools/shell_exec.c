@@ -103,6 +103,10 @@ struct shell_exec_config {
     uint64_t max_file_size_bytes;
     uint64_t max_open_files;
     uint64_t max_processes;
+    size_t working_directory_min_bytes;
+    size_t working_directory_max_bytes;
+    size_t environment_max_items;
+    size_t environment_item_max_bytes;
     json_int_t sandbox_revision;
     char *shell_path;
     char *shell_arg;
@@ -374,6 +378,15 @@ static bool shell_exec_env_name_is_valid(const char *name)
     return name && name[0] != '\0' && !strchr(name, '=');
 }
 
+static bool shell_exec_env_name_equals(const char *left, const char *right)
+{
+#ifdef _WIN32
+    return _stricmp(left, right) == 0;
+#else
+    return strcmp(left, right) == 0;
+#endif
+}
+
 static int shell_exec_config_set_env_var(struct shell_exec_config *cfg,
                                          const char *name,
                                          const char *value)
@@ -389,7 +402,7 @@ static int shell_exec_config_set_env_var(struct shell_exec_config *cfg,
         value = "";
 
     for (i = 0; i < cfg->env_var_count; i++) {
-        if (strcmp(cfg->env_vars[i].name, name) == 0) {
+        if (shell_exec_env_name_equals(cfg->env_vars[i].name, name)) {
             value_copy = mcp_strdup(value);
             if (!value_copy)
                 return -1;
@@ -1439,7 +1452,13 @@ static json_t *shell_v2_hard_value(
     case MCP_SHELL_POLICY_TYPE_MODE:
         return json_string(field->hard_default == MCP_SHELL_POLICY_MODE_EXEC ? "exec" : "shell");
     case MCP_SHELL_POLICY_TYPE_ENV:
-        return shell_v2_environment_summary(0u);
+        return shell_v2_environment_summary(
+#ifdef _WIN32
+            2u
+#else
+            3u
+#endif
+        );
     }
     return NULL;
 }
@@ -2002,6 +2021,59 @@ static const char *shell_v2_effective_string(const struct mcp_shell_sandbox_cont
     return string->value;
 }
 
+static void shell_v2_effective_string_bounds(
+    const struct mcp_shell_sandbox_control *control,
+    enum mcp_shell_policy_field_id id,
+    size_t *minimum,
+    size_t *maximum)
+{
+    const struct mcp_shell_policy_field_descriptor *field = shell_v2_field(id);
+    const struct mcp_shell_policy_string *string;
+
+    if (!field || !control->sandbox_enabled) {
+        *minimum = field ? field->hard_min_bytes : 0u;
+        *maximum = field ? field->hard_max_bytes : 0u;
+        return;
+    }
+    string = shell_v2_field_value(control->policy_snapshot, field);
+    *minimum = string->min_bytes;
+    *maximum = string->max_bytes;
+}
+
+static bool shell_exec_utf8_is_valid(const char *value, size_t length)
+{
+    json_t *validated = json_stringn(value, length);
+
+    if (!validated)
+        return false;
+    json_decref(validated);
+    return true;
+}
+
+static bool shell_exec_environment_is_valid(const struct shell_exec_config *cfg)
+{
+    size_t index;
+
+    if (cfg->env_var_count > cfg->environment_max_items)
+        return false;
+    for (index = 0; index < cfg->env_var_count; index++) {
+        const struct shell_exec_env_var *item = &cfg->env_vars[index];
+        size_t name_length;
+        size_t value_length;
+
+        if (!shell_exec_env_name_is_valid(item->name) || !item->value)
+            return false;
+        name_length = strlen(item->name);
+        value_length = strlen(item->value);
+        if (name_length > SIZE_MAX - value_length - 1u ||
+            name_length + 1u + value_length > cfg->environment_item_max_bytes ||
+            !shell_exec_utf8_is_valid(item->name, name_length) ||
+            !shell_exec_utf8_is_valid(item->value, value_length))
+            return false;
+    }
+    return true;
+}
+
 static enum mcp_shell_policy_mode shell_v2_effective_mode(
     const struct mcp_shell_sandbox_control *control)
 {
@@ -2065,6 +2137,21 @@ static int shell_v2_copy_effective_environment(
     return 0;
 }
 
+static int shell_v2_copy_start_environment(
+    const struct mcp_shell_policy_snapshot *snapshot,
+    struct shell_exec_config *cfg)
+{
+    size_t index;
+
+    for (index = 0; index < snapshot->startup_env_var_count; index++) {
+        const struct mcp_shell_policy_env_var *item = &snapshot->startup_env_vars[index];
+
+        if (shell_exec_config_set_env_var(cfg, item->name, item->value) != 0)
+            return -1;
+    }
+    return 0;
+}
+
 static int shell_exec_config_from_v2_control(
     const struct mcp_shell_sandbox_control *control,
     struct shell_exec_config *cfg)
@@ -2084,8 +2171,7 @@ static int shell_exec_config_from_v2_control(
     cfg->merge_stderr =
         cfg->capture_stderr &&
         shell_v2_effective_bool(control, MCP_SHELL_POLICY_FIELD_MERGE_STDERR);
-    cfg->clear_environment =
-        !shell_v2_effective_bool(control, MCP_SHELL_POLICY_FIELD_INHERIT_ENV);
+    cfg->clear_environment = true;
     cfg->request_cwd_allowed =
         shell_v2_effective_bool(control, MCP_SHELL_POLICY_FIELD_REQUEST_CWD_ALLOWED);
     cfg->request_env_allowed =
@@ -2125,6 +2211,16 @@ static int shell_exec_config_from_v2_control(
         shell_v2_effective_uint64(control, MCP_SHELL_POLICY_FIELD_OPEN_FILES);
     cfg->max_processes =
         shell_v2_effective_uint64(control, MCP_SHELL_POLICY_FIELD_PROCESSES);
+    shell_v2_effective_string_bounds(control,
+                                     MCP_SHELL_POLICY_FIELD_WORKING_DIRECTORY,
+                                     &cfg->working_directory_min_bytes,
+                                     &cfg->working_directory_max_bytes);
+    cfg->environment_max_items = control->sandbox_enabled
+                                     ? control->policy_snapshot->environment_max_items
+                                     : MCP_SHELL_POLICY_ENV_HARD_MAX_ITEMS;
+    cfg->environment_item_max_bytes =
+        control->sandbox_enabled ? control->policy_snapshot->environment_item_max_bytes
+                                 : MCP_SHELL_POLICY_ENV_HARD_ITEM_MAX_BYTES;
 
     cfg->shell_path =
         mcp_strdup(shell_v2_effective_string(control, MCP_SHELL_POLICY_FIELD_SHELL_PATH));
@@ -2140,8 +2236,12 @@ static int shell_exec_config_from_v2_control(
                                       ? control->policy_snapshot->config_path
                                       : "(hard_profile)");
     if (!cfg->shell_path || !cfg->shell_arg || !cfg->working_directory || !cfg->run_as_user ||
-        !cfg->run_as_group || !cfg->config_path ||
-        shell_v2_copy_effective_environment(control, cfg) != 0)
+        !cfg->run_as_group || !cfg->config_path)
+        goto fail;
+    if (shell_v2_effective_bool(control, MCP_SHELL_POLICY_FIELD_INHERIT_ENV) &&
+        shell_v2_copy_start_environment(control->policy_snapshot, cfg) != 0)
+        goto fail;
+    if (shell_v2_copy_effective_environment(control, cfg) != 0)
         goto fail;
 
 #ifdef _WIN32
@@ -2159,6 +2259,74 @@ static int shell_exec_config_from_v2_control(
 fail:
     shell_exec_config_destroy(cfg);
     return -1;
+}
+
+static int shell_exec_apply_sync_request_overrides(
+    struct shell_exec_config *cfg,
+    const struct mcp_tool_invocation *invocation,
+    char **out_error)
+{
+    json_t *cwd = json_object_get(invocation->arguments, "cwd");
+    json_t *env = json_object_get(invocation->arguments, "env");
+
+    *out_error = NULL;
+    if (cwd) {
+        const char *value;
+        size_t length;
+
+        if (!cfg->request_cwd_allowed) {
+            *out_error = mcp_strdup("Invalid params: cwd is disabled by the effective v2 policy.");
+            return *out_error ? 0 : -1;
+        }
+        if (!json_is_string(cwd)) {
+            *out_error = mcp_strdup("Invalid params: cwd must be a string.");
+            return *out_error ? 0 : -1;
+        }
+        value = json_string_value(cwd);
+        length = json_string_length(cwd);
+        if (strlen(value) != length || length < cfg->working_directory_min_bytes ||
+            length > cfg->working_directory_max_bytes) {
+            *out_error = mcp_strdup("Invalid params: cwd is outside the effective byte bounds.");
+            return *out_error ? 0 : -1;
+        }
+        if (dup_string_field(&cfg->working_directory, value) != 0)
+            return -1;
+    }
+    if (env) {
+        const char *name;
+        json_t *value;
+
+        if (!cfg->request_env_allowed) {
+            *out_error = mcp_strdup("Invalid params: env is disabled by the effective v2 policy.");
+            return *out_error ? 0 : -1;
+        }
+        if (!json_is_object(env)) {
+            *out_error = mcp_strdup("Invalid params: env must be an object of string values.");
+            return *out_error ? 0 : -1;
+        }
+        json_object_foreach(env, name, value) {
+            const char *text;
+
+            if (!shell_exec_env_name_is_valid(name) || !json_is_string(value)) {
+                *out_error =
+                    mcp_strdup("Invalid params: env must contain valid names and string values.");
+                return *out_error ? 0 : -1;
+            }
+            text = json_string_value(value);
+            if (strlen(text) != json_string_length(value)) {
+                *out_error = mcp_strdup("Invalid params: env values must not contain NUL.");
+                return *out_error ? 0 : -1;
+            }
+            if (shell_exec_config_set_env_var(cfg, name, text) != 0)
+                return -1;
+        }
+        if (!shell_exec_environment_is_valid(cfg)) {
+            *out_error =
+                mcp_strdup("Invalid params: final environment exceeds the effective bounds.");
+            return *out_error ? 0 : -1;
+        }
+    }
+    return 0;
 }
 
 static int shell_exec_buffer_append(struct shell_exec_buffer *buffer,
@@ -4064,6 +4232,22 @@ int mcp_tool_system_shell_exec(struct mcp_server *server,
         *out_result = mcp_tool_result_text(
             "Invalid params: timeout_ms must be an integer from 1 to the current effective maximum.",
             true);
+        rc = 0;
+        goto cleanup;
+    }
+
+    if (shell_exec_apply_sync_request_overrides(&cfg, invocation, &error_message) != 0) {
+        *out_result = mcp_tool_result_text("Failed to apply shell_exec request overrides.", true);
+        goto cleanup;
+    }
+    if (error_message) {
+        *out_result = mcp_tool_result_text(error_message, true);
+        rc = 0;
+        goto cleanup;
+    }
+    if (!shell_exec_environment_is_valid(&cfg)) {
+        *out_result = mcp_tool_result_text(
+            "Invalid params: final environment exceeds the effective bounds.", true);
         rc = 0;
         goto cleanup;
     }
