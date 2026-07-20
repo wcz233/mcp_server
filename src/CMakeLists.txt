@@ -21,6 +21,7 @@ target_sources(mcp_server
         tools/builtin_tools.c
         tools/schema.c
         tools/shell_exec.c
+        tools/shell_policy.c
         tools/system_status.c
         tools/tool_result.c
         transport/peer_transport.c
