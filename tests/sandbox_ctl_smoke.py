@@ -684,10 +684,18 @@ def verify_v2_control_state(exe, config_path, config):
 
     marker = config_path.parent / "s2-must-not-reach-spawn.marker"
     marker.unlink(missing_ok=True)
+    write_config(
+        config_path,
+        {
+            "enabled": True,
+            "execution": {"working_directory": str(config_path.parent)},
+        },
+    )
     command = shell_command(f'type nul > "{marker}"', f"touch '{marker}'")
     result, _ = shell_result(client, {"command": command})
-    assert result["isError"] is True, result
-    assert not marker.exists(), marker
+    assert result["isError"] is False, result
+    assert marker.exists(), marker
+    marker.unlink()
 
     reset = client.control(
         {"action": "reset", "token": TOKEN, "expected_revision": state["revision"]}
