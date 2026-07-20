@@ -98,11 +98,11 @@ struct shell_exec_config {
     unsigned int max_timeout_ms;
     unsigned int max_output_bytes;
     unsigned int chunk_size;
-    unsigned int max_cpu_seconds;
-    unsigned int max_memory_bytes;
-    unsigned int max_file_size_bytes;
-    unsigned int max_open_files;
-    unsigned int max_processes;
+    uint64_t max_cpu_seconds;
+    uint64_t max_memory_bytes;
+    uint64_t max_file_size_bytes;
+    uint64_t max_open_files;
+    uint64_t max_processes;
     json_int_t sandbox_revision;
     char *shell_path;
     char *shell_arg;
@@ -643,27 +643,42 @@ static int shell_exec_config_parse_json(struct shell_exec_config *cfg, const jso
         value = json_object_get(limits, "max_cpu_seconds");
         if (json_is_integer(value))
             cfg->max_cpu_seconds =
-                clamp_uint((unsigned long)json_integer_value(value), cfg->max_cpu_seconds, 0u, 3600u);
+                clamp_uint((unsigned long)json_integer_value(value),
+                           (unsigned int)cfg->max_cpu_seconds,
+                           0u,
+                           3600u);
 
         value = json_object_get(limits, "max_memory_bytes");
         if (json_is_integer(value))
             cfg->max_memory_bytes =
-                clamp_uint((unsigned long)json_integer_value(value), cfg->max_memory_bytes, 0u, 2147483647u);
+                clamp_uint((unsigned long)json_integer_value(value),
+                           (unsigned int)cfg->max_memory_bytes,
+                           0u,
+                           2147483647u);
 
         value = json_object_get(limits, "max_file_size_bytes");
         if (json_is_integer(value))
             cfg->max_file_size_bytes =
-                clamp_uint((unsigned long)json_integer_value(value), cfg->max_file_size_bytes, 0u, 2147483647u);
+                clamp_uint((unsigned long)json_integer_value(value),
+                           (unsigned int)cfg->max_file_size_bytes,
+                           0u,
+                           2147483647u);
 
         value = json_object_get(limits, "max_open_files");
         if (json_is_integer(value))
             cfg->max_open_files =
-                clamp_uint((unsigned long)json_integer_value(value), cfg->max_open_files, 0u, 1048576u);
+                clamp_uint((unsigned long)json_integer_value(value),
+                           (unsigned int)cfg->max_open_files,
+                           0u,
+                           1048576u);
 
         value = json_object_get(limits, "max_processes");
         if (json_is_integer(value))
             cfg->max_processes =
-                clamp_uint((unsigned long)json_integer_value(value), cfg->max_processes, 0u, 1048576u);
+                clamp_uint((unsigned long)json_integer_value(value),
+                           (unsigned int)cfg->max_processes,
+                           0u,
+                           1048576u);
     }
 
     isolation = json_object_get(root, "isolation");
@@ -777,15 +792,21 @@ static int shell_exec_config_load(struct shell_exec_config *cfg)
         env_uint("MCP_SHELL_OUTPUT_LIMIT", cfg->max_output_bytes, 256u, 1048576u);
     cfg->chunk_size = env_uint("MCP_SHELL_CHUNK_SIZE", cfg->chunk_size, 64u, 65536u);
     cfg->max_cpu_seconds =
-        env_uint("MCP_SHELL_MAX_CPU_SECONDS", cfg->max_cpu_seconds, 0u, 3600u);
+        env_uint("MCP_SHELL_MAX_CPU_SECONDS", (unsigned int)cfg->max_cpu_seconds, 0u, 3600u);
     cfg->max_memory_bytes =
-        env_uint("MCP_SHELL_MAX_MEMORY_BYTES", cfg->max_memory_bytes, 0u, 2147483647u);
+        env_uint("MCP_SHELL_MAX_MEMORY_BYTES",
+                 (unsigned int)cfg->max_memory_bytes,
+                 0u,
+                 2147483647u);
     cfg->max_file_size_bytes =
-        env_uint("MCP_SHELL_MAX_FILE_SIZE_BYTES", cfg->max_file_size_bytes, 0u, 2147483647u);
+        env_uint("MCP_SHELL_MAX_FILE_SIZE_BYTES",
+                 (unsigned int)cfg->max_file_size_bytes,
+                 0u,
+                 2147483647u);
     cfg->max_open_files =
-        env_uint("MCP_SHELL_MAX_OPEN_FILES", cfg->max_open_files, 0u, 1048576u);
+        env_uint("MCP_SHELL_MAX_OPEN_FILES", (unsigned int)cfg->max_open_files, 0u, 1048576u);
     cfg->max_processes =
-        env_uint("MCP_SHELL_MAX_PROCESSES", cfg->max_processes, 0u, 1048576u);
+        env_uint("MCP_SHELL_MAX_PROCESSES", (unsigned int)cfg->max_processes, 0u, 1048576u);
 
     env_path = getenv("MCP_SHELL_PATH");
     if (env_path && env_path[0] != '\0' && dup_string_field(&cfg->shell_path, env_path) != 0)
@@ -1905,6 +1926,241 @@ static int shell_exec_buffer_reserve(struct shell_exec_buffer *buffer, size_t wa
     return 0;
 }
 
+static const struct mcp_shell_policy_field_descriptor *shell_v2_field(
+    enum mcp_shell_policy_field_id id)
+{
+    const struct mcp_shell_policy_field_descriptor *fields;
+    size_t count;
+
+    fields = mcp_shell_policy_field_directory(&count);
+    if ((size_t)id >= count || fields[id].id != id)
+        return NULL;
+    return &fields[id];
+}
+
+static const json_t *shell_v2_effective_override(
+    const struct mcp_shell_sandbox_control *control,
+    const struct mcp_shell_policy_field_descriptor *field)
+{
+    const char *path;
+
+    if (!control->sandbox_enabled)
+        return NULL;
+    path = shell_v2_override_path(field);
+    return path ? shell_v2_json_path_get(control->overrides, path) : NULL;
+}
+
+static bool shell_v2_effective_bool(const struct mcp_shell_sandbox_control *control,
+                                    enum mcp_shell_policy_field_id id)
+{
+    const struct mcp_shell_policy_field_descriptor *field = shell_v2_field(id);
+    const json_t *override;
+
+    if (!field)
+        return false;
+    if (!control->sandbox_enabled)
+        return field->hard_default != 0u;
+    override = shell_v2_effective_override(control, field);
+    if (override)
+        return json_is_true(override);
+    return *(const bool *)shell_v2_field_value(control->policy_snapshot, field);
+}
+
+static uint64_t shell_v2_effective_uint64(const struct mcp_shell_sandbox_control *control,
+                                          enum mcp_shell_policy_field_id id)
+{
+    const struct mcp_shell_policy_field_descriptor *field = shell_v2_field(id);
+    const json_t *override;
+    const struct mcp_shell_policy_numeric *number;
+
+    if (!field)
+        return 0u;
+    if (!control->sandbox_enabled)
+        return field->hard_default;
+    override = shell_v2_effective_override(control, field);
+    if (override)
+        return (uint64_t)json_integer_value(override);
+    number = shell_v2_field_value(control->policy_snapshot, field);
+    return number->value;
+}
+
+static const char *shell_v2_effective_string(const struct mcp_shell_sandbox_control *control,
+                                             enum mcp_shell_policy_field_id id)
+{
+    const struct mcp_shell_policy_field_descriptor *field = shell_v2_field(id);
+    const json_t *override;
+    const struct mcp_shell_policy_string *string;
+
+    if (!field)
+        return NULL;
+    if (!control->sandbox_enabled)
+        return field->hard_default_string;
+    override = shell_v2_effective_override(control, field);
+    if (override)
+        return json_string_value(override);
+    string = shell_v2_field_value(control->policy_snapshot, field);
+    return string->value;
+}
+
+static enum mcp_shell_policy_mode shell_v2_effective_mode(
+    const struct mcp_shell_sandbox_control *control)
+{
+    const struct mcp_shell_policy_field_descriptor *field =
+        shell_v2_field(MCP_SHELL_POLICY_FIELD_EXECUTION_MODE);
+    const json_t *override;
+    const struct mcp_shell_policy_mode_value *mode;
+
+    if (!field || !control->sandbox_enabled)
+        return MCP_SHELL_POLICY_MODE_SHELL;
+    override = shell_v2_effective_override(control, field);
+    if (override)
+        return strcmp(json_string_value(override), "exec") == 0 ? MCP_SHELL_POLICY_MODE_EXEC
+                                                                 : MCP_SHELL_POLICY_MODE_SHELL;
+    mode = shell_v2_field_value(control->policy_snapshot, field);
+    return mode->value;
+}
+
+static int shell_v2_copy_effective_environment(
+    const struct mcp_shell_sandbox_control *control,
+    struct shell_exec_config *cfg)
+{
+    const struct mcp_shell_policy_field_descriptor *field =
+        shell_v2_field(MCP_SHELL_POLICY_FIELD_ENV);
+    const json_t *override = field ? shell_v2_effective_override(control, field) : NULL;
+    size_t index;
+
+    if (!control->sandbox_enabled) {
+#ifdef _WIN32
+        if (shell_exec_config_set_env_var(cfg,
+                                          "PATH",
+                                          "%SystemRoot%\\System32;%SystemRoot%") != 0 ||
+            shell_exec_config_set_env_var(cfg, "SystemRoot", "C:\\Windows") != 0)
+            return -1;
+#else
+        if (shell_exec_config_set_env_var(cfg, "PATH", "/usr/bin:/bin") != 0 ||
+            shell_exec_config_set_env_var(cfg, "HOME", "/tmp/mcp-shell") != 0 ||
+            shell_exec_config_set_env_var(cfg, "LANG", "C") != 0)
+            return -1;
+#endif
+        return 0;
+    }
+    if (override) {
+        const char *name;
+        json_t *value;
+
+        json_object_foreach((json_t *)override, name, value) {
+            if (shell_exec_config_set_env_var(cfg, name, json_string_value(value)) != 0)
+                return -1;
+        }
+        return 0;
+    }
+    for (index = 0; index < control->policy_snapshot->defaults.execution.env_var_count;
+         index++) {
+        const struct mcp_shell_policy_env_var *item =
+            &control->policy_snapshot->defaults.execution.env_vars[index];
+
+        if (shell_exec_config_set_env_var(cfg, item->name, item->value) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static int shell_exec_config_from_v2_control(
+    const struct mcp_shell_sandbox_control *control,
+    struct shell_exec_config *cfg)
+{
+    uint64_t value;
+
+    if (!control || !control->policy_snapshot)
+        return -1;
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->config_loaded = true;
+    cfg->sandbox_revision = control->revision;
+    cfg->sandbox_enabled = control->sandbox_enabled;
+    cfg->shell_enabled = shell_v2_effective_bool(control, MCP_SHELL_POLICY_FIELD_SHELL_ENABLED);
+    cfg->enabled = cfg->shell_enabled;
+    cfg->capture_stderr =
+        shell_v2_effective_bool(control, MCP_SHELL_POLICY_FIELD_CAPTURE_STDERR);
+    cfg->merge_stderr =
+        cfg->capture_stderr &&
+        shell_v2_effective_bool(control, MCP_SHELL_POLICY_FIELD_MERGE_STDERR);
+    cfg->clear_environment =
+        !shell_v2_effective_bool(control, MCP_SHELL_POLICY_FIELD_INHERIT_ENV);
+    cfg->request_cwd_allowed =
+        shell_v2_effective_bool(control, MCP_SHELL_POLICY_FIELD_REQUEST_CWD_ALLOWED);
+    cfg->request_env_allowed =
+        shell_v2_effective_bool(control, MCP_SHELL_POLICY_FIELD_REQUEST_ENV_ALLOWED);
+    cfg->kill_process_group_on_timeout =
+        shell_v2_effective_bool(control, MCP_SHELL_POLICY_FIELD_KILL_PROCESS_GROUP);
+    cfg->require_non_root =
+        shell_v2_effective_bool(control, MCP_SHELL_POLICY_FIELD_REQUIRE_NON_ROOT);
+    cfg->mode = shell_v2_effective_mode(control) == MCP_SHELL_POLICY_MODE_EXEC
+                    ? SHELL_EXEC_MODE_EXEC
+                    : SHELL_EXEC_MODE_SHELL;
+
+    value = shell_v2_effective_uint64(control, MCP_SHELL_POLICY_FIELD_COMMAND_LENGTH);
+    if (value > UINT_MAX)
+        goto fail;
+    cfg->max_command_length = (unsigned int)value;
+    value = shell_v2_effective_uint64(control, MCP_SHELL_POLICY_FIELD_TIMEOUT_MS);
+    if (value > UINT_MAX)
+        goto fail;
+    cfg->default_timeout_ms = (unsigned int)value;
+    cfg->max_timeout_ms = (unsigned int)value;
+    value = shell_v2_effective_uint64(control, MCP_SHELL_POLICY_FIELD_OUTPUT_BYTES);
+    if (value > UINT_MAX)
+        goto fail;
+    cfg->max_output_bytes = (unsigned int)value;
+    value = shell_v2_effective_uint64(control, MCP_SHELL_POLICY_FIELD_READ_CHUNK_SIZE);
+    if (value > UINT_MAX)
+        goto fail;
+    cfg->chunk_size = (unsigned int)value;
+    cfg->max_cpu_seconds =
+        shell_v2_effective_uint64(control, MCP_SHELL_POLICY_FIELD_CPU_SECONDS);
+    cfg->max_memory_bytes =
+        shell_v2_effective_uint64(control, MCP_SHELL_POLICY_FIELD_MEMORY_BYTES);
+    cfg->max_file_size_bytes =
+        shell_v2_effective_uint64(control, MCP_SHELL_POLICY_FIELD_FILE_SIZE_BYTES);
+    cfg->max_open_files =
+        shell_v2_effective_uint64(control, MCP_SHELL_POLICY_FIELD_OPEN_FILES);
+    cfg->max_processes =
+        shell_v2_effective_uint64(control, MCP_SHELL_POLICY_FIELD_PROCESSES);
+
+    cfg->shell_path =
+        mcp_strdup(shell_v2_effective_string(control, MCP_SHELL_POLICY_FIELD_SHELL_PATH));
+    cfg->shell_arg =
+        mcp_strdup(shell_v2_effective_string(control, MCP_SHELL_POLICY_FIELD_SHELL_ARG));
+    cfg->working_directory = mcp_strdup(
+        shell_v2_effective_string(control, MCP_SHELL_POLICY_FIELD_WORKING_DIRECTORY));
+    cfg->run_as_user =
+        mcp_strdup(shell_v2_effective_string(control, MCP_SHELL_POLICY_FIELD_RUN_AS_USER));
+    cfg->run_as_group =
+        mcp_strdup(shell_v2_effective_string(control, MCP_SHELL_POLICY_FIELD_RUN_AS_GROUP));
+    cfg->config_path = mcp_strdup(control->policy_snapshot->config_path
+                                      ? control->policy_snapshot->config_path
+                                      : "(hard_profile)");
+    if (!cfg->shell_path || !cfg->shell_arg || !cfg->working_directory || !cfg->run_as_user ||
+        !cfg->run_as_group || !cfg->config_path ||
+        shell_v2_copy_effective_environment(control, cfg) != 0)
+        goto fail;
+
+#ifdef _WIN32
+    cfg->require_non_root = false;
+    cfg->max_cpu_seconds = 0u;
+    cfg->max_memory_bytes = 0u;
+    cfg->max_file_size_bytes = 0u;
+    cfg->max_open_files = 0u;
+    cfg->max_processes = 0u;
+    cfg->run_as_user[0] = '\0';
+    cfg->run_as_group[0] = '\0';
+#endif
+    return 0;
+
+fail:
+    shell_exec_config_destroy(cfg);
+    return -1;
+}
+
 static int shell_exec_buffer_append(struct shell_exec_buffer *buffer,
                                     const char *data,
                                     size_t len,
@@ -2387,15 +2643,45 @@ static int read_fd_into_buffer(int fd,
     }
 }
 
-static int shell_exec_set_rlimit_value(int resource, unsigned int value)
+static bool shell_exec_rlimit_value_is_representable(uint64_t value)
+{
+    rlim_t converted = (rlim_t)value;
+
+    return (uint64_t)converted == value;
+}
+
+static int shell_exec_set_rlimit_value(int resource, uint64_t value)
 {
     struct rlimit limit;
 
     if (value == 0u)
         return 0;
+    if (!shell_exec_rlimit_value_is_representable(value)) {
+        errno = ERANGE;
+        return -1;
+    }
     limit.rlim_cur = (rlim_t)value;
     limit.rlim_max = (rlim_t)value;
     return setrlimit(resource, &limit);
+}
+
+static const char *shell_exec_unrepresentable_rlimit(const struct shell_exec_config *cfg)
+{
+    if (!shell_exec_rlimit_value_is_representable(cfg->max_cpu_seconds))
+        return "limits.cpu_seconds";
+#ifdef RLIMIT_AS
+    if (!shell_exec_rlimit_value_is_representable(cfg->max_memory_bytes))
+        return "limits.memory_bytes";
+#endif
+    if (!shell_exec_rlimit_value_is_representable(cfg->max_file_size_bytes))
+        return "limits.file_size_bytes";
+    if (!shell_exec_rlimit_value_is_representable(cfg->max_open_files))
+        return "limits.open_files";
+#ifdef RLIMIT_NPROC
+    if (!shell_exec_rlimit_value_is_representable(cfg->max_processes))
+        return "limits.processes";
+#endif
+    return NULL;
 }
 
 static int shell_exec_apply_unix_rlimits(const struct shell_exec_config *cfg)
@@ -2411,8 +2697,7 @@ static int shell_exec_apply_unix_rlimits(const struct shell_exec_config *cfg)
     if (shell_exec_set_rlimit_value(RLIMIT_NOFILE, cfg->max_open_files) != 0)
         return -1;
 #ifdef RLIMIT_NPROC
-    if (cfg->run_as_user && cfg->run_as_user[0] &&
-        shell_exec_set_rlimit_value(RLIMIT_NPROC, cfg->max_processes) != 0)
+    if (shell_exec_set_rlimit_value(RLIMIT_NPROC, cfg->max_processes) != 0)
         return -1;
 #endif
     return 0;
@@ -2512,6 +2797,18 @@ static int shell_exec_spawn_unix(const struct shell_exec_config *cfg,
     int wait_status = 0;
     bool child_exited = false;
     bool killed_for_timeout = false;
+    const char *unrepresentable_limit = shell_exec_unrepresentable_rlimit(cfg);
+
+    if (unrepresentable_limit) {
+        char message[160];
+
+        snprintf(message,
+                 sizeof(message),
+                 "%s cannot be represented by rlim_t on this platform.",
+                 unrepresentable_limit);
+        outcome->spawn_error = mcp_strdup(message);
+        return -1;
+    }
 
     if (shell_exec_prepare_working_directory(cfg) != 0) {
         char message[512];
@@ -3723,41 +4020,18 @@ int mcp_tool_system_shell_exec(struct mcp_server *server,
     memset(&cfg, 0, sizeof(cfg));
     *out_result = NULL;
 
-    if (shell_exec_config_load(&cfg) != 0) {
-        *out_result = mcp_tool_result_text("Failed to initialize shell_exec configuration.", true);
-        goto cleanup;
-    }
-
-    if (!cfg.config_loaded) {
-        char message[512];
-
-        snprintf(message,
-                 sizeof(message),
-                 "system.shell_exec is disabled because configuration failed to load from %s. %s",
-                 cfg.config_path ? cfg.config_path : "(unknown)",
-                 cfg.load_error ? cfg.load_error : "No details available.");
-        *out_result = mcp_tool_result_text(message, true);
-        rc = 0;
-        goto cleanup;
-    }
-
     if (!control) {
         *out_result = mcp_tool_result_text("Failed to initialize shell sandbox policy.", true);
         goto cleanup;
     }
-    cfg.sandbox_revision = 0;
-    cfg.sandbox_enabled = true;
-    cfg.shell_enabled = cfg.enabled;
-    if (!shell_sandbox_policy_is_valid(&cfg, NULL)) {
-        *out_result = mcp_tool_result_text(
-            "system.shell_exec is disabled because the execution policy is invalid.", true);
-        rc = 0;
+    if (shell_exec_config_from_v2_control(control, &cfg) != 0) {
+        *out_result = mcp_tool_result_text("Failed to build effective shell sandbox policy.", true);
         goto cleanup;
     }
 
-    if (!cfg.enabled) {
+    if (!cfg.shell_enabled) {
         *out_result = mcp_tool_result_text(
-            "system.shell_exec is disabled by policy. Enable it in shell_exec.json or MCP_ENABLE_SHELL_EXEC=1 for a trusted session.",
+            "system.shell_exec is disabled by the effective v2 policy.",
             true);
         rc = 0;
         goto cleanup;

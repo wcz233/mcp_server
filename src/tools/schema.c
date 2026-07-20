@@ -252,7 +252,7 @@ fail:
 
 json_t *mcp_schema_shell_exec(void)
 {
-    return json_pack("{s:s,s:{s:{s:s,s:s},s:{s:s,s:s,s:i,s:i}},s:[s]}",
+    return json_pack("{s:s,s:{s:{s:s,s:s},s:{s:s,s:s,s:i,s:i},s:{s:s,s:s},s:{s:s,s:s,s:{s:s}}},s:[s]}",
                      "type",
                      "object",
                      "properties",
@@ -270,6 +270,19 @@ json_t *mcp_schema_shell_exec(void)
                      1,
                      "maximum",
                      (int)MCP_SHELL_EXEC_HARD_TIMEOUT_MS,
+                     "cwd",
+                     "type",
+                     "string",
+                     "description",
+                     "Optional working directory override.",
+                     "env",
+                     "type",
+                     "object",
+                     "description",
+                     "Optional string-valued environment overrides.",
+                     "additionalProperties",
+                     "type",
+                     "string",
                      "required",
                      "command");
 }
