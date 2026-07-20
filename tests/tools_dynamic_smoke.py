@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 
@@ -83,8 +84,32 @@ def verify_tool(proc, request_id, tool_name):
 
     if tool_name == "system.shell_start":
         result = call_tool(proc, request_id, tool_name, {"command": "echo unsafe"})
-        assert result["isError"] is True, result
-        assert "disabled" in parse_text_content(result), result
+        if os.name == "nt":
+            assert result["isError"] is True, result
+            assert "disabled" in parse_text_content(result), result
+            return
+
+        assert result["isError"] is False, result
+        payload = assert_json_text(result)
+        expected_snapshot = {
+            "sandbox_revision": 0,
+            "sandbox_enabled": False,
+            "shell_enabled": True,
+            "timeout_ms": 3600000,
+            "output_bytes": 1048576,
+            "once_read_stdout_err_chunk_size": 65536,
+        }
+        assert {key: payload[key] for key in expected_snapshot} == expected_snapshot, payload
+        waited = call_tool(
+            proc,
+            request_id + 2000,
+            "system.shell_wait",
+            {"job_id": payload["job_id"], "timeout_ms": 3000},
+        )
+        assert waited["isError"] is False, waited
+        waited_payload = assert_json_text(waited)
+        assert waited_payload["state"] == "exited", waited_payload
+        assert {key: waited_payload[key] for key in expected_snapshot} == expected_snapshot, waited_payload
         return
 
     if tool_name in ("system.shell_poll", "system.shell_tail", "system.shell_wait", "system.shell_kill"):
