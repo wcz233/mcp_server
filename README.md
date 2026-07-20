@@ -190,24 +190,37 @@ mcp_stdio_proxy_adapter\build\Release\mcp_stdio_proxy_adapter.exe
 
 ## 运行 MCP Server
 
-`system.shell_exec` 默认禁用。只有在可信环境中才设置 `MCP_ENABLE_SHELL_EXEC=1`。
+`system.shell_exec` 始终注册。未启用 runtime control 时，server 无需 JSON 即可启动，
+使用编译期 hard profile，且 `shell_enabled` 的 hard default 为 `true`。
 
 ### Runtime Sandbox Control
 
-`system.sandbox_ctl` 在 `tools/list` 中始终可见，但默认不可调用。只有同时在
-启动 server 前设置以下两个环境变量时，持有 bearer token 的调用方才能使用它：
+`system.sandbox_ctl` 在 `tools/list` 中始终可见，但默认不可调用。生产配置示例位于
+`config/tools/shell_exec.json`；启用 control 前必须把其中公开的示例 token 替换为随机
+secret，并在启动 server 前设置：
 
 ```text
+MCP_SHELL_EXEC_CONFIG=<absolute path to shell_exec.json>
 MCP_ENABLE_SANDBOX_CTL=1
-MCP_SANDBOX_CTL_TOKEN=<non-empty bearer token>
 ```
 
-`MCP_ENABLE_SANDBOX_CTL` 只能是未设置、空、`0` 或 `1`；设为 `1` 时 token 必须
-非空，否则 server 启动失败。token 只适合可信 stdio/pipe、loopback，或已由外部
-加密隧道保护的连接。不要在未加密且可被其他主体访问的 TCP listener 上发送它。
+bearer token 只从 JSON v2 的 `control.token` 读取，不再读取
+`MCP_SANDBOX_CTL_TOKEN`。`MCP_ENABLE_SANDBOX_CTL` 只能是未设置、空、`0` 或 `1`；
+设为 `1` 时，配置缺失、JSON/version 无效或 token 为空都会使 server 启动失败。
+未设置、空或 `0` 时 control 不可调用，且未指定 JSON 也能使用 hard profile 启动；
+一旦显式设置 `MCP_SHELL_EXEC_CONFIG`，配置错误仍会使启动失败。
+
+配置文件包含明文 bearer token。Unix 上应由运行 server 的账号持有并设置为 `0600`；
+Windows 上应移除继承权限，只给运行服务的账号授予读取权限。不要把示例 token 用于
+生产，也不要把 token 放入命令行、日志或环境变量。token 只适合可信 stdio/pipe、
+loopback，或已由外部加密隧道保护的连接；它不是传输加密，不能在其他主体可访问的
+明文 TCP listener 上发送。
 
 控制状态只存在于当前 server 进程内，不写回 JSON 配置；重启后 revision 恢复为
-`0`，runtime overrides 清空。`sandbox_enabled=false` 只旁路本工具可配置的限制，
+`0`，runtime overrides 清空。JSON defaults、bounds 和 token 也只在启动时读取，
+修改文件后必须重启。单个 JSON bound 超过编译期 hard max 时，仅该字段回退到 hard
+default/bounds，`get` 会返回字段级 diagnostic；其他合法字段继续生效。
+`sandbox_enabled=false` 会使用 hard profile，但保留 overrides，重新开启后恢复；它
 不是强隔离开关，也不会提升 mcp_server 的 OS 权限。
 
 使用前先读取状态，再通过 revision 执行 compare-and-swap 更新或重置：
@@ -217,7 +230,7 @@ MCP_SANDBOX_CTL_TOKEN=<non-empty bearer token>
 ```
 
 ```json
-{"action":"update","token":"<token>","expected_revision":0,"shell_enabled":true,"overrides":{"max_timeout_ms":1000}}
+{"action":"update","token":"<token>","expected_revision":0,"overrides":{"shell_enabled":true,"timeout_ms":1000}}
 ```
 
 ```json
@@ -225,8 +238,11 @@ MCP_SANDBOX_CTL_TOKEN=<non-empty bearer token>
 ```
 
 更新和 reset 只影响之后的新 `system.shell_exec` 或 Unix `system.shell_start` 执行，
-不会终止既有 job。Windows 上五项 rlimit 与非空身份切换不支持；
-`require_non_root` 是 reject-only，`system.shell_start` 仍未实现。
+不会终止既有 job。Unix 支持可表示的 RLIMIT_CPU/AS/FSIZE/NOFILE/NPROC、身份切换和
+进程组超时清理；身份切换仍受启动账号权限约束。Windows 使用完整 Unicode environment
+block，但五项 rlimit 与非空身份切换不支持，`require_non_root` 是 reject-only，
+`system.shell_start` 未实现。状态接口会如实报告 `enforced`、`unsupported`、
+`reject_only` 或 `ignored`。
 
 ### Linux
 
@@ -237,7 +253,8 @@ MCP_ENABLE_STDIO=0 \
 MCP_ENABLE_TCP=1 \
 MCP_TCP_HOST=192.168.222.128 \
 MCP_TCP_PORT=18767 \
-MCP_ENABLE_SHELL_EXEC=1 \
+MCP_SHELL_EXEC_CONFIG=/etc/mcp_server/shell_exec.json \
+MCP_ENABLE_SANDBOX_CTL=1 \
 ./mcp_server/build/src/mcp_server
 ```
 
@@ -258,7 +275,8 @@ Environment=MCP_ENABLE_STDIO=0
 Environment=MCP_ENABLE_TCP=1
 Environment=MCP_TCP_HOST=192.168.16.135
 Environment=MCP_TCP_PORT=18767
-Environment=MCP_ENABLE_SHELL_EXEC=1
+Environment=MCP_SHELL_EXEC_CONFIG=/etc/mcp_server/shell_exec.json
+Environment=MCP_ENABLE_SANDBOX_CTL=1
 ExecStart=/opt/mcp_server/mcp_server
 WorkingDirectory=/root/
 Restart=always
@@ -297,7 +315,8 @@ $env:MCP_ENABLE_STDIO = "0"
 $env:MCP_ENABLE_TCP = "1"
 $env:MCP_TCP_HOST = "192.168.16.2"
 $env:MCP_TCP_PORT = "18767"
-$env:MCP_ENABLE_SHELL_EXEC = "1"
+$env:MCP_SHELL_EXEC_CONFIG = (Resolve-Path "config\tools\shell_exec.json").Path
+$env:MCP_ENABLE_SANDBOX_CTL = "1"
 .\build\src\Release\mcp_server.exe
 ```
 
@@ -308,7 +327,8 @@ set MCP_ENABLE_STDIO=0
 set MCP_ENABLE_TCP=1
 set MCP_TCP_HOST=192.168.16.2
 set MCP_TCP_PORT=18767
-set MCP_ENABLE_SHELL_EXEC=1
+set MCP_SHELL_EXEC_CONFIG=D:\Project\2025-12-02\mcp\mcp_server\config\tools\shell_exec.json
+set MCP_ENABLE_SANDBOX_CTL=1
 .\build\src\Release\mcp_server.exe
 ```
 
@@ -329,7 +349,8 @@ set MCP_ENABLE_STDIO=0
 set MCP_ENABLE_TCP=1
 set MCP_TCP_HOST=192.168.16.2
 set MCP_TCP_PORT=18767
-set MCP_ENABLE_SHELL_EXEC=1
+set MCP_SHELL_EXEC_CONFIG=D:\Project\2025-12-02\mcp\mcp_server\config\tools\shell_exec.json
+set MCP_ENABLE_SANDBOX_CTL=1
 
 cd /d D:\Project\2025-12-02\mcp\mcp_server
 .\build\src\Release\mcp_server.exe
@@ -464,7 +485,8 @@ int main(void){printf(\"hello world!\\n\");return 0;}' > /home/alinx/prj/hello.c
 - `MCP_DISCOVERY_ADVERTISE_HOST=<ip>`：广播中声明给对端连接的地址；默认使用 UDP 来源地址。
 - `MCP_DISCOVERY_HOSTS=<ip[:port],...>`：额外单播发现目标，适合测试或禁止广播的网络。
 - `MCP_DISCOVERY_PROXY_TIMEOUT_MS=<ms>`：`gateway.proxy_tool` 未显式传入 `proxy_timeout_ms` 时的代理等待超时；默认 `5000`。
-- `MCP_ENABLE_SHELL_EXEC=1`：允许 `system.shell_exec` 执行主机命令。
+- `MCP_SHELL_EXEC_CONFIG=<absolute path>`：显式指定 JSON v2 shell policy；修改后需重启。
+- `MCP_ENABLE_SANDBOX_CTL=1`：要求有效 JSON v2 和非空 `control.token`，并启用 process-local control。
 
 TCP 协议使用 4 字节大端长度头加 JSON body。`mcp_stdio_proxy_adapter`
 负责把 Codex stdio JSON-RPC 转换成该 TCP framed 协议。
