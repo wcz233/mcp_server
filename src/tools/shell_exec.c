@@ -3208,51 +3208,127 @@ fail:
     return -1;
 }
 #else
+static WCHAR *shell_exec_windows_utf8_to_wide(const char *value);
+
 static int shell_exec_prepare_working_directory(const struct shell_exec_config *cfg)
 {
+    WCHAR *working_directory;
     int rc;
 
     if (!cfg->working_directory || cfg->working_directory[0] == '\0')
         return -1;
-    rc = _mkdir(cfg->working_directory);
+    working_directory = shell_exec_windows_utf8_to_wide(cfg->working_directory);
+    if (!working_directory)
+        return -1;
+    rc = _wmkdir(working_directory);
+    free(working_directory);
     if (rc == 0 || errno == EEXIST)
         return 0;
     return -1;
 }
 
-static void shell_exec_free_environment_block(char *block)
+static void shell_exec_free_environment_block(WCHAR *block)
 {
     free(block);
 }
 
-static char *shell_exec_build_environment_block(const struct shell_exec_config *cfg)
+static WCHAR *shell_exec_windows_utf8_to_wide(const char *value)
 {
+    int length;
+    WCHAR *wide;
+
+    if (!value || strlen(value) > (size_t)INT_MAX)
+        return NULL;
+    length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, NULL, 0);
+    if (length <= 0)
+        return NULL;
+    wide = malloc(sizeof(*wide) * (size_t)length);
+    if (!wide)
+        return NULL;
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, wide, length) != length) {
+        free(wide);
+        return NULL;
+    }
+    return wide;
+}
+
+static int shell_exec_windows_env_pointer_compare(const void *left, const void *right)
+{
+    const struct shell_exec_env_var *const *left_item = left;
+    const struct shell_exec_env_var *const *right_item = right;
+
+    return _stricmp((*left_item)->name, (*right_item)->name);
+}
+
+static WCHAR *shell_exec_build_environment_block(const struct shell_exec_config *cfg)
+{
+    const struct shell_exec_env_var **items = NULL;
     size_t total = 1u;
     size_t i;
-    char *block;
-    char *cursor;
+    WCHAR *block;
+    WCHAR *cursor;
 
-    for (i = 0; i < cfg->env_var_count; i++)
-        total += strlen(cfg->env_vars[i].name) + strlen(cfg->env_vars[i].value) + 2u;
+    if (cfg->env_var_count > 0u) {
+        items = malloc(sizeof(*items) * cfg->env_var_count);
+        if (!items)
+            return NULL;
+        for (i = 0; i < cfg->env_var_count; i++)
+            items[i] = &cfg->env_vars[i];
+        qsort(items,
+              cfg->env_var_count,
+              sizeof(*items),
+              shell_exec_windows_env_pointer_compare);
+    }
+    for (i = 0; i < cfg->env_var_count; i++) {
+        int name_length = MultiByteToWideChar(
+            CP_UTF8, MB_ERR_INVALID_CHARS, items[i]->name, -1, NULL, 0);
+        int value_length = MultiByteToWideChar(
+            CP_UTF8, MB_ERR_INVALID_CHARS, items[i]->value, -1, NULL, 0);
 
-    block = calloc(total, 1u);
-    if (!block)
+        if (name_length <= 0 || value_length <= 0 ||
+            total > SIZE_MAX - (size_t)name_length - (size_t)value_length) {
+            free(items);
+            return NULL;
+        }
+        total += (size_t)name_length + (size_t)value_length;
+    }
+
+    block = calloc(total, sizeof(*block));
+    if (!block) {
+        free(items);
         return NULL;
+    }
 
     cursor = block;
     for (i = 0; i < cfg->env_var_count; i++) {
-        size_t name_len = strlen(cfg->env_vars[i].name);
-        size_t value_len = strlen(cfg->env_vars[i].value);
+        int name_length = MultiByteToWideChar(
+            CP_UTF8, MB_ERR_INVALID_CHARS, items[i]->name, -1, cursor, (int)(total - (size_t)(cursor - block)));
 
-        memcpy(cursor, cfg->env_vars[i].name, name_len);
-        cursor += name_len;
-        *cursor++ = '=';
-        memcpy(cursor, cfg->env_vars[i].value, value_len);
-        cursor += value_len;
-        *cursor++ = '\0';
+        if (name_length <= 0)
+            goto fail;
+        cursor += name_length - 1;
+        *cursor++ = L'=';
+        {
+            int value_length = MultiByteToWideChar(CP_UTF8,
+                                                   MB_ERR_INVALID_CHARS,
+                                                   items[i]->value,
+                                                   -1,
+                                                   cursor,
+                                                   (int)(total - (size_t)(cursor - block)));
+
+            if (value_length <= 0)
+                goto fail;
+            cursor += value_length;
+        }
     }
-    *cursor = '\0';
+    *cursor = L'\0';
+    free(items);
     return block;
+
+fail:
+    free(items);
+    free(block);
+    return NULL;
 }
 
 static char *shell_exec_build_windows_command_line(const struct shell_exec_config *cfg,
@@ -3279,7 +3355,7 @@ static int shell_exec_spawn_windows(const struct shell_exec_config *cfg,
                                     struct shell_exec_outcome *outcome)
 {
     SECURITY_ATTRIBUTES attrs;
-    STARTUPINFOA startup;
+    STARTUPINFOW startup;
     PROCESS_INFORMATION process;
     HANDLE stdout_read = NULL;
     HANDLE stdout_write = NULL;
@@ -3287,8 +3363,10 @@ static int shell_exec_spawn_windows(const struct shell_exec_config *cfg,
     HANDLE stderr_write = NULL;
     HANDLE job = NULL;
     char *chunk = NULL;
-    char *command_line = NULL;
-    char *environment_block = NULL;
+    char *command_line_utf8 = NULL;
+    WCHAR *command_line = NULL;
+    WCHAR *working_directory = NULL;
+    WCHAR *environment_block = NULL;
     bool process_started = false;
     unsigned long long deadline = mcp_now_ms() + request->timeout_ms;
 
@@ -3339,22 +3417,29 @@ static int shell_exec_spawn_windows(const struct shell_exec_config *cfg,
     if (!chunk)
         goto fail;
 
-    command_line = shell_exec_build_windows_command_line(cfg, request);
-    if (!command_line)
+    command_line_utf8 = shell_exec_build_windows_command_line(cfg, request);
+    if (!command_line_utf8)
+        goto fail;
+    command_line = shell_exec_windows_utf8_to_wide(command_line_utf8);
+    working_directory = shell_exec_windows_utf8_to_wide(cfg->working_directory);
+    if (!command_line || !working_directory)
         goto fail;
 
     environment_block = shell_exec_build_environment_block(cfg);
-    if (!environment_block)
+    if (!environment_block) {
+        outcome->spawn_error =
+            mcp_strdup("Failed to serialize the final Windows environment block.");
         goto fail;
+    }
 
-    if (!CreateProcessA(NULL,
+    if (!CreateProcessW(NULL,
                         command_line,
                         NULL,
                         NULL,
                         TRUE,
-                        CREATE_NO_WINDOW,
-                        cfg->clear_environment ? environment_block : NULL,
-                        cfg->working_directory,
+                        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                        environment_block,
+                        working_directory,
                         &startup,
                         &process))
         goto fail;
@@ -3433,7 +3518,9 @@ static int shell_exec_spawn_windows(const struct shell_exec_config *cfg,
     if (stderr_read)
         CloseHandle(stderr_read);
     free(chunk);
+    free(command_line_utf8);
     free(command_line);
+    free(working_directory);
     shell_exec_free_environment_block(environment_block);
     return 0;
 
@@ -3459,7 +3546,9 @@ fail:
     if (stderr_write)
         CloseHandle(stderr_write);
     free(chunk);
+    free(command_line_utf8);
     free(command_line);
+    free(working_directory);
     shell_exec_free_environment_block(environment_block);
     return -1;
 }
