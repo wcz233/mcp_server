@@ -2259,7 +2259,7 @@ fail:
     return -1;
 }
 
-static int shell_exec_apply_sync_request_overrides(
+static int shell_exec_apply_request_overrides(
     struct shell_exec_config *cfg,
     const struct mcp_tool_invocation *invocation,
     char **out_error)
@@ -3692,7 +3692,7 @@ static json_t *shell_job_status_json(const struct shell_job *job)
     if (!job)
         return NULL;
 
-    payload = json_pack("{s:s,s:s,s:i,s:i,s:s,s:s,s:i,s:i,s:i,s:i,s:b,s:b,s:i,s:i,s:I,s:b,s:b}",
+    payload = json_pack("{s:s,s:s,s:i,s:i,s:s,s:s,s:i,s:i,s:i,s:i,s:i,s:i,s:b,s:b,s:i,s:i,s:I,s:b,s:b}",
                         "job_id",
                         job->job_id,
                         "state",
@@ -3707,6 +3707,10 @@ static json_t *shell_job_status_json(const struct shell_job *job)
                         job->command ? job->command : "",
                         "timeout_ms",
                         (json_int_t)job->timeout_ms,
+                        "output_bytes",
+                        (json_int_t)job->output_limit_bytes,
+                        "once_read_stdout_err_chunk_size",
+                        (json_int_t)job->chunk_size,
                         "deadline_ms",
                         (json_int_t)job->deadline_ms,
                         "stdout_bytes",
@@ -3759,59 +3763,6 @@ static json_t *shell_job_result(const struct shell_job *job, bool is_error)
     result = mcp_tool_result_json_text(payload, is_error);
     json_decref(payload);
     return result;
-}
-
-static int shell_job_apply_start_overrides(struct shell_exec_config *cfg,
-                                           json_t *arguments,
-                                           char **out_error)
-{
-    json_t *cwd;
-    json_t *env;
-    const char *key;
-    json_t *value;
-
-    *out_error = NULL;
-
-    cwd = json_object_get(arguments, "cwd");
-    if (cwd) {
-        if (!cfg->request_cwd_allowed) {
-            *out_error = mcp_strdup("Invalid params: cwd is disabled by the effective sandbox policy.");
-            return 0;
-        }
-        if (!json_is_string(cwd)) {
-            *out_error = mcp_strdup("Invalid params: cwd must be a string.");
-            return 0;
-        }
-        if (dup_string_field(&cfg->working_directory, json_string_value(cwd)) != 0)
-            return -1;
-    }
-
-    env = json_object_get(arguments, "env");
-    if (!env)
-        return 0;
-    if (!cfg->request_env_allowed) {
-        *out_error = mcp_strdup("Invalid params: env is disabled by the effective sandbox policy.");
-        return 0;
-    }
-    if (!json_is_object(env)) {
-        *out_error = mcp_strdup("Invalid params: env must be an object of string values.");
-        return 0;
-    }
-
-    json_object_foreach(env, key, value) {
-        if (!shell_exec_env_name_is_valid(key)) {
-            *out_error = mcp_strdup("Invalid params: env names must be non-empty and must not contain '='.");
-            return 0;
-        }
-        if (!json_is_string(value)) {
-            *out_error = mcp_strdup("Invalid params: env values must be strings.");
-            return 0;
-        }
-        if (shell_exec_config_set_env_var(cfg, key, json_string_value(value)) != 0)
-            return -1;
-    }
-
-    return 0;
 }
 
 #ifndef _WIN32
@@ -4337,7 +4288,7 @@ int mcp_tool_system_shell_exec(struct mcp_server *server,
         goto cleanup;
     }
 
-    if (shell_exec_apply_sync_request_overrides(&cfg, invocation, &error_message) != 0) {
+    if (shell_exec_apply_request_overrides(&cfg, invocation, &error_message) != 0) {
         *out_result = mcp_tool_result_text("Failed to apply shell_exec request overrides.", true);
         goto cleanup;
     }
@@ -4397,6 +4348,17 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
                                 const struct mcp_tool_invocation *invocation,
                                 json_t **out_result)
 {
+#ifdef _WIN32
+    (void)invocation;
+    if (!server || !server->shell_jobs) {
+        *out_result = mcp_tool_result_text("system.shell_start job store is not available.", true);
+        return 0;
+    }
+    *out_result = mcp_tool_result_text(
+        "system.shell_start is disabled because async jobs are not implemented on Windows in this build.",
+        true);
+    return 0;
+#else
     struct shell_exec_config cfg;
     const struct mcp_shell_sandbox_control *control = server ? server->sandbox_control : NULL;
     struct shell_exec_request request;
@@ -4405,7 +4367,6 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
     const char *command;
     const char *label;
     size_t command_length;
-    unsigned int timeout_ms;
     unsigned int output_limit_bytes;
     char *error_message = NULL;
     int rc = -1;
@@ -4419,54 +4380,24 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
         return 0;
     }
 
-    if (shell_exec_config_load(&cfg) != 0) {
-        *out_result = mcp_tool_result_text("Failed to initialize shell_start configuration.", true);
-        goto cleanup;
-    }
-    if (!cfg.config_loaded) {
-        char message[512];
-
-        snprintf(message,
-                 sizeof(message),
-                 "system.shell_start is disabled because configuration failed to load from %s. %s",
-                 cfg.config_path ? cfg.config_path : "(unknown)",
-                 cfg.load_error ? cfg.load_error : "No details available.");
-        *out_result = mcp_tool_result_text(message, true);
-        rc = 0;
-        goto cleanup;
-    }
     if (!control) {
         *out_result = mcp_tool_result_text("Failed to initialize shell sandbox policy.", true);
         goto cleanup;
     }
-    cfg.sandbox_revision = 0;
-    cfg.sandbox_enabled = true;
-    cfg.shell_enabled = cfg.enabled;
-    if (!shell_sandbox_policy_is_valid(&cfg, NULL)) {
-        *out_result = mcp_tool_result_text(
-            "system.shell_start is disabled because the execution policy is invalid.", true);
-        rc = 0;
+    if (shell_exec_config_from_v2_control(control, &cfg) != 0) {
+        *out_result = mcp_tool_result_text("Failed to build effective shell sandbox policy.", true);
         goto cleanup;
     }
 
-    if (!cfg.enabled) {
+    if (!cfg.shell_enabled) {
         *out_result = mcp_tool_result_text(
-            "system.shell_start is disabled by policy. Enable it in shell_exec.json or MCP_ENABLE_SHELL_EXEC=1 for a trusted session.",
+            "system.shell_start is disabled by the effective v2 policy.",
             true);
         rc = 0;
         goto cleanup;
     }
     if (json_object_get(invocation->arguments, "args")) {
         *out_result = mcp_tool_result_text("Invalid params: args is not supported by system.shell_start.", true);
-        rc = 0;
-        goto cleanup;
-    }
-    if (shell_job_apply_start_overrides(&cfg, invocation->arguments, &error_message) != 0) {
-        *out_result = mcp_tool_result_text("Failed to apply shell_start overrides.", true);
-        goto cleanup;
-    }
-    if (error_message) {
-        *out_result = mcp_tool_result_text(error_message, true);
         rc = 0;
         goto cleanup;
     }
@@ -4500,19 +4431,10 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
         goto cleanup;
     }
 
-    if (!shell_job_uint_arg(invocation->arguments,
-                            "timeout_ms",
-                            cfg.default_timeout_ms,
-                            MCP_SHELL_EXEC_MIN_TIMEOUT_MS,
-                            cfg.max_timeout_ms,
-                            &timeout_ms)) {
-        char message[128];
-
-        snprintf(message,
-                 sizeof(message),
-                 "Invalid params: timeout_ms must be between 1 and %u for system.shell_start.",
-                 cfg.max_timeout_ms);
-        *out_result = mcp_tool_result_text(message, true);
+    if (!shell_exec_resolve_timeout(&cfg, invocation, &request.timeout_ms)) {
+        *out_result = mcp_tool_result_text(
+            "Invalid params: timeout_ms must be an integer from 1 to the current effective maximum.",
+            true);
         rc = 0;
         goto cleanup;
     }
@@ -4533,7 +4455,22 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
         goto cleanup;
     }
 
-    request.timeout_ms = timeout_ms;
+    if (shell_exec_apply_request_overrides(&cfg, invocation, &error_message) != 0) {
+        *out_result = mcp_tool_result_text("Failed to apply shell_start request overrides.", true);
+        goto cleanup;
+    }
+    if (error_message) {
+        *out_result = mcp_tool_result_text(error_message, true);
+        rc = 0;
+        goto cleanup;
+    }
+    if (!shell_exec_environment_is_valid(&cfg)) {
+        *out_result = mcp_tool_result_text(
+            "Invalid params: final environment exceeds the effective bounds.", true);
+        rc = 0;
+        goto cleanup;
+    }
+
     job = calloc(1, sizeof(*job));
     if (!job)
         goto cleanup;
@@ -4589,6 +4526,7 @@ cleanup:
     shell_exec_request_destroy(&request);
     shell_exec_config_destroy(&cfg);
     return rc;
+#endif
 }
 
 int mcp_tool_system_shell_poll(struct mcp_server *server,
