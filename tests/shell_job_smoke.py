@@ -3,8 +3,79 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+
+TOKEN = "s4-token-must-not-appear-2f841bd7"
+SNAPSHOT_FIELDS = (
+    "sandbox_revision",
+    "sandbox_enabled",
+    "shell_enabled",
+    "timeout_ms",
+    "output_bytes",
+    "once_read_stdout_err_chunk_size",
+)
+
+
+def valid_config(working_directory):
+    return {
+        "version": 2,
+        "control": {"token": TOKEN},
+        "defaults": {
+            "shell_enabled": True,
+            "command_length": 65536,
+            "timeout_ms": 1000,
+            "output_bytes": 512,
+            "once_read_stdout_err_chunk_size": 64,
+            "capture_stderr": True,
+            "merge_stderr_to_stdout": False,
+            "execution": {
+                "mode": "shell",
+                "shell_path": "/bin/sh",
+                "shell_arg": "-c",
+                "working_directory": str(working_directory),
+                "inherit_env": False,
+                "request_cwd_allowed": True,
+                "request_env_allowed": True,
+                "kill_process_group_on_timeout": True,
+                "run_as_user": "",
+                "run_as_group": "",
+                "env": {"HOME": str(working_directory), "LANG": "C", "PATH": "/usr/bin:/bin"},
+            },
+            "limits": {
+                "cpu_seconds": 3600,
+                "memory_bytes": 2147483648,
+                "file_size_bytes": 2147483648,
+                "open_files": 64,
+                "processes": 16,
+            },
+            "isolation": {"require_non_root": False},
+        },
+        "bounds": {
+            "command_length": {"min": 1, "max": 65536},
+            "timeout_ms": {"min": 1, "max": 3600000},
+            "output_bytes": {"min": 0, "max": 1048576},
+            "once_read_stdout_err_chunk_size": {"min": 64, "max": 65536},
+            "execution": {
+                "mode": {"allowed": ["shell", "exec"]},
+                "shell_path": {"min_bytes": 1, "max_bytes": 4096},
+                "shell_arg": {"min_bytes": 0, "max_bytes": 65536},
+                "working_directory": {"min_bytes": 1, "max_bytes": 4096},
+                "allowed_env": {"max_items": 1024, "item_max_bytes": 255},
+                "run_as_user": {"min_bytes": 0},
+                "run_as_group": {"min_bytes": 0},
+            },
+            "limits": {
+                "cpu_seconds": {"min": 0, "max": 3600},
+                "memory_bytes": {"min": 0, "max": 34359738367},
+                "file_size_bytes": {"min": 0, "max": 17179869184},
+                "open_files": {"min": 0, "max": 65536},
+                "processes": {"min": 0, "max": 2048},
+            },
+        },
+    }
 
 
 def send(proc, payload):
@@ -66,12 +137,14 @@ def list_tools(proc, request_id):
     return response["result"]["tools"]
 
 
-def start_server(exe):
-    env = os.environ.copy()
-    env["MCP_ENABLE_SHELL_EXEC"] = "1"
-    env["MCP_SHELL_EXEC_CONFIG"] = os.path.join(
-        os.path.dirname(__file__), "shell_exec_test_config.json"
-    )
+def start_server(exe, config_path):
+    env = {
+        "HOME": str(config_path.parent),
+        "LANG": "C",
+        "PATH": "/usr/bin:/bin",
+        "MCP_ENABLE_SANDBOX_CTL": "1",
+        "MCP_SHELL_EXEC_CONFIG": str(config_path),
+    }
     return subprocess.Popen(
         [exe],
         stdin=subprocess.PIPE,
@@ -81,6 +154,10 @@ def start_server(exe):
         text=True,
         encoding="utf-8",
     )
+
+
+def assert_snapshot(payload, expected):
+    assert {field: payload[field] for field in SNAPSHOT_FIELDS} == expected, payload
 
 
 def wait_for_state(proc, job_id, wanted, deadline_seconds=5.0):
@@ -101,7 +178,13 @@ def main():
     if os.name == "nt":
         return 0
 
-    proc = start_server(exe)
+    temp_dir = tempfile.TemporaryDirectory(prefix="mcp-shell-job-")
+    temp_path = Path(temp_dir.name)
+    config_path = temp_path / "shell_exec.json"
+    config_path.write_text(json.dumps(valid_config(temp_path), separators=(",", ":")), encoding="utf-8")
+    async_cwd = temp_path / "async-cwd"
+    async_cwd.mkdir()
+    proc = start_server(exe, config_path)
     try:
         initialize(proc)
 
@@ -112,9 +195,9 @@ def main():
         assert "env" in start_properties, start_properties
         assert "args" not in start_properties, start_properties
         assert start_properties["timeout_ms"]["minimum"] == 1, start_properties
-        assert start_properties["timeout_ms"]["maximum"] == 300000, start_properties
+        assert start_properties["timeout_ms"]["maximum"] == 3600000, start_properties
         assert start_properties["output_limit_bytes"]["minimum"] == 256, start_properties
-        assert start_properties["output_limit_bytes"]["maximum"] == 2147483648, start_properties
+        assert start_properties["output_limit_bytes"]["maximum"] == 1048576, start_properties
         assert start_properties["env"]["additionalProperties"]["type"] == "string", start_properties
         tail_properties = tool_schemas["system.shell_tail"]["properties"]
         assert "offset" not in tail_properties, tail_properties
@@ -125,61 +208,72 @@ def main():
         assert tools["isError"] is False, tools
         assert "jobs" in json_content(tools), tools
 
+        state = json_content(
+            call_tool(proc, 4, "system.sandbox_ctl", {"action": "get", "token": TOKEN})
+        )
+        assert state["revision"] == 0, state
+
         started = call_tool(
             proc,
-            4,
+            5,
             "system.shell_start",
-            {"command": "sh -c 'printf start; sleep 0.2; printf done'", "timeout_ms": 2000},
+            {
+                "command": "printf '%s|%s|' \"$PWD\" \"$S4_ENV\"; sleep 0.2; printf done",
+                "cwd": str(async_cwd),
+                "env": {"S4_ENV": "request"},
+                "timeout_ms": 800,
+                "output_limit_bytes": 256,
+            },
         )
         assert started["isError"] is False, started
         start_payload = json_content(started)
         job_id = start_payload["job_id"]
+        expected_snapshot = {
+            "sandbox_revision": state["revision"],
+            "sandbox_enabled": True,
+            "shell_enabled": True,
+            "timeout_ms": 800,
+            "output_bytes": 256,
+            "once_read_stdout_err_chunk_size": 64,
+        }
         assert start_payload["state"] == "running", start_payload
         assert start_payload["pid"] > 0, start_payload
         assert start_payload["process_group_id"] == start_payload["pid"], start_payload
         assert start_payload["rollback"]["tool_name"] == "system.shell_kill", start_payload
-        assert start_payload["sandbox_revision"] == 0, start_payload
-        assert start_payload["sandbox_enabled"] is True, start_payload
-        assert start_payload["shell_enabled"] is True, start_payload
+        assert_snapshot(start_payload, expected_snapshot)
+
+        poll_payload = json_content(
+            call_tool(proc, 6, "system.shell_poll", {"job_id": job_id})
+        )
+        assert_snapshot(poll_payload, expected_snapshot)
 
         wait_payload = json_content(
-            call_tool(proc, 5, "system.shell_wait", {"job_id": job_id, "timeout_ms": 3000})
+            call_tool(proc, 7, "system.shell_wait", {"job_id": job_id, "timeout_ms": 3000})
         )
         assert wait_payload["wait_result"] == "finished", wait_payload
         assert wait_payload["state"] == "exited", wait_payload
         assert wait_payload["exit_code"] == 0, wait_payload
-        assert wait_payload["sandbox_revision"] == start_payload["sandbox_revision"], wait_payload
+        assert_snapshot(wait_payload, expected_snapshot)
 
-        tail_payload = json_content(call_tool(proc, 6, "system.shell_tail", {"job_id": job_id}))
-        assert tail_payload["stdout"] == "startdone", tail_payload
-        assert tail_payload["next_stdout_offset"] == len("startdone"), tail_payload
-        assert tail_payload["sandbox_revision"] == start_payload["sandbox_revision"], tail_payload
+        tail_payload = json_content(call_tool(proc, 8, "system.shell_tail", {"job_id": job_id}))
+        expected_stdout = f"{async_cwd}|request|done"
+        assert tail_payload["stdout"] == expected_stdout, tail_payload
+        assert tail_payload["next_stdout_offset"] == len(expected_stdout), tail_payload
+        assert_snapshot(tail_payload, expected_snapshot)
 
-        env_started = json_content(
-            call_tool(
-                proc,
-                7,
-                "system.shell_start",
-                {
-                    "command": "printf '%s:%s' \"$MCP_TEST_ENV\" \"$LANG\"",
-                    "env": {"MCP_TEST_ENV": "from-env"},
-                    "label": "env-check",
-                },
-            )
-        )
-        assert env_started["label"] == "env-check", env_started
-        env_job_id = env_started["job_id"]
-        env_wait = json_content(call_tool(proc, 8, "system.shell_wait", {"job_id": env_job_id, "timeout_ms": 3000}))
-        assert env_wait["state"] == "exited", env_wait
-        env_tail = json_content(call_tool(proc, 9, "system.shell_tail", {"job_id": env_job_id}))
-        assert env_tail["stdout"] == "from-env:C", env_tail
+        listed_payload = json_content(call_tool(proc, 9, "system.shell_list", {}))
+        listed = next(job for job in listed_payload["jobs"] if job["job_id"] == job_id)
+        assert_snapshot(listed, expected_snapshot)
 
         truncated_started = json_content(
             call_tool(
                 proc,
                 10,
                 "system.shell_start",
-                {"command": "printf abcdef", "output_limit_bytes": 256},
+                {
+                    "command": "i=0; while [ \"$i\" -lt 300 ]; do printf x; i=$((i + 1)); done",
+                    "output_limit_bytes": 256,
+                },
             )
         )
         truncated_job_id = truncated_started["job_id"]
@@ -188,13 +282,13 @@ def main():
         )
         assert truncated_wait["state"] == "exited", truncated_wait
         truncated_tail = json_content(call_tool(proc, 12, "system.shell_tail", {"job_id": truncated_job_id}))
-        assert truncated_tail["stdout"] == "abcdef", truncated_tail
-        assert truncated_tail["stdout_truncated"] is False, truncated_tail
+        assert truncated_tail["stdout"] == "x" * 256, truncated_tail
+        assert truncated_tail["stdout_truncated"] is True, truncated_tail
 
-        bad_timeout = call_tool(proc, 13, "system.shell_start", {"command": "true", "timeout_ms": 5001})
+        bad_timeout = call_tool(proc, 13, "system.shell_start", {"command": "true", "timeout_ms": 1001})
         assert bad_timeout["isError"] is True, bad_timeout
         assert "timeout_ms" in bad_timeout["content"][0]["text"], bad_timeout
-        bad_output_limit = call_tool(proc, 14, "system.shell_start", {"command": "true", "output_limit_bytes": 255})
+        bad_output_limit = call_tool(proc, 14, "system.shell_start", {"command": "true", "output_limit_bytes": 513})
         assert bad_output_limit["isError"] is True, bad_output_limit
         assert "output_limit_bytes" in bad_output_limit["content"][0]["text"], bad_output_limit
         bad_args = call_tool(proc, 15, "system.shell_start", {"command": "true", "args": {}})
@@ -202,12 +296,85 @@ def main():
         assert "args" in bad_args["content"][0]["text"], bad_args
         bad_env = call_tool(proc, 16, "system.shell_start", {"command": "true", "env": {"BAD=NAME": "x"}})
         assert bad_env["isError"] is True, bad_env
-        assert "env names" in bad_env["content"][0]["text"], bad_env
+        assert "valid names" in bad_env["content"][0]["text"], bad_env
         bad_offset = call_tool(proc, 17, "system.shell_tail", {"job_id": job_id, "offset": 0})
         assert bad_offset["isError"] is True, bad_offset
         assert "offset" in bad_offset["content"][0]["text"], bad_offset
 
-        marker = Path(f"/tmp/mcp_shell_job_marker_{os.getpid()}")
+        state = json_content(
+            call_tool(
+                proc,
+                18,
+                "system.sandbox_ctl",
+                {
+                    "action": "update",
+                    "token": TOKEN,
+                    "expected_revision": state["revision"],
+                    "overrides": {
+                        "execution": {
+                            "request_cwd_allowed": False,
+                            "request_env_allowed": False,
+                        }
+                    },
+                },
+            )
+        )
+        blocked_cwd = call_tool(
+            proc,
+            19,
+            "system.shell_start",
+            {"command": "pwd", "cwd": str(async_cwd)},
+        )
+        assert blocked_cwd["isError"] is True and "cwd is disabled" in blocked_cwd["content"][0]["text"], blocked_cwd
+        blocked_env = call_tool(
+            proc,
+            20,
+            "system.shell_start",
+            {"command": "true", "env": {"S4_ENV": "blocked"}},
+        )
+        assert blocked_env["isError"] is True and "env is disabled" in blocked_env["content"][0]["text"], blocked_env
+
+        state = json_content(
+            call_tool(
+                proc,
+                21,
+                "system.sandbox_ctl",
+                {
+                    "action": "update",
+                    "token": TOKEN,
+                    "expected_revision": state["revision"],
+                    "overrides": {
+                        "output_bytes": 0,
+                        "execution": {
+                            "request_cwd_allowed": None,
+                            "request_env_allowed": None,
+                        },
+                    },
+                },
+            )
+        )
+        zero_started = json_content(
+            call_tool(proc, 22, "system.shell_start", {"command": "printf discarded"})
+        )
+        zero_expected = {
+            "sandbox_revision": state["revision"],
+            "sandbox_enabled": True,
+            "shell_enabled": True,
+            "timeout_ms": 1000,
+            "output_bytes": 0,
+            "once_read_stdout_err_chunk_size": 64,
+        }
+        assert_snapshot(zero_started, zero_expected)
+        zero_job_id = zero_started["job_id"]
+        zero_wait = json_content(
+            call_tool(proc, 23, "system.shell_wait", {"job_id": zero_job_id, "timeout_ms": 3000})
+        )
+        assert_snapshot(zero_wait, zero_expected)
+        zero_tail = json_content(call_tool(proc, 24, "system.shell_tail", {"job_id": zero_job_id}))
+        assert zero_tail["stdout"] == "" and zero_tail["stdout_truncated"] is True, zero_tail
+        assert_snapshot(zero_tail, zero_expected)
+
+        marker = temp_path / "kill-marker"
         try:
             marker.unlink()
         except FileNotFoundError:
@@ -215,17 +382,17 @@ def main():
         kill_started = json_content(
             call_tool(
                 proc,
-                18,
+                25,
                 "system.shell_start",
                 {
                     "command": f"sh -c 'sleep 2; touch {marker}'",
-                    "timeout_ms": 5000,
+                    "timeout_ms": 800,
                     "label": "kill-check",
                 },
             )
         )
         kill_job_id = kill_started["job_id"]
-        killed = json_content(call_tool(proc, 19, "system.shell_kill", {"job_id": kill_job_id, "signal": signal.SIGTERM}))
+        killed = json_content(call_tool(proc, 26, "system.shell_kill", {"job_id": kill_job_id, "signal": signal.SIGTERM}))
         assert killed["state"] == "killed", killed
         assert killed["signal"] in (signal.SIGTERM, signal.SIGKILL), killed
         time.sleep(2.2)
@@ -234,7 +401,7 @@ def main():
         timed_started = json_content(
             call_tool(
                 proc,
-                20,
+                27,
                 "system.shell_start",
                 {"command": "sh -c 'sleep 2'", "timeout_ms": 100},
             )
@@ -242,16 +409,17 @@ def main():
         timed = wait_for_state(proc, timed_started["job_id"], "timed_out")
         assert timed["signal"] != 0, timed
 
-        jobs = json_content(call_tool(proc, 21, "system.shell_list", {}))["jobs"]
+        jobs = json_content(call_tool(proc, 28, "system.shell_list", {}))["jobs"]
         ids = {job["job_id"] for job in jobs}
         assert job_id in ids and kill_job_id in ids and timed_started["job_id"] in ids, jobs
-        assert env_job_id in ids and truncated_job_id in ids, jobs
+        assert zero_job_id in ids and truncated_job_id in ids, jobs
         listed = next(job for job in jobs if job["job_id"] == job_id)
-        assert listed["sandbox_revision"] == start_payload["sandbox_revision"], listed
+        assert_snapshot(listed, expected_snapshot)
     finally:
         if proc.stdin:
             proc.stdin.close()
         proc.wait(timeout=5)
+        temp_dir.cleanup()
 
     return 0
 
