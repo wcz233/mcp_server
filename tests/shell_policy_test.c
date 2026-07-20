@@ -3,6 +3,7 @@
 #include <jansson.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CHECK(condition)                                                                          \
@@ -117,9 +118,13 @@ static int test_field_directory(void)
 
 static int test_valid_config_and_token_copy(void)
 {
+    const struct mcp_shell_policy_field_descriptor *fields;
     json_t *root = valid_root();
     struct mcp_shell_policy_snapshot *snapshot = NULL;
     json_t *control;
+    json_t *serialized;
+    size_t count;
+    size_t index;
 
     CHECK(root != NULL);
     CHECK(parse_root(root, &snapshot) == 0);
@@ -139,6 +144,66 @@ static int test_valid_config_and_token_copy(void)
     CHECK(json_object_set_new(control, "token", json_string("changed")) == 0);
     CHECK(strcmp(snapshot->token, "unit-test-token") == 0);
 
+    fields = mcp_shell_policy_field_directory(&count);
+    for (index = 0; index < count; index++) {
+        serialized = fields[index].serializer(snapshot, &fields[index]);
+        CHECK(serialized != NULL);
+        json_decref(serialized);
+    }
+
+    json_decref(root);
+    mcp_shell_policy_snapshot_destroy(snapshot);
+    return 0;
+}
+
+static int test_hard_profile(void)
+{
+    struct mcp_shell_policy_snapshot *snapshot = NULL;
+
+    CHECK(mcp_shell_policy_snapshot_create_hard(&snapshot, "(unit-hard)", false) == 0);
+    CHECK(snapshot != NULL);
+    CHECK(!snapshot->config_loaded);
+    CHECK(!snapshot->control_enabled);
+    CHECK(snapshot->token == NULL && snapshot->token_length == 0u);
+    CHECK(snapshot->defaults.shell_enabled);
+    CHECK(snapshot->defaults.command_length.value == snapshot->defaults.command_length.max);
+    CHECK(snapshot->defaults.timeout_ms.value == snapshot->defaults.timeout_ms.max);
+    CHECK(snapshot->defaults.output_bytes.value == snapshot->defaults.output_bytes.max);
+    CHECK(snapshot->defaults.limits.memory_bytes.value ==
+          snapshot->defaults.limits.memory_bytes.max);
+    CHECK(snapshot->defaults.limits.file_size_bytes.value ==
+          snapshot->defaults.limits.file_size_bytes.max);
+    CHECK(snapshot->environment_source == MCP_SHELL_POLICY_SOURCE_HARD);
+    CHECK(snapshot->defaults.execution.env_var_count > 0u);
+    mcp_shell_policy_snapshot_destroy(snapshot);
+    return 0;
+}
+
+static int test_utf8_byte_length_fallback(void)
+{
+    json_t *root = valid_root();
+    struct mcp_shell_policy_snapshot *snapshot = NULL;
+    json_t *execution;
+    char *value;
+    size_t index;
+    size_t length = 4098u;
+
+    CHECK(root != NULL);
+    value = malloc(length);
+    CHECK(value != NULL);
+    for (index = 0; index < length; index += 2u)
+        memcpy(&value[index], "\xc3\xa9", 2u);
+    execution = json_object_get(json_object_get(root, "defaults"), "execution");
+    CHECK(json_object_set_new(execution, "shell_path", json_stringn(value, length)) == 0);
+    free(value);
+
+    CHECK(parse_root(root, &snapshot) == 0);
+    CHECK(snapshot->defaults.execution.shell_path.source ==
+          MCP_SHELL_POLICY_SOURCE_HARD_FALLBACK);
+    CHECK(snapshot->defaults.execution.shell_path.max_bytes == 4096u);
+    CHECK(strcmp(mcp_shell_policy_snapshot_diagnostic(
+                     snapshot, MCP_SHELL_POLICY_FIELD_SHELL_PATH),
+                 "default_out_of_bounds") == 0);
     json_decref(root);
     mcp_shell_policy_snapshot_destroy(snapshot);
     return 0;
@@ -205,6 +270,7 @@ static int test_strict_type_rejection(void)
 int main(void)
 {
     if (test_field_directory() != 0 || test_valid_config_and_token_copy() != 0 ||
+        test_hard_profile() != 0 || test_utf8_byte_length_fallback() != 0 ||
         test_field_fallbacks() != 0 || test_strict_type_rejection() != 0)
         return 1;
     return 0;
