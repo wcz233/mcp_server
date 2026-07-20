@@ -19,6 +19,14 @@
 #define MCP_SHELL_POLICY_HARD_ENV_ITEM_MAX_BYTES 255u
 #define POLICY_OFFSET(member) offsetof(struct mcp_shell_policy_defaults, member)
 
+#ifndef MCP_SHELL_EXEC_DEFAULT_CONFIG
+#define MCP_SHELL_EXEC_DEFAULT_CONFIG ""
+#endif
+
+#ifndef MCP_SHELL_EXEC_INSTALLED_CONFIG
+#define MCP_SHELL_EXEC_INSTALLED_CONFIG ""
+#endif
+
 static int parse_policy_field(struct mcp_shell_policy_snapshot *snapshot,
                               const json_t *root,
                               const struct mcp_shell_policy_field_descriptor *field,
@@ -626,6 +634,118 @@ int mcp_shell_policy_snapshot_create_hard(struct mcp_shell_policy_snapshot **out
 fail:
     mcp_shell_policy_snapshot_destroy(snapshot);
     return -1;
+}
+
+static int policy_control_gate(bool *enabled)
+{
+    const char *value = getenv("MCP_ENABLE_SANDBOX_CTL");
+
+    if (!enabled)
+        return -1;
+    if (!value || value[0] == '\0' || strcmp(value, "0") == 0) {
+        *enabled = false;
+        return 0;
+    }
+    if (strcmp(value, "1") == 0) {
+        *enabled = true;
+        return 0;
+    }
+    fputs("MCP_ENABLE_SANDBOX_CTL must be unset, empty, 0, or 1\n", stderr);
+    return -1;
+}
+
+static int policy_parse_loaded_root(struct mcp_shell_policy_snapshot **out,
+                                    json_t *root,
+                                    const char *path,
+                                    bool control_enabled,
+                                    bool failure_is_fatal)
+{
+    char error[256];
+
+    if (mcp_shell_policy_snapshot_parse_json(
+            out, root, path, control_enabled, error, sizeof(error)) == 0)
+        return 0;
+    if (failure_is_fatal) {
+        fprintf(stderr, "Invalid shell policy config %s: %s\n", path, error);
+        return -1;
+    }
+    fprintf(stderr,
+            "Ignoring invalid automatic shell policy config %s: %s; using hard profile\n",
+            path,
+            error);
+    return mcp_shell_policy_snapshot_create_hard(out, path, false);
+}
+
+int mcp_shell_policy_snapshot_create_from_environment(struct mcp_shell_policy_snapshot **out)
+{
+    const char *explicit_path;
+    const char *path = NULL;
+    const char *candidates[] = {
+        MCP_SHELL_EXEC_DEFAULT_CONFIG,
+        MCP_SHELL_EXEC_INSTALLED_CONFIG,
+    };
+    bool control_enabled;
+    bool explicit_config;
+    size_t index;
+    json_t *root = NULL;
+    json_error_t json_error;
+    int result;
+
+    if (!out)
+        return -1;
+    *out = NULL;
+    if (policy_control_gate(&control_enabled) != 0)
+        return -1;
+
+    explicit_path = getenv("MCP_SHELL_EXEC_CONFIG");
+    explicit_config = explicit_path && explicit_path[0] != '\0';
+    if (explicit_config) {
+        path = explicit_path;
+        root = json_load_file(path, JSON_REJECT_DUPLICATES, &json_error);
+        if (!root) {
+            fprintf(stderr,
+                    "Failed to load explicit shell policy config %s%s\n",
+                    path,
+                    json_error_code(&json_error) == json_error_cannot_open_file
+                        ? ": file unavailable"
+                        : ": invalid JSON");
+            return -1;
+        }
+    } else {
+        for (index = 0; index < sizeof(candidates) / sizeof(candidates[0]); index++) {
+            if (candidates[index][0] == '\0')
+                continue;
+            root = json_load_file(candidates[index], JSON_REJECT_DUPLICATES, &json_error);
+            if (root) {
+                path = candidates[index];
+                break;
+            }
+            if (json_error_code(&json_error) != json_error_cannot_open_file) {
+                path = candidates[index];
+                if (control_enabled) {
+                    fprintf(stderr, "Invalid automatic shell policy config %s\n", path);
+                    return -1;
+                }
+                fprintf(stderr,
+                        "Ignoring invalid automatic shell policy config %s; using hard profile\n",
+                        path);
+                return mcp_shell_policy_snapshot_create_hard(out, path, false);
+            }
+        }
+    }
+
+    if (!root) {
+        if (control_enabled) {
+            fputs("MCP_ENABLE_SANDBOX_CTL=1 requires a valid shell policy config\n", stderr);
+            return -1;
+        }
+        return mcp_shell_policy_snapshot_create_hard(out, "(hard_profile)", false);
+    }
+
+    result = policy_parse_loaded_root(
+        out, root, path, control_enabled, explicit_config || control_enabled);
+    json_decref(root);
+    return result;
 }
 
 static void policy_set_diagnostic(struct mcp_shell_policy_snapshot *snapshot,

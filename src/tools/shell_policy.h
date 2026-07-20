@@ -179,6 +179,7 @@ const struct mcp_shell_policy_field_descriptor *mcp_shell_policy_field_directory
 int mcp_shell_policy_snapshot_create_hard(struct mcp_shell_policy_snapshot **out,
                                           const char *config_path,
                                           bool control_enabled);
+int mcp_shell_policy_snapshot_create_from_environment(struct mcp_shell_policy_snapshot **out);
 int mcp_shell_policy_snapshot_parse_json(struct mcp_shell_policy_snapshot **out,
                                          const json_t *root,
                                          const char *config_path,

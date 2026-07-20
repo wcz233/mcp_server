@@ -14,6 +14,7 @@
 
 struct mcp_shell_job_store;
 struct mcp_shell_sandbox_control;
+struct mcp_shell_policy_snapshot;
 
 enum mcp_session_state {
     MCP_SESSION_NOT_INITIALIZED = 0,
@@ -53,6 +54,7 @@ struct mcp_server {
     struct mcp_plugin_manager *plugin_manager;
     struct mcp_peer_transport *peer_transport;
     struct mcp_server_discovery *discovery;
+    struct mcp_shell_policy_snapshot *shell_policy_snapshot;
     struct mcp_shell_sandbox_control *sandbox_control;
     struct mcp_shell_job_store *shell_jobs;
     char *tcp_host;

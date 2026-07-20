@@ -2,6 +2,7 @@
 
 #include "common/platform.h"
 #include "core/server_internal.h"
+#include "tools/shell_policy.h"
 #include "tools/tool_result.h"
 
 #include <ctype.h>
@@ -178,8 +179,7 @@ struct shell_job {
 
 struct mcp_shell_sandbox_control {
     bool enabled;
-    char *token;
-    size_t token_length;
+    const struct mcp_shell_policy_snapshot *policy_snapshot;
     json_int_t revision;
     bool sandbox_enabled;
     bool shell_enabled_is_set;
@@ -201,31 +201,14 @@ struct mcp_shell_job_store {
 
 static int shell_exec_prepare_working_directory(const struct shell_exec_config *cfg);
 
-static void shell_sandbox_token_zero(char *token, size_t token_length)
+int mcp_shell_sandbox_control_create(struct mcp_shell_sandbox_control **out,
+                                     const struct mcp_shell_policy_snapshot *policy_snapshot)
 {
-    volatile unsigned char *bytes = (volatile unsigned char *)token;
-    size_t i;
-
-    for (i = 0; i < token_length; i++)
-        bytes[i] = 0;
-}
-
-int mcp_shell_sandbox_control_create(struct mcp_shell_sandbox_control **out)
-{
-    const char *enable_value;
-    const char *token;
     struct mcp_shell_sandbox_control *control;
 
-    if (!out)
+    if (!out || !policy_snapshot)
         return -1;
     *out = NULL;
-
-    enable_value = getenv("MCP_ENABLE_SANDBOX_CTL");
-    if (enable_value && enable_value[0] != '\0' &&
-        strcmp(enable_value, "0") != 0 && strcmp(enable_value, "1") != 0) {
-        fputs("MCP_ENABLE_SANDBOX_CTL must be unset, empty, 0, or 1\n", stderr);
-        return -1;
-    }
 
     control = calloc(1, sizeof(*control));
     if (!control)
@@ -236,27 +219,9 @@ int mcp_shell_sandbox_control_create(struct mcp_shell_sandbox_control **out)
         free(control);
         return -1;
     }
-    control->sandbox_enabled = true;
-
-    control->enabled = enable_value && strcmp(enable_value, "1") == 0;
-    if (control->enabled) {
-        token = getenv("MCP_SANDBOX_CTL_TOKEN");
-        if (!token || token[0] == '\0') {
-            fputs("MCP_SANDBOX_CTL_TOKEN must be non-empty when MCP_ENABLE_SANDBOX_CTL=1\n",
-                  stderr);
-            json_decref(control->overrides);
-            free(control);
-            return -1;
-        }
-
-        control->token = mcp_strdup(token);
-        if (!control->token) {
-            json_decref(control->overrides);
-            free(control);
-            return -1;
-        }
-        control->token_length = strlen(token);
-    }
+    control->policy_snapshot = policy_snapshot;
+    control->enabled = policy_snapshot->control_enabled;
+    control->sandbox_enabled = control->enabled;
 
     *out = control;
     return 0;
@@ -267,8 +232,6 @@ void mcp_shell_sandbox_control_destroy(struct mcp_shell_sandbox_control *control
     if (!control)
         return;
 
-    shell_sandbox_token_zero(control->token, control->token_length);
-    free(control->token);
     json_decref(control->overrides);
     free(control);
 }
@@ -961,20 +924,25 @@ static bool shell_sandbox_token_matches(const struct mcp_shell_sandbox_control *
                                         const json_t *provided)
 {
     const unsigned char *actual;
+    const unsigned char *expected;
     size_t actual_length;
+    size_t expected_length;
     size_t difference;
     size_t index;
 
-    if (!control || !control->enabled || !json_is_string(provided))
+    if (!control || !control->enabled || !control->policy_snapshot ||
+        !json_is_string(provided))
         return false;
 
     actual = (const unsigned char *)json_string_value(provided);
     actual_length = json_string_length(provided);
-    difference = actual_length ^ control->token_length;
-    for (index = 0; index < control->token_length; index++) {
+    expected = (const unsigned char *)control->policy_snapshot->token;
+    expected_length = control->policy_snapshot->token_length;
+    difference = actual_length ^ expected_length;
+    for (index = 0; index < expected_length; index++) {
         unsigned char actual_byte = index < actual_length ? actual[index] : 0u;
 
-        difference |= (size_t)(actual_byte ^ (unsigned char)control->token[index]);
+        difference |= (size_t)(actual_byte ^ expected[index]);
     }
     return difference == 0u;
 }

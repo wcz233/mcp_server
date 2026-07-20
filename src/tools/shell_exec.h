@@ -6,8 +6,10 @@
 
 struct mcp_shell_job_store;
 struct mcp_shell_sandbox_control;
+struct mcp_shell_policy_snapshot;
 
-int mcp_shell_sandbox_control_create(struct mcp_shell_sandbox_control **out);
+int mcp_shell_sandbox_control_create(struct mcp_shell_sandbox_control **out,
+                                     const struct mcp_shell_policy_snapshot *policy_snapshot);
 void mcp_shell_sandbox_control_destroy(struct mcp_shell_sandbox_control *control);
 bool mcp_shell_sandbox_control_is_enabled(const struct mcp_shell_sandbox_control *control);
 int mcp_tool_system_sandbox_ctl(struct mcp_server *server,

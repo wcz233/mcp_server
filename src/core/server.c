@@ -9,6 +9,7 @@
 #endif
 #include "tools/builtin_tools.h"
 #include "tools/shell_exec.h"
+#include "tools/shell_policy.h"
 #include "tools/tool_result.h"
 
 #include <jansson.h>
@@ -900,7 +901,9 @@ int mcp_server_init(struct mcp_server **out, uv_loop_t *loop, struct mcp_server_
     server->stdio_session.state = MCP_SESSION_NOT_INITIALIZED;
     mcp_in_flight_init(&server->in_flight);
 
-    if (mcp_shell_sandbox_control_create(&server->sandbox_control) != 0) {
+    if (mcp_shell_policy_snapshot_create_from_environment(&server->shell_policy_snapshot) != 0 ||
+        mcp_shell_sandbox_control_create(&server->sandbox_control,
+                                         server->shell_policy_snapshot) != 0) {
         mcp_server_destroy(server);
         return -1;
     }
@@ -980,6 +983,7 @@ void mcp_server_destroy(struct mcp_server *server)
     mcp_server_discovery_destroy(server->discovery);
     mcp_shell_jobs_destroy(server->shell_jobs);
     mcp_shell_sandbox_control_destroy(server->sandbox_control);
+    mcp_shell_policy_snapshot_destroy(server->shell_policy_snapshot);
     mcp_peer_transport_destroy(server->peer_transport);
     mcp_tool_registry_destroy(server->registry);
     mcp_in_flight_destroy(&server->in_flight);
