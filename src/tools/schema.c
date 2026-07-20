@@ -1,6 +1,8 @@
 #include "tools/schema.h"
+#include "tools/shell_policy.h"
 
 #include <jansson.h>
+#include <string.h>
 
 #define MCP_SHELL_EXEC_HARD_TIMEOUT_MS 300000u
 #define MCP_SHELL_EXEC_HARD_OUTPUT_BYTES 2147483648u
@@ -109,6 +111,36 @@ static int sandbox_schema_add(json_t *properties, const char *name, json_t *sche
     return 0;
 }
 
+static json_t *sandbox_schema_policy_field(
+    const struct mcp_shell_policy_field_descriptor *field)
+{
+    json_t *typed = NULL;
+
+    switch (field->type) {
+    case MCP_SHELL_POLICY_TYPE_BOOLEAN:
+        return sandbox_schema_nullable_boolean();
+    case MCP_SHELL_POLICY_TYPE_UINT64:
+        return sandbox_schema_nullable_integer((json_int_t)field->hard_min,
+                                               (json_int_t)field->hard_max);
+    case MCP_SHELL_POLICY_TYPE_STRING:
+        return sandbox_schema_nullable_string(field->hard_min_bytes, field->hard_max_bytes);
+    case MCP_SHELL_POLICY_TYPE_MODE:
+        typed = json_pack("{s:s,s:[s,s]}", "type", "string", "enum", "shell", "exec");
+        return sandbox_schema_nullable(typed);
+    case MCP_SHELL_POLICY_TYPE_ENV:
+        typed = json_pack("{s:s,s:{s:s},s:I}",
+                          "type",
+                          "object",
+                          "additionalProperties",
+                          "type",
+                          "string",
+                          "maxProperties",
+                          (json_int_t)MCP_SHELL_POLICY_ENV_HARD_MAX_ITEMS);
+        return sandbox_schema_nullable(typed);
+    }
+    return NULL;
+}
+
 json_t *mcp_schema_sandbox_ctl(void)
 {
     json_t *root_properties = json_object();
@@ -117,10 +149,11 @@ json_t *mcp_schema_sandbox_ctl(void)
     json_t *limit_properties = json_object();
     json_t *isolation_properties = json_object();
     json_t *action = NULL;
-    json_t *allowed_env_typed = NULL;
-    json_t *allowed_env_items = NULL;
     json_t *schema = NULL;
     json_t *required = NULL;
+    const struct mcp_shell_policy_field_descriptor *fields;
+    size_t field_count;
+    size_t index;
 
     if (!root_properties || !override_properties || !execution_properties || !limit_properties ||
         !isolation_properties)
@@ -143,96 +176,36 @@ json_t *mcp_schema_sandbox_ctl(void)
                            "expected_revision",
                            json_pack("{s:s,s:I}", "type", "integer", "minimum", (json_int_t)0)) !=
             0 ||
-        sandbox_schema_add(root_properties, "shell_enabled", sandbox_schema_nullable_boolean()) !=
-            0 ||
         sandbox_schema_add(root_properties,
                            "sandbox_enabled",
                            json_pack("{s:s}", "type", "boolean")) != 0)
         goto fail;
 
-    if (sandbox_schema_add(override_properties,
-                           "max_command_length",
-                           sandbox_schema_nullable_integer(64, 65535)) != 0 ||
-        sandbox_schema_add(override_properties,
-                           "default_timeout_ms",
-                           sandbox_schema_nullable_integer(1, 300000)) != 0 ||
-        sandbox_schema_add(override_properties,
-                           "max_timeout_ms",
-                           sandbox_schema_nullable_integer(1, 300000)) != 0 ||
-        sandbox_schema_add(override_properties,
-                           "max_output_bytes",
-                           sandbox_schema_nullable_integer(256, 2147483648LL)) != 0 ||
-        sandbox_schema_add(override_properties,
-                           "capture_stderr",
-                           sandbox_schema_nullable_boolean()) != 0 ||
-        sandbox_schema_add(override_properties,
-                           "merge_stderr",
-                           sandbox_schema_nullable_boolean()) != 0)
-        goto fail;
+    fields = mcp_shell_policy_field_directory(&field_count);
+    for (index = 0; index < field_count; index++) {
+        const char *path = fields[index].path + strlen("defaults.");
+        const char *separator = strchr(path, '.');
+        json_t *properties = override_properties;
+        const char *name = path;
 
-    if (sandbox_schema_add(execution_properties,
-                           "working_directory",
-                           sandbox_schema_nullable_string(1u, 4096u)) != 0 ||
-        sandbox_schema_add(execution_properties,
-                           "request_cwd_allowed",
-                           sandbox_schema_nullable_boolean()) != 0 ||
-        sandbox_schema_add(execution_properties,
-                           "clear_environment",
-                           sandbox_schema_nullable_boolean()) != 0 ||
-        sandbox_schema_add(execution_properties,
-                           "request_env_allowed",
-                           sandbox_schema_nullable_boolean()) != 0 ||
-        sandbox_schema_add(execution_properties,
-                           "kill_process_group_on_timeout",
-                           sandbox_schema_nullable_boolean()) != 0 ||
-        sandbox_schema_add(execution_properties,
-                           "run_as_user",
-                           sandbox_schema_nullable_string(0u, 0u)) != 0 ||
-        sandbox_schema_add(execution_properties,
-                           "run_as_group",
-                           sandbox_schema_nullable_string(0u, 0u)) != 0)
-        goto fail;
-
-    allowed_env_items = json_pack("{s:s,s:I,s:I}",
-                                  "type",
-                                  "string",
-                                  "minLength",
-                                  (json_int_t)1,
-                                  "maxLength",
-                                  (json_int_t)255);
-    allowed_env_typed = json_pack("{s:s,s:I,s:o}",
-                                  "type",
-                                  "array",
-                                  "maxItems",
-                                  (json_int_t)128,
-                                  "items",
-                                  allowed_env_items);
-    allowed_env_items = NULL;
-    if (sandbox_schema_add(execution_properties,
-                           "allowed_env",
-                           sandbox_schema_nullable(allowed_env_typed)) != 0)
-        goto fail;
-    allowed_env_typed = NULL;
-
-    if (sandbox_schema_add(limit_properties,
-                           "max_cpu_seconds",
-                           sandbox_schema_nullable_integer(0, 3600)) != 0 ||
-        sandbox_schema_add(limit_properties,
-                           "max_memory_bytes",
-                           sandbox_schema_nullable_integer(0, 2147483647)) != 0 ||
-        sandbox_schema_add(limit_properties,
-                           "max_file_size_bytes",
-                           sandbox_schema_nullable_integer(0, 2147483647)) != 0 ||
-        sandbox_schema_add(limit_properties,
-                           "max_open_files",
-                           sandbox_schema_nullable_integer(0, 1048576)) != 0 ||
-        sandbox_schema_add(limit_properties,
-                           "max_processes",
-                           sandbox_schema_nullable_integer(0, 1048576)) != 0 ||
-        sandbox_schema_add(isolation_properties,
-                           "require_non_root",
-                           sandbox_schema_nullable_boolean()) != 0)
-        goto fail;
+        if (separator) {
+            if ((size_t)(separator - path) == strlen("execution") &&
+                strncmp(path, "execution", strlen("execution")) == 0)
+                properties = execution_properties;
+            else if ((size_t)(separator - path) == strlen("limits") &&
+                     strncmp(path, "limits", strlen("limits")) == 0)
+                properties = limit_properties;
+            else if ((size_t)(separator - path) == strlen("isolation") &&
+                     strncmp(path, "isolation", strlen("isolation")) == 0)
+                properties = isolation_properties;
+            else
+                goto fail;
+            name = separator + 1;
+        }
+        if (sandbox_schema_add(
+                properties, name, sandbox_schema_policy_field(&fields[index])) != 0)
+            goto fail;
+    }
 
     if (sandbox_schema_add(override_properties,
                            "execution",
@@ -272,8 +245,6 @@ fail:
     json_decref(limit_properties);
     json_decref(isolation_properties);
     json_decref(action);
-    json_decref(allowed_env_typed);
-    json_decref(allowed_env_items);
     json_decref(required);
     json_decref(schema);
     return NULL;

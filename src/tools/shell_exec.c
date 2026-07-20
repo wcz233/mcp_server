@@ -182,8 +182,6 @@ struct mcp_shell_sandbox_control {
     const struct mcp_shell_policy_snapshot *policy_snapshot;
     json_int_t revision;
     bool sandbox_enabled;
-    bool shell_enabled_is_set;
-    bool shell_enabled;
     json_t *overrides;
 };
 
@@ -973,7 +971,6 @@ static bool shell_sandbox_top_level_is_valid(const json_t *arguments,
         (void)value;
         if (action == SHELL_SANDBOX_ACTION_UPDATE) {
             allowed = allowed || shell_sandbox_key_equals(key, key_length, "expected_revision") ||
-                      shell_sandbox_key_equals(key, key_length, "shell_enabled") ||
                       shell_sandbox_key_equals(key, key_length, "sandbox_enabled") ||
                       shell_sandbox_key_equals(key, key_length, "overrides");
         } else if (action == SHELL_SANDBOX_ACTION_RESET) {
@@ -1023,125 +1020,6 @@ static enum shell_sandbox_patch_status shell_sandbox_store_patch_value(
     return SHELL_SANDBOX_PATCH_OK;
 }
 
-static enum shell_sandbox_patch_status shell_sandbox_patch_boolean(
-    json_t *target,
-    const char *key,
-    const json_t *value,
-    const char *field,
-    bool unsupported,
-    struct shell_sandbox_patch_error *error)
-{
-    if (!json_is_null(value) && !json_is_boolean(value)) {
-        error->field = field;
-        return SHELL_SANDBOX_PATCH_INVALID;
-    }
-    if (!json_is_null(value) && unsupported) {
-        error->field = field;
-        return SHELL_SANDBOX_PATCH_UNSUPPORTED;
-    }
-    return shell_sandbox_store_patch_value(target, key, value);
-}
-
-static enum shell_sandbox_patch_status shell_sandbox_patch_integer(
-    json_t *target,
-    const char *key,
-    const json_t *value,
-    json_int_t minimum,
-    json_int_t maximum,
-    const char *field,
-    bool unsupported,
-    struct shell_sandbox_patch_error *error)
-{
-    json_int_t integer;
-
-    if (json_is_null(value))
-        return shell_sandbox_store_patch_value(target, key, value);
-    if (!json_is_integer(value)) {
-        error->field = field;
-        return SHELL_SANDBOX_PATCH_INVALID;
-    }
-    integer = json_integer_value(value);
-    if (integer < minimum || integer > maximum) {
-        error->field = field;
-        return SHELL_SANDBOX_PATCH_INVALID;
-    }
-    if (unsupported) {
-        error->field = field;
-        return SHELL_SANDBOX_PATCH_UNSUPPORTED;
-    }
-    return shell_sandbox_store_patch_value(target, key, value);
-}
-
-static enum shell_sandbox_patch_status shell_sandbox_patch_string(
-    json_t *target,
-    const char *key,
-    const json_t *value,
-    size_t minimum_length,
-    size_t maximum_length,
-    const char *field,
-    bool unsupported,
-    bool allow_empty_when_unsupported,
-    struct shell_sandbox_patch_error *error)
-{
-    size_t length;
-
-    if (json_is_null(value))
-        return shell_sandbox_store_patch_value(target, key, value);
-    if (!json_is_string(value)) {
-        error->field = field;
-        return SHELL_SANDBOX_PATCH_INVALID;
-    }
-    length = json_string_length(value);
-    if (strlen(json_string_value(value)) != length || length < minimum_length ||
-        (maximum_length > 0u && length > maximum_length)) {
-        error->field = field;
-        return SHELL_SANDBOX_PATCH_INVALID;
-    }
-    if (unsupported && !(allow_empty_when_unsupported && length == 0u)) {
-        error->field = field;
-        return SHELL_SANDBOX_PATCH_UNSUPPORTED;
-    }
-    return shell_sandbox_store_patch_value(target, key, value);
-}
-
-static enum shell_sandbox_patch_status shell_sandbox_patch_allowed_env(
-    json_t *target,
-    const json_t *value,
-    struct shell_sandbox_patch_error *error)
-{
-    size_t index;
-    json_t *item;
-
-    if (json_is_null(value))
-        return shell_sandbox_store_patch_value(target, "allowed_env", value);
-    if (!json_is_array(value) || json_array_size(value) > MCP_SANDBOX_CTL_MAX_ALLOWED_ENV_ITEMS) {
-        error->field = "execution.allowed_env";
-        return SHELL_SANDBOX_PATCH_INVALID;
-    }
-    json_array_foreach(value, index, item) {
-        const char *name;
-        size_t length;
-
-        if (!json_is_string(item)) {
-            error->field = "execution.allowed_env";
-            return SHELL_SANDBOX_PATCH_INVALID;
-        }
-        name = json_string_value(item);
-        length = json_string_length(item);
-        if (length == 0u || length > MCP_SANDBOX_CTL_MAX_ALLOWED_ENV_NAME_BYTES ||
-            strlen(name) != length || strchr(name, '=')) {
-            error->field = "execution.allowed_env";
-            return SHELL_SANDBOX_PATCH_INVALID;
-        }
-    }
-#ifdef _WIN32
-    error->field = "execution.allowed_env";
-    return SHELL_SANDBOX_PATCH_UNSUPPORTED;
-#else
-    return shell_sandbox_store_patch_value(target, "allowed_env", value);
-#endif
-}
-
 static enum shell_sandbox_patch_status shell_sandbox_record_path(json_t *changed_paths,
                                                                  const char *field)
 {
@@ -1150,454 +1028,254 @@ static enum shell_sandbox_patch_status shell_sandbox_record_path(json_t *changed
     return SHELL_SANDBOX_PATCH_OK;
 }
 
-static enum shell_sandbox_patch_status shell_sandbox_patch_top_leaf(
-    json_t *overrides,
-    const char *key,
-    size_t key_length,
-    const json_t *value,
-    struct shell_sandbox_patch_error *error,
-    const char **field)
+static const char *shell_v2_override_path(
+    const struct mcp_shell_policy_field_descriptor *field)
 {
-    if (shell_sandbox_key_equals(key, key_length, "max_command_length")) {
-        *field = "max_command_length";
-        return shell_sandbox_patch_integer(overrides,
-                                           "max_command_length",
-                                           value,
-                                           64,
-                                           65535,
-                                           *field,
-                                           false,
-                                           error);
-    }
-    if (shell_sandbox_key_equals(key, key_length, "default_timeout_ms")) {
-        *field = "default_timeout_ms";
-        return shell_sandbox_patch_integer(overrides,
-                                           "default_timeout_ms",
-                                           value,
-                                           1,
-                                           MCP_SANDBOX_CTL_MAX_TIMEOUT_MS,
-                                           *field,
-                                           false,
-                                           error);
-    }
-    if (shell_sandbox_key_equals(key, key_length, "max_timeout_ms")) {
-        *field = "max_timeout_ms";
-        return shell_sandbox_patch_integer(overrides,
-                                           "max_timeout_ms",
-                                           value,
-                                           1,
-                                           MCP_SANDBOX_CTL_MAX_TIMEOUT_MS,
-                                           *field,
-                                           false,
-                                           error);
-    }
-    if (shell_sandbox_key_equals(key, key_length, "max_output_bytes")) {
-        *field = "max_output_bytes";
-        return shell_sandbox_patch_integer(overrides,
-                                           "max_output_bytes",
-                                           value,
-                                           256,
-                                           MCP_SANDBOX_CTL_MAX_OUTPUT_BYTES,
-                                           *field,
-                                           false,
-                                           error);
-    }
-    if (shell_sandbox_key_equals(key, key_length, "capture_stderr")) {
-        *field = "capture_stderr";
-        return shell_sandbox_patch_boolean(
-            overrides, "capture_stderr", value, *field, false, error);
-    }
-    if (shell_sandbox_key_equals(key, key_length, "merge_stderr")) {
-        *field = "merge_stderr";
-        return shell_sandbox_patch_boolean(
-            overrides, "merge_stderr", value, *field, false, error);
-    }
+    static const char prefix[] = "defaults.";
 
-    error->field = "overrides";
-    return SHELL_SANDBOX_PATCH_INVALID;
+    return field && strncmp(field->path, prefix, sizeof(prefix) - 1u) == 0
+               ? field->path + sizeof(prefix) - 1u
+               : NULL;
 }
 
-static enum shell_sandbox_patch_status shell_sandbox_patch_execution_leaf(
-    json_t *group,
-    const char *key,
-    size_t key_length,
-    const json_t *value,
-    struct shell_sandbox_patch_error *error,
-    const char **field)
+static const struct mcp_shell_policy_field_descriptor *shell_v2_field_by_path(
+    const char *path)
+{
+    const struct mcp_shell_policy_field_descriptor *fields;
+    size_t count;
+    size_t index;
+
+    fields = mcp_shell_policy_field_directory(&count);
+    for (index = 0; index < count; index++) {
+        const char *candidate = shell_v2_override_path(&fields[index]);
+
+        if (candidate && strcmp(candidate, path) == 0)
+            return &fields[index];
+    }
+    return NULL;
+}
+
+static bool shell_v2_path_is_group(const char *path)
+{
+    const struct mcp_shell_policy_field_descriptor *fields;
+    size_t count;
+    size_t index;
+    size_t length = strlen(path);
+
+    fields = mcp_shell_policy_field_directory(&count);
+    for (index = 0; index < count; index++) {
+        const char *candidate = shell_v2_override_path(&fields[index]);
+
+        if (candidate && strncmp(candidate, path, length) == 0 && candidate[length] == '.')
+            return true;
+    }
+    return false;
+}
+
+static const void *shell_v2_field_value(
+    const struct mcp_shell_policy_snapshot *snapshot,
+    const struct mcp_shell_policy_field_descriptor *field)
+{
+    return (const unsigned char *)&snapshot->defaults + field->value_offset;
+}
+
+static const char *shell_v2_capability(
+    const struct mcp_shell_policy_field_descriptor *field)
 {
 #ifdef _WIN32
-    const bool unix_only = true;
+    if (field->capability == MCP_SHELL_POLICY_CAPABILITY_UNIX_ONLY ||
+        field->id == MCP_SHELL_POLICY_FIELD_KILL_PROCESS_GROUP ||
+        field->id == MCP_SHELL_POLICY_FIELD_MEMORY_BYTES)
+        return "unsupported";
+    if (field->id == MCP_SHELL_POLICY_FIELD_REQUIRE_NON_ROOT)
+        return "reject_only";
 #else
-    const bool unix_only = false;
+    (void)field;
 #endif
-
-    if (shell_sandbox_key_equals(key, key_length, "working_directory")) {
-        *field = "execution.working_directory";
-        return shell_sandbox_patch_string(group,
-                                          "working_directory",
-                                          value,
-                                          1u,
-                                          MCP_SANDBOX_CTL_MAX_WORKING_DIRECTORY_BYTES,
-                                          *field,
-                                          false,
-                                          false,
-                                          error);
-    }
-    if (shell_sandbox_key_equals(key, key_length, "request_cwd_allowed")) {
-        *field = "execution.request_cwd_allowed";
-        return shell_sandbox_patch_boolean(
-            group, "request_cwd_allowed", value, *field, unix_only, error);
-    }
-    if (shell_sandbox_key_equals(key, key_length, "clear_environment")) {
-        *field = "execution.clear_environment";
-        return shell_sandbox_patch_boolean(
-            group, "clear_environment", value, *field, false, error);
-    }
-    if (shell_sandbox_key_equals(key, key_length, "allowed_env")) {
-        *field = "execution.allowed_env";
-        return shell_sandbox_patch_allowed_env(group, value, error);
-    }
-    if (shell_sandbox_key_equals(key, key_length, "request_env_allowed")) {
-        *field = "execution.request_env_allowed";
-        return shell_sandbox_patch_boolean(
-            group, "request_env_allowed", value, *field, unix_only, error);
-    }
-    if (shell_sandbox_key_equals(key, key_length, "kill_process_group_on_timeout")) {
-        *field = "execution.kill_process_group_on_timeout";
-        return shell_sandbox_patch_boolean(
-            group, "kill_process_group_on_timeout", value, *field, unix_only, error);
-    }
-    if (shell_sandbox_key_equals(key, key_length, "run_as_user")) {
-        *field = "execution.run_as_user";
-        return shell_sandbox_patch_string(
-            group, "run_as_user", value, 0u, 0u, *field, unix_only, true, error);
-    }
-    if (shell_sandbox_key_equals(key, key_length, "run_as_group")) {
-        *field = "execution.run_as_group";
-        return shell_sandbox_patch_string(
-            group, "run_as_group", value, 0u, 0u, *field, unix_only, true, error);
-    }
-
-    error->field = "overrides.execution";
-    return SHELL_SANDBOX_PATCH_INVALID;
+    return "ignored";
 }
 
-static enum shell_sandbox_patch_status shell_sandbox_patch_limits_leaf(
-    json_t *group,
-    const char *key,
-    size_t key_length,
-    const json_t *value,
-    struct shell_sandbox_patch_error *error,
-    const char **field)
+static enum shell_sandbox_patch_status shell_v2_validate_patch_value(
+    const struct mcp_shell_policy_snapshot *snapshot,
+    const struct mcp_shell_policy_field_descriptor *field,
+    const json_t *value)
 {
-#ifdef _WIN32
-    const bool unsupported = true;
-#else
-    const bool unsupported = false;
-#endif
+    const void *current = shell_v2_field_value(snapshot, field);
 
-    if (shell_sandbox_key_equals(key, key_length, "max_cpu_seconds")) {
-        *field = "limits.max_cpu_seconds";
-        return shell_sandbox_patch_integer(
-            group, "max_cpu_seconds", value, 0, 3600, *field, unsupported, error);
+    if (json_is_null(value))
+        return SHELL_SANDBOX_PATCH_OK;
+    if (strcmp(shell_v2_capability(field), "unsupported") == 0)
+        return SHELL_SANDBOX_PATCH_UNSUPPORTED;
+
+    switch (field->type) {
+    case MCP_SHELL_POLICY_TYPE_BOOLEAN:
+        return json_is_boolean(value) ? SHELL_SANDBOX_PATCH_OK : SHELL_SANDBOX_PATCH_INVALID;
+    case MCP_SHELL_POLICY_TYPE_UINT64: {
+        const struct mcp_shell_policy_numeric *number = current;
+        json_int_t integer;
+
+        if (!json_is_integer(value))
+            return SHELL_SANDBOX_PATCH_INVALID;
+        integer = json_integer_value(value);
+        return integer >= 0 && (uint64_t)integer >= number->min &&
+                       (uint64_t)integer <= number->max
+                   ? SHELL_SANDBOX_PATCH_OK
+                   : SHELL_SANDBOX_PATCH_INVALID;
     }
-    if (shell_sandbox_key_equals(key, key_length, "max_memory_bytes")) {
-        *field = "limits.max_memory_bytes";
-        return shell_sandbox_patch_integer(
-            group, "max_memory_bytes", value, 0, 2147483647, *field, unsupported, error);
+    case MCP_SHELL_POLICY_TYPE_STRING: {
+        const struct mcp_shell_policy_string *string = current;
+        size_t length;
+
+        if (!json_is_string(value))
+            return SHELL_SANDBOX_PATCH_INVALID;
+        length = json_string_length(value);
+        return strlen(json_string_value(value)) == length && length >= string->min_bytes &&
+                       length <= string->max_bytes
+                   ? SHELL_SANDBOX_PATCH_OK
+                   : SHELL_SANDBOX_PATCH_INVALID;
     }
-    if (shell_sandbox_key_equals(key, key_length, "max_file_size_bytes")) {
-        *field = "limits.max_file_size_bytes";
-        return shell_sandbox_patch_integer(group,
-                                           "max_file_size_bytes",
-                                           value,
-                                           0,
-                                           2147483647,
-                                           *field,
-                                           unsupported,
-                                           error);
+    case MCP_SHELL_POLICY_TYPE_MODE: {
+        const struct mcp_shell_policy_mode_value *mode = current;
+        unsigned int requested;
+
+        if (!json_is_string(value) ||
+            strlen(json_string_value(value)) != json_string_length(value))
+            return SHELL_SANDBOX_PATCH_INVALID;
+        if (shell_sandbox_json_string_equals(value, "shell"))
+            requested = MCP_SHELL_POLICY_MODE_SHELL_MASK;
+        else if (shell_sandbox_json_string_equals(value, "exec"))
+            requested = MCP_SHELL_POLICY_MODE_EXEC_MASK;
+        else
+            return SHELL_SANDBOX_PATCH_INVALID;
+        return (mode->allowed_mask & requested) != 0u ? SHELL_SANDBOX_PATCH_OK
+                                                      : SHELL_SANDBOX_PATCH_INVALID;
     }
-    if (shell_sandbox_key_equals(key, key_length, "max_open_files")) {
-        *field = "limits.max_open_files";
-        return shell_sandbox_patch_integer(
-            group, "max_open_files", value, 0, 1048576, *field, unsupported, error);
-    }
-    if (shell_sandbox_key_equals(key, key_length, "max_processes")) {
-        *field = "limits.max_processes";
-        return shell_sandbox_patch_integer(
-            group, "max_processes", value, 0, 1048576, *field, unsupported, error);
-    }
+    case MCP_SHELL_POLICY_TYPE_ENV: {
+        const char *name;
+        json_t *item;
 
-    error->field = "overrides.limits";
-    return SHELL_SANDBOX_PATCH_INVALID;
-}
+        if (!json_is_object(value) ||
+            json_object_size(value) > snapshot->environment_max_items)
+            return SHELL_SANDBOX_PATCH_INVALID;
+        json_object_foreach((json_t *)value, name, item) {
+            size_t name_length = strlen(name);
+            size_t value_length;
 
-static enum shell_sandbox_patch_status shell_sandbox_patch_isolation_leaf(
-    json_t *group,
-    const char *key,
-    size_t key_length,
-    const json_t *value,
-    struct shell_sandbox_patch_error *error,
-    const char **field)
-{
-    if (shell_sandbox_key_equals(key, key_length, "require_non_root")) {
-        *field = "isolation.require_non_root";
-        return shell_sandbox_patch_boolean(
-            group, "require_non_root", value, *field, false, error);
-    }
-
-    error->field = "overrides.isolation";
-    return SHELL_SANDBOX_PATCH_INVALID;
-}
-
-static enum shell_sandbox_patch_status shell_sandbox_apply_group_patch(
-    json_t *overrides,
-    const char *group_name,
-    const json_t *patch,
-    json_t *changed_paths,
-    size_t *leaf_count,
-    struct shell_sandbox_patch_error *error)
-{
-    json_t *group;
-    const char *key;
-    size_t key_length;
-    json_t *value;
-    enum shell_sandbox_patch_status status;
-
-    if (!json_is_object(patch)) {
-        error->field = group_name;
-        return SHELL_SANDBOX_PATCH_INVALID;
-    }
-    group = shell_sandbox_override_group(overrides, group_name);
-    if (!group)
-        return SHELL_SANDBOX_PATCH_INTERNAL;
-
-    json_object_keylen_foreach((json_t *)patch, key, key_length, value) {
-        const char *field = NULL;
-
-        if (strcmp(group_name, "execution") == 0) {
-            status = shell_sandbox_patch_execution_leaf(
-                group, key, key_length, value, error, &field);
-        } else if (strcmp(group_name, "limits") == 0) {
-            status = shell_sandbox_patch_limits_leaf(group, key, key_length, value, error, &field);
-        } else {
-            status = shell_sandbox_patch_isolation_leaf(
-                group, key, key_length, value, error, &field);
+            if (name_length == 0u || strchr(name, '=') || !json_is_string(item))
+                return SHELL_SANDBOX_PATCH_INVALID;
+            value_length = json_string_length(item);
+            if (strlen(json_string_value(item)) != value_length ||
+                name_length + 1u + value_length > snapshot->environment_item_max_bytes)
+                return SHELL_SANDBOX_PATCH_INVALID;
         }
-        if (status != SHELL_SANDBOX_PATCH_OK)
-            return status;
-        status = shell_sandbox_record_path(changed_paths, field);
-        if (status != SHELL_SANDBOX_PATCH_OK)
-            return status;
-        (*leaf_count)++;
+        return SHELL_SANDBOX_PATCH_OK;
     }
-
-    if (json_object_size(group) == 0u)
-        json_object_del(overrides, group_name);
-    return SHELL_SANDBOX_PATCH_OK;
+    }
+    return SHELL_SANDBOX_PATCH_INTERNAL;
 }
 
-static enum shell_sandbox_patch_status shell_sandbox_apply_overrides_patch(
-    json_t *overrides,
+static const char *shell_v2_unknown_field(const char *prefix)
+{
+    if (strcmp(prefix, "execution") == 0)
+        return "overrides.execution";
+    if (strcmp(prefix, "limits") == 0)
+        return "overrides.limits";
+    if (strcmp(prefix, "isolation") == 0)
+        return "overrides.isolation";
+    return "overrides";
+}
+
+static enum shell_sandbox_patch_status shell_v2_apply_patch_node(
+    const struct mcp_shell_policy_snapshot *snapshot,
+    json_t *target,
     const json_t *patch,
+    const char *prefix,
     json_t *changed_paths,
     size_t *leaf_count,
     struct shell_sandbox_patch_error *error)
 {
     const char *key;
-    size_t key_length;
     json_t *value;
 
     if (!json_is_object(patch)) {
-        error->field = "overrides";
+        error->field = shell_v2_unknown_field(prefix);
         return SHELL_SANDBOX_PATCH_INVALID;
     }
 
-    json_object_keylen_foreach((json_t *)patch, key, key_length, value) {
+    json_object_foreach((json_t *)patch, key, value) {
+        char path[128];
+        int written = prefix[0] == '\0' ? snprintf(path, sizeof(path), "%s", key)
+                                        : snprintf(path, sizeof(path), "%s.%s", prefix, key);
+        const struct mcp_shell_policy_field_descriptor *field;
         enum shell_sandbox_patch_status status;
-        const char *field = NULL;
 
-        if (shell_sandbox_key_equals(key, key_length, "execution")) {
-            status = shell_sandbox_apply_group_patch(overrides,
-                                                     "execution",
-                                                     value,
-                                                     changed_paths,
-                                                     leaf_count,
-                                                     error);
-        } else if (shell_sandbox_key_equals(key, key_length, "limits")) {
-            status = shell_sandbox_apply_group_patch(
-                overrides, "limits", value, changed_paths, leaf_count, error);
-        } else if (shell_sandbox_key_equals(key, key_length, "isolation")) {
-            status = shell_sandbox_apply_group_patch(overrides,
-                                                     "isolation",
-                                                     value,
-                                                     changed_paths,
-                                                     leaf_count,
-                                                     error);
-        } else {
-            status = shell_sandbox_patch_top_leaf(
-                overrides, key, key_length, value, error, &field);
-            if (status == SHELL_SANDBOX_PATCH_OK) {
-                status = shell_sandbox_record_path(changed_paths, field);
-                if (status == SHELL_SANDBOX_PATCH_OK)
-                    (*leaf_count)++;
-            }
+        if (written < 0 || (size_t)written >= sizeof(path)) {
+            error->field = shell_v2_unknown_field(prefix);
+            return SHELL_SANDBOX_PATCH_INVALID;
         }
+        field = shell_v2_field_by_path(path);
+        if (field) {
+            json_t *group = target;
+            const char *name = path;
+            const char *separator = strchr(path, '.');
+
+            status = shell_v2_validate_patch_value(snapshot, field, value);
+            if (status != SHELL_SANDBOX_PATCH_OK) {
+                error->field = shell_v2_override_path(field);
+                return status;
+            }
+            if (separator) {
+                char group_name[32];
+                size_t group_length = (size_t)(separator - path);
+
+                if (group_length >= sizeof(group_name))
+                    return SHELL_SANDBOX_PATCH_INTERNAL;
+                memcpy(group_name, path, group_length);
+                group_name[group_length] = '\0';
+                group = shell_sandbox_override_group(target, group_name);
+                if (!group)
+                    return SHELL_SANDBOX_PATCH_INTERNAL;
+                name = separator + 1;
+            }
+            status = shell_sandbox_store_patch_value(group, name, value);
+            if (status != SHELL_SANDBOX_PATCH_OK)
+                return status;
+            if (separator && json_object_size(group) == 0u) {
+                char group_name[32];
+                size_t group_length = (size_t)(separator - path);
+
+                memcpy(group_name, path, group_length);
+                group_name[group_length] = '\0';
+                json_object_del(target, group_name);
+            }
+            if (shell_sandbox_record_path(changed_paths, path) != SHELL_SANDBOX_PATCH_OK)
+                return SHELL_SANDBOX_PATCH_INTERNAL;
+            (*leaf_count)++;
+            continue;
+        }
+
+        if (!shell_v2_path_is_group(path) || !json_is_object(value) || prefix[0] != '\0') {
+            error->field = shell_v2_unknown_field(prefix);
+            return SHELL_SANDBOX_PATCH_INVALID;
+        }
+        status = shell_v2_apply_patch_node(
+            snapshot, target, value, path, changed_paths, leaf_count, error);
         if (status != SHELL_SANDBOX_PATCH_OK)
             return status;
     }
     return SHELL_SANDBOX_PATCH_OK;
 }
 
-static int shell_sandbox_config_copy(struct shell_exec_config *destination,
-                                     const struct shell_exec_config *source)
+static enum shell_sandbox_patch_status shell_v2_apply_overrides_patch(
+    const struct mcp_shell_policy_snapshot *snapshot,
+    json_t *target,
+    const json_t *patch,
+    json_t *changed_paths,
+    size_t *leaf_count,
+    struct shell_sandbox_patch_error *error)
 {
-    size_t index;
-
-    *destination = *source;
-    destination->shell_path = NULL;
-    destination->shell_arg = NULL;
-    destination->working_directory = NULL;
-    destination->run_as_user = NULL;
-    destination->run_as_group = NULL;
-    destination->env_vars = NULL;
-    destination->env_var_count = 0u;
-    destination->allowed_env = NULL;
-    destination->allowed_env_count = 0u;
-    destination->config_path = NULL;
-    destination->load_error = NULL;
-
-    if (dup_string_field(&destination->shell_path, source->shell_path) != 0 ||
-        dup_string_field(&destination->shell_arg, source->shell_arg) != 0 ||
-        dup_string_field(&destination->working_directory, source->working_directory) != 0 ||
-        dup_string_field(&destination->run_as_user, source->run_as_user) != 0 ||
-        dup_string_field(&destination->run_as_group, source->run_as_group) != 0 ||
-        dup_string_field(&destination->config_path, source->config_path) != 0 ||
-        dup_string_field(&destination->load_error, source->load_error) != 0)
-        goto fail;
-
-    for (index = 0; index < source->env_var_count; index++) {
-        if (shell_exec_config_set_env_var(destination,
-                                          source->env_vars[index].name,
-                                          source->env_vars[index].value) != 0)
-            goto fail;
-    }
-    for (index = 0; index < source->allowed_env_count; index++) {
-        if (shell_exec_config_add_allowed_env(destination, source->allowed_env[index]) != 0)
-            goto fail;
-    }
-    return 0;
-
-fail:
-    shell_exec_config_destroy(destination);
-    return -1;
-}
-
-static int shell_sandbox_apply_allowed_env(struct shell_exec_config *cfg, const json_t *value)
-{
-    size_t index;
-    json_t *item;
-
-    shell_exec_allowed_env_destroy(cfg);
-    cfg->allowed_env_is_set = true;
-    json_array_foreach(value, index, item) {
-        if (shell_exec_config_add_allowed_env(cfg, json_string_value(item)) != 0)
-            return -1;
-    }
-    return 0;
-}
-
-static int shell_sandbox_apply_normalized_overrides(struct shell_exec_config *cfg,
-                                                    const json_t *overrides,
-                                                    bool shell_enabled_is_set,
-                                                    bool shell_enabled)
-{
-    json_t *execution;
-    json_t *limits;
-    json_t *isolation;
-    json_t *value;
-
-    if (shell_enabled_is_set)
-        cfg->enabled = shell_enabled;
-
-#define SHELL_SANDBOX_APPLY_UINT(name, member)                                            \
-    do {                                                                                  \
-        value = json_object_get(overrides, name);                                         \
-        if (json_is_integer(value))                                                       \
-            cfg->member = (unsigned int)json_integer_value(value);                        \
-    } while (0)
-#define SHELL_SANDBOX_APPLY_BOOL(name, member)                                            \
-    do {                                                                                  \
-        value = json_object_get(overrides, name);                                         \
-        if (json_is_boolean(value))                                                       \
-            cfg->member = json_is_true(value);                                            \
-    } while (0)
-
-    SHELL_SANDBOX_APPLY_UINT("max_command_length", max_command_length);
-    SHELL_SANDBOX_APPLY_UINT("default_timeout_ms", default_timeout_ms);
-    SHELL_SANDBOX_APPLY_UINT("max_timeout_ms", max_timeout_ms);
-    SHELL_SANDBOX_APPLY_UINT("max_output_bytes", max_output_bytes);
-    SHELL_SANDBOX_APPLY_BOOL("capture_stderr", capture_stderr);
-    SHELL_SANDBOX_APPLY_BOOL("merge_stderr", merge_stderr);
-
-    execution = json_object_get(overrides, "execution");
-    if (execution) {
-        value = json_object_get(execution, "working_directory");
-        if (json_is_string(value) &&
-            dup_string_field(&cfg->working_directory, json_string_value(value)) != 0)
-            return -1;
-        value = json_object_get(execution, "request_cwd_allowed");
-        if (json_is_boolean(value))
-            cfg->request_cwd_allowed = json_is_true(value);
-        value = json_object_get(execution, "clear_environment");
-        if (json_is_boolean(value))
-            cfg->clear_environment = json_is_true(value);
-        value = json_object_get(execution, "allowed_env");
-        if (json_is_array(value) && shell_sandbox_apply_allowed_env(cfg, value) != 0)
-            return -1;
-        value = json_object_get(execution, "request_env_allowed");
-        if (json_is_boolean(value))
-            cfg->request_env_allowed = json_is_true(value);
-        value = json_object_get(execution, "kill_process_group_on_timeout");
-        if (json_is_boolean(value))
-            cfg->kill_process_group_on_timeout = json_is_true(value);
-        value = json_object_get(execution, "run_as_user");
-        if (json_is_string(value) && dup_string_field(&cfg->run_as_user, json_string_value(value)) != 0)
-            return -1;
-        value = json_object_get(execution, "run_as_group");
-        if (json_is_string(value) && dup_string_field(&cfg->run_as_group, json_string_value(value)) != 0)
-            return -1;
-    }
-
-    limits = json_object_get(overrides, "limits");
-    if (limits) {
-        value = json_object_get(limits, "max_cpu_seconds");
-        if (json_is_integer(value))
-            cfg->max_cpu_seconds = (unsigned int)json_integer_value(value);
-        value = json_object_get(limits, "max_memory_bytes");
-        if (json_is_integer(value))
-            cfg->max_memory_bytes = (unsigned int)json_integer_value(value);
-        value = json_object_get(limits, "max_file_size_bytes");
-        if (json_is_integer(value))
-            cfg->max_file_size_bytes = (unsigned int)json_integer_value(value);
-        value = json_object_get(limits, "max_open_files");
-        if (json_is_integer(value))
-            cfg->max_open_files = (unsigned int)json_integer_value(value);
-        value = json_object_get(limits, "max_processes");
-        if (json_is_integer(value))
-            cfg->max_processes = (unsigned int)json_integer_value(value);
-    }
-
-    isolation = json_object_get(overrides, "isolation");
-    if (isolation) {
-        value = json_object_get(isolation, "require_non_root");
-        if (json_is_boolean(value))
-            cfg->require_non_root = json_is_true(value);
-    }
-
-#undef SHELL_SANDBOX_APPLY_BOOL
-#undef SHELL_SANDBOX_APPLY_UINT
-    return 0;
+    return shell_v2_apply_patch_node(
+        snapshot, target, patch, "", changed_paths, leaf_count, error);
 }
 
 static bool shell_sandbox_policy_is_valid(const struct shell_exec_config *cfg,
@@ -1660,419 +1338,343 @@ static bool shell_sandbox_policy_is_valid(const struct shell_exec_config *cfg,
     return true;
 }
 
-static char *shell_sandbox_current_working_directory(void)
+static const json_t *shell_v2_json_path_get(const json_t *root, const char *path)
 {
-#ifdef _WIN32
-    return _getcwd(NULL, 0);
-#else
-    return getcwd(NULL, 0);
-#endif
-}
+    const char *separator = strchr(path, '.');
 
-static int shell_sandbox_apply_bypass_profile(struct shell_exec_config *cfg)
-{
-    char *working_directory = shell_sandbox_current_working_directory();
+    if (!separator)
+        return json_object_get(root, path);
+    {
+        char group_name[32];
+        size_t group_length = (size_t)(separator - path);
+        const json_t *group;
 
-    if (!working_directory)
-        return -1;
-
-    free(cfg->working_directory);
-    cfg->working_directory = working_directory;
-    free(cfg->run_as_user);
-    cfg->run_as_user = NULL;
-    free(cfg->run_as_group);
-    cfg->run_as_group = NULL;
-    shell_exec_allowed_env_destroy(cfg);
-    cfg->allowed_env_is_set = false;
-
-    cfg->max_command_length = MCP_SHELL_EXEC_MAX_COMMAND_LENGTH;
-    cfg->default_timeout_ms = MCP_SANDBOX_CTL_MAX_TIMEOUT_MS;
-    cfg->max_timeout_ms = MCP_SANDBOX_CTL_MAX_TIMEOUT_MS;
-    cfg->max_output_bytes = MCP_SANDBOX_CTL_MAX_OUTPUT_BYTES;
-    cfg->capture_stderr = true;
-    cfg->clear_environment = false;
-    cfg->request_cwd_allowed = true;
-    cfg->request_env_allowed = true;
-    cfg->kill_process_group_on_timeout = true;
-    cfg->max_cpu_seconds = 0u;
-    cfg->max_memory_bytes = 0u;
-    cfg->max_file_size_bytes = 0u;
-    cfg->max_open_files = 0u;
-    cfg->max_processes = 0u;
-    cfg->require_non_root = false;
-    return 0;
-}
-
-static int shell_sandbox_apply_effective_policy(struct shell_exec_config *cfg,
-                                                json_int_t revision,
-                                                bool sandbox_enabled,
-                                                bool shell_enabled_is_set,
-                                                bool shell_enabled,
-                                                const json_t *overrides)
-{
-    cfg->sandbox_revision = revision;
-    cfg->sandbox_enabled = sandbox_enabled;
-    if (shell_sandbox_apply_normalized_overrides(
-            cfg, overrides, shell_enabled_is_set, shell_enabled) != 0)
-        return -1;
-    cfg->shell_enabled = cfg->enabled;
-    if (!shell_sandbox_policy_is_valid(cfg, NULL))
-        return 1;
-    if (!sandbox_enabled && shell_sandbox_apply_bypass_profile(cfg) != 0)
-        return -1;
-    return 0;
-}
-
-static json_t *shell_sandbox_allowed_env_json(const struct shell_exec_config *cfg)
-{
-    json_t *array = json_array();
-    size_t index;
-
-    if (!array)
-        return NULL;
-    for (index = 0; index < cfg->allowed_env_count; index++) {
-        if (json_array_append_new(array, json_string(cfg->allowed_env[index])) != 0) {
-            json_decref(array);
+        if (group_length >= sizeof(group_name))
             return NULL;
+        memcpy(group_name, path, group_length);
+        group_name[group_length] = '\0';
+        group = json_object_get(root, group_name);
+        return json_is_object(group) ? json_object_get(group, separator + 1) : NULL;
+    }
+}
+
+static int shell_v2_json_path_set(json_t *root, const char *path, json_t *value)
+{
+    const char *separator = strchr(path, '.');
+
+    if (!value)
+        return -1;
+    if (!separator) {
+        if (json_object_set_new(root, path, value) != 0) {
+            json_decref(value);
+            return -1;
         }
+        return 0;
     }
-    return array;
+    {
+        char group_name[32];
+        size_t group_length = (size_t)(separator - path);
+        json_t *group;
+
+        if (group_length >= sizeof(group_name)) {
+            json_decref(value);
+            return -1;
+        }
+        memcpy(group_name, path, group_length);
+        group_name[group_length] = '\0';
+        group = shell_sandbox_override_group(root, group_name);
+        if (!group || json_object_set_new(group, separator + 1, value) != 0) {
+            json_decref(value);
+            return -1;
+        }
+        return 0;
+    }
 }
 
-static const char *shell_sandbox_parent_environment_mode(const struct shell_exec_config *cfg)
+static json_t *shell_v2_environment_summary(size_t items)
 {
-    if (cfg->clear_environment || (cfg->allowed_env_is_set && cfg->allowed_env_count == 0u))
-        return "none";
-    if (cfg->allowed_env_is_set)
-        return "allowlist";
-    return "all";
+    return json_pack("{s:I,s:b}", "items", (json_int_t)items, "valid", true);
 }
 
-static json_t *shell_sandbox_policy_json(const struct shell_exec_config *cfg,
-                                         bool include_sandbox_enabled,
-                                         bool sandbox_enabled)
+static json_t *shell_v2_redacted_override_value(
+    const struct mcp_shell_policy_field_descriptor *field,
+    const json_t *value)
 {
-    json_t *root = json_object();
-    json_t *execution = json_object();
-    json_t *limits = json_object();
-    json_t *isolation = json_object();
-    json_t *allowed_env = shell_sandbox_allowed_env_json(cfg);
+    if (field->type == MCP_SHELL_POLICY_TYPE_ENV)
+        return shell_v2_environment_summary(json_object_size(value));
+    return json_deep_copy(value);
+}
 
-    if (!root || !execution || !limits || !isolation || !allowed_env)
-        goto fail;
-
-#define SHELL_SANDBOX_SET(object, name, value)                                            \
-    do {                                                                                  \
-        if (json_object_set_new(object, name, value) != 0)                                \
-            goto fail;                                                                     \
-    } while (0)
-
-    SHELL_SANDBOX_SET(root, "shell_enabled", json_boolean(cfg->enabled));
-    if (include_sandbox_enabled)
-        SHELL_SANDBOX_SET(root, "sandbox_enabled", json_boolean(sandbox_enabled));
-    SHELL_SANDBOX_SET(root, "max_command_length", json_integer(cfg->max_command_length));
-    SHELL_SANDBOX_SET(root, "default_timeout_ms", json_integer(cfg->default_timeout_ms));
-    SHELL_SANDBOX_SET(root, "max_timeout_ms", json_integer(cfg->max_timeout_ms));
-    SHELL_SANDBOX_SET(root, "max_output_bytes", json_integer(cfg->max_output_bytes));
-    SHELL_SANDBOX_SET(root, "capture_stderr", json_boolean(cfg->capture_stderr));
-    SHELL_SANDBOX_SET(root, "merge_stderr", json_boolean(cfg->merge_stderr));
-
-    SHELL_SANDBOX_SET(execution,
-                      "working_directory",
-                      json_string(cfg->working_directory ? cfg->working_directory : ""));
-    SHELL_SANDBOX_SET(execution,
-                      "request_cwd_allowed",
-                      json_boolean(cfg->request_cwd_allowed));
-    SHELL_SANDBOX_SET(execution, "clear_environment", json_boolean(cfg->clear_environment));
-    if (json_object_set_new(execution, "allowed_env", allowed_env) != 0)
-        goto fail;
-    allowed_env = NULL;
-    SHELL_SANDBOX_SET(execution,
-                      "request_env_allowed",
-                      json_boolean(cfg->request_env_allowed));
-    SHELL_SANDBOX_SET(execution,
-                      "kill_process_group_on_timeout",
-                      json_boolean(cfg->kill_process_group_on_timeout));
-    SHELL_SANDBOX_SET(execution,
-                      "run_as_user",
-                      cfg->run_as_user ? json_string(cfg->run_as_user) : json_null());
-    SHELL_SANDBOX_SET(execution,
-                      "run_as_group",
-                      cfg->run_as_group ? json_string(cfg->run_as_group) : json_null());
-#ifndef _WIN32
-    SHELL_SANDBOX_SET(execution,
-                      "parent_environment_mode",
-                      json_string(shell_sandbox_parent_environment_mode(cfg)));
-#endif
-
-    SHELL_SANDBOX_SET(limits, "max_cpu_seconds", json_integer(cfg->max_cpu_seconds));
-    SHELL_SANDBOX_SET(limits, "max_memory_bytes", json_integer(cfg->max_memory_bytes));
-    SHELL_SANDBOX_SET(limits,
-                      "max_file_size_bytes",
-                      json_integer(cfg->max_file_size_bytes));
-    SHELL_SANDBOX_SET(limits, "max_open_files", json_integer(cfg->max_open_files));
-    SHELL_SANDBOX_SET(limits, "max_processes", json_integer(cfg->max_processes));
-    SHELL_SANDBOX_SET(isolation, "require_non_root", json_boolean(cfg->require_non_root));
-
-    if (json_object_set_new(root, "execution", execution) != 0)
-        goto fail;
-    execution = NULL;
-    if (json_object_set_new(root, "limits", limits) != 0)
-        goto fail;
-    limits = NULL;
-    if (json_object_set_new(root, "isolation", isolation) != 0)
-        goto fail;
-    isolation = NULL;
-
-#undef SHELL_SANDBOX_SET
-    return root;
-
-fail:
-#undef SHELL_SANDBOX_SET
-    json_decref(allowed_env);
-    json_decref(execution);
-    json_decref(limits);
-    json_decref(isolation);
-    json_decref(root);
+static json_t *shell_v2_hard_value(
+    const struct mcp_shell_policy_field_descriptor *field)
+{
+    switch (field->type) {
+    case MCP_SHELL_POLICY_TYPE_BOOLEAN:
+        return json_boolean(field->hard_default != 0u);
+    case MCP_SHELL_POLICY_TYPE_UINT64:
+        return json_integer((json_int_t)field->hard_default);
+    case MCP_SHELL_POLICY_TYPE_STRING:
+        return json_string(field->hard_default_string);
+    case MCP_SHELL_POLICY_TYPE_MODE:
+        return json_string(field->hard_default == MCP_SHELL_POLICY_MODE_EXEC ? "exec" : "shell");
+    case MCP_SHELL_POLICY_TYPE_ENV:
+        return shell_v2_environment_summary(0u);
+    }
     return NULL;
 }
 
-static const char *shell_sandbox_supported_capability(bool policy_valid,
-                                                      bool sandbox_enabled)
+static const char *shell_v2_source_name(enum mcp_shell_policy_source source)
 {
-    return policy_valid && sandbox_enabled ? "enforced" : "ignored";
+    switch (source) {
+    case MCP_SHELL_POLICY_SOURCE_JSON:
+        return "json";
+    case MCP_SHELL_POLICY_SOURCE_HARD_FALLBACK:
+        return "hard_fallback";
+    case MCP_SHELL_POLICY_SOURCE_HARD:
+        return "hard_fallback";
+    }
+    return "hard_fallback";
 }
 
-static json_t *shell_sandbox_capabilities_json(const struct shell_exec_config *cfg,
-                                               bool policy_valid,
-                                               bool sandbox_enabled)
+static enum mcp_shell_policy_source shell_v2_field_source(
+    const struct mcp_shell_policy_snapshot *snapshot,
+    const struct mcp_shell_policy_field_descriptor *field)
 {
-    const char *supported = shell_sandbox_supported_capability(policy_valid, sandbox_enabled);
-    const char *merge = supported;
-    const char *allowed_env = supported;
-    const char *max_memory = supported;
-    const char *max_processes = supported;
-    json_t *root = json_object();
-    json_t *execution = json_object();
-    json_t *limits = json_object();
-    json_t *isolation = json_object();
+    const void *value = shell_v2_field_value(snapshot, field);
 
-    if (!root || !execution || !limits || !isolation)
-        goto fail;
+    switch (field->type) {
+    case MCP_SHELL_POLICY_TYPE_UINT64:
+        return ((const struct mcp_shell_policy_numeric *)value)->source;
+    case MCP_SHELL_POLICY_TYPE_STRING:
+        return ((const struct mcp_shell_policy_string *)value)->source;
+    case MCP_SHELL_POLICY_TYPE_MODE:
+        return ((const struct mcp_shell_policy_mode_value *)value)->source;
+    case MCP_SHELL_POLICY_TYPE_BOOLEAN:
+        return snapshot->config_loaded ? MCP_SHELL_POLICY_SOURCE_JSON
+                                       : MCP_SHELL_POLICY_SOURCE_HARD;
+    case MCP_SHELL_POLICY_TYPE_ENV:
+        return snapshot->environment_source;
+    }
+    return MCP_SHELL_POLICY_SOURCE_HARD;
+}
 
-    if (policy_valid && sandbox_enabled && !cfg->capture_stderr)
-        merge = "ignored";
-#ifdef _WIN32
-    allowed_env = "unsupported";
-    max_memory = "unsupported";
-    max_processes = "unsupported";
-#else
-    if (policy_valid && sandbox_enabled && cfg->clear_environment)
-        allowed_env = "ignored";
-#ifndef RLIMIT_AS
-    max_memory = "unsupported";
-#endif
-#ifndef RLIMIT_NPROC
-    max_processes = "unsupported";
-#else
-    if (policy_valid && sandbox_enabled && (!cfg->run_as_user || cfg->run_as_user[0] == '\0'))
-        max_processes = "ignored";
-#endif
-#endif
+static json_t *shell_v2_field_bounds(
+    const struct mcp_shell_policy_snapshot *snapshot,
+    const struct mcp_shell_policy_field_descriptor *field,
+    bool sandbox_enabled)
+{
+    const void *value = shell_v2_field_value(snapshot, field);
 
-#define SHELL_SANDBOX_SET_CAP(object, name, status)                                      \
-    do {                                                                                  \
-        if (json_object_set_new(object, name, json_string(status)) != 0)                  \
-            goto fail;                                                                     \
-    } while (0)
+    switch (field->type) {
+    case MCP_SHELL_POLICY_TYPE_UINT64: {
+        const struct mcp_shell_policy_numeric *number = value;
+        uint64_t minimum = sandbox_enabled ? number->min : field->hard_min;
+        uint64_t maximum = sandbox_enabled ? number->max : field->hard_max;
 
-    SHELL_SANDBOX_SET_CAP(root, "shell_enabled", "enforced");
-    SHELL_SANDBOX_SET_CAP(root, "sandbox_enabled", "enforced");
-    SHELL_SANDBOX_SET_CAP(root, "max_command_length", supported);
-    SHELL_SANDBOX_SET_CAP(root, "default_timeout_ms", supported);
-    SHELL_SANDBOX_SET_CAP(root, "max_timeout_ms", supported);
-    SHELL_SANDBOX_SET_CAP(root, "max_output_bytes", supported);
-    SHELL_SANDBOX_SET_CAP(root, "capture_stderr", supported);
-    SHELL_SANDBOX_SET_CAP(root, "merge_stderr", merge);
+        return json_pack("{s:I,s:I}",
+                         "min",
+                         (json_int_t)minimum,
+                         "max",
+                         (json_int_t)maximum);
+    }
+    case MCP_SHELL_POLICY_TYPE_STRING: {
+        const struct mcp_shell_policy_string *string = value;
+        size_t minimum = sandbox_enabled ? string->min_bytes : field->hard_min_bytes;
+        size_t maximum = sandbox_enabled ? string->max_bytes : field->hard_max_bytes;
 
-    SHELL_SANDBOX_SET_CAP(execution, "working_directory", supported);
-#ifdef _WIN32
-    SHELL_SANDBOX_SET_CAP(execution, "request_cwd_allowed", "unsupported");
-#else
-    SHELL_SANDBOX_SET_CAP(execution, "request_cwd_allowed", supported);
-#endif
-    SHELL_SANDBOX_SET_CAP(execution, "clear_environment", supported);
-    SHELL_SANDBOX_SET_CAP(execution, "allowed_env", allowed_env);
-#ifdef _WIN32
-    SHELL_SANDBOX_SET_CAP(execution, "request_env_allowed", "unsupported");
-    SHELL_SANDBOX_SET_CAP(execution, "kill_process_group_on_timeout", "unsupported");
-    SHELL_SANDBOX_SET_CAP(execution, "run_as_user", "unsupported");
-    SHELL_SANDBOX_SET_CAP(execution, "run_as_group", "unsupported");
-#else
-    SHELL_SANDBOX_SET_CAP(execution, "request_env_allowed", supported);
-    SHELL_SANDBOX_SET_CAP(execution, "kill_process_group_on_timeout", supported);
-    SHELL_SANDBOX_SET_CAP(execution, "run_as_user", supported);
-    SHELL_SANDBOX_SET_CAP(execution, "run_as_group", supported);
-#endif
+        return json_pack("{s:I,s:I}",
+                         "min_bytes",
+                         (json_int_t)minimum,
+                         "max_bytes",
+                         (json_int_t)maximum);
+    }
+    case MCP_SHELL_POLICY_TYPE_MODE: {
+        const struct mcp_shell_policy_mode_value *mode = value;
+        unsigned int allowed = sandbox_enabled
+                                   ? mode->allowed_mask
+                                   : MCP_SHELL_POLICY_MODE_SHELL_MASK |
+                                         MCP_SHELL_POLICY_MODE_EXEC_MASK;
+        json_t *values = json_array();
+        json_t *bounds = json_object();
 
-#ifdef _WIN32
-    SHELL_SANDBOX_SET_CAP(limits, "max_cpu_seconds", "unsupported");
-#else
-    SHELL_SANDBOX_SET_CAP(limits, "max_cpu_seconds", supported);
-#endif
-    SHELL_SANDBOX_SET_CAP(limits, "max_memory_bytes", max_memory);
-#ifdef _WIN32
-    SHELL_SANDBOX_SET_CAP(limits, "max_file_size_bytes", "unsupported");
-    SHELL_SANDBOX_SET_CAP(limits, "max_open_files", "unsupported");
-#else
-    SHELL_SANDBOX_SET_CAP(limits, "max_file_size_bytes", supported);
-    SHELL_SANDBOX_SET_CAP(limits, "max_open_files", supported);
-#endif
-    SHELL_SANDBOX_SET_CAP(limits, "max_processes", max_processes);
-#ifdef _WIN32
-    SHELL_SANDBOX_SET_CAP(isolation, "require_non_root", "reject_only");
-#else
-    SHELL_SANDBOX_SET_CAP(isolation, "require_non_root", supported);
-#endif
+        if (!values || !bounds)
+            goto mode_fail;
+        if ((allowed & MCP_SHELL_POLICY_MODE_SHELL_MASK) != 0u &&
+            json_array_append_new(values, json_string("shell")) != 0)
+            goto mode_fail;
+        if ((allowed & MCP_SHELL_POLICY_MODE_EXEC_MASK) != 0u &&
+            json_array_append_new(values, json_string("exec")) != 0)
+            goto mode_fail;
+        if (json_object_set_new(bounds, "allowed", values) != 0)
+            goto mode_fail;
+        return bounds;
 
-    if (json_object_set_new(root, "execution", execution) != 0)
-        goto fail;
-    execution = NULL;
-    if (json_object_set_new(root, "limits", limits) != 0)
-        goto fail;
-    limits = NULL;
-    if (json_object_set_new(root, "isolation", isolation) != 0)
-        goto fail;
-    isolation = NULL;
-
-#undef SHELL_SANDBOX_SET_CAP
-    return root;
-
-fail:
-#undef SHELL_SANDBOX_SET_CAP
-    json_decref(execution);
-    json_decref(limits);
-    json_decref(isolation);
-    json_decref(root);
+    mode_fail:
+        json_decref(values);
+        json_decref(bounds);
+        return NULL;
+    }
+    case MCP_SHELL_POLICY_TYPE_ENV:
+        return json_pack("{s:I,s:I}",
+                         "max_items",
+                         (json_int_t)(sandbox_enabled ? snapshot->environment_max_items
+                                                     : MCP_SHELL_POLICY_ENV_HARD_MAX_ITEMS),
+                         "item_max_bytes",
+                         (json_int_t)(sandbox_enabled
+                                          ? snapshot->environment_item_max_bytes
+                                          : MCP_SHELL_POLICY_ENV_HARD_ITEM_MAX_BYTES));
+    case MCP_SHELL_POLICY_TYPE_BOOLEAN:
+        return json_pack("{s:[b,b]}", "allowed", false, true);
+    }
     return NULL;
 }
 
-static json_t *shell_sandbox_saved_overrides_json(const json_t *overrides,
-                                                  bool shell_enabled_is_set,
-                                                  bool shell_enabled)
+static json_t *shell_v2_state_json(const struct mcp_shell_policy_snapshot *snapshot,
+                                   json_int_t revision,
+                                   bool sandbox_enabled,
+                                   const json_t *overrides)
 {
-    json_t *copy = json_deep_copy(overrides);
-
-    if (!copy)
-        return NULL;
-    if (shell_enabled_is_set &&
-        json_object_set_new(copy, "shell_enabled", json_boolean(shell_enabled)) != 0) {
-        json_decref(copy);
-        return NULL;
-    }
-    return copy;
-}
-
-static json_t *shell_sandbox_state_json(json_int_t revision,
-                                        bool sandbox_enabled,
-                                        bool shell_enabled_is_set,
-                                        bool shell_enabled,
-                                        const json_t *overrides,
-                                        struct shell_exec_config *cfg)
-{
-    bool policy_valid = false;
-    int effective_status;
+    const struct mcp_shell_policy_field_descriptor *fields;
+    size_t field_count;
+    size_t index;
     json_t *root = json_object();
-    json_t *base = NULL;
-    json_t *effective = NULL;
-    json_t *saved_overrides = NULL;
-    json_t *capabilities = NULL;
+    json_t *base = json_object();
+    json_t *effective = json_object();
+    json_t *saved_overrides = json_object();
+    json_t *field_status = json_object();
+    json_t *capabilities = json_object();
+    json_t *diagnostics = json_array();
+    json_t *pending_status = NULL;
+    const json_t *shell_override;
+    const json_t *effective_shell;
 
-    if (!root)
-        return NULL;
-
-    saved_overrides =
-        shell_sandbox_saved_overrides_json(overrides, shell_enabled_is_set, shell_enabled);
-    if (!saved_overrides)
+    if (!snapshot || !root || !base || !effective || !saved_overrides || !field_status ||
+        !capabilities || !diagnostics)
         goto fail;
 
-    if (cfg->config_loaded) {
-        base = shell_sandbox_policy_json(cfg, false, true);
-        if (!base)
+    fields = mcp_shell_policy_field_directory(&field_count);
+    for (index = 0; index < field_count; index++) {
+        const struct mcp_shell_policy_field_descriptor *field = &fields[index];
+        const char *path = shell_v2_override_path(field);
+        const json_t *override = shell_v2_json_path_get(overrides, path);
+        const char *diagnostic = mcp_shell_policy_snapshot_diagnostic(snapshot, field->id);
+        const char *source;
+        json_t *base_value;
+        json_t *effective_value;
+        json_t *status;
+        json_t *bounds;
+
+        pending_status = json_object();
+        status = pending_status;
+        if (!path || !status)
             goto fail;
-        effective_status = shell_sandbox_apply_effective_policy(cfg,
-                                                                 revision,
-                                                                 sandbox_enabled,
-                                                                 shell_enabled_is_set,
-                                                                 shell_enabled,
-                                                                 overrides);
-        if (effective_status < 0)
+        base_value = field->serializer(snapshot, field);
+        if (!base_value)
             goto fail;
-        policy_valid = effective_status == 0;
-        if (policy_valid) {
-            effective = shell_sandbox_policy_json(cfg, true, sandbox_enabled);
-            if (!effective)
+        if (shell_v2_json_path_set(base, path, base_value) != 0)
+            goto fail;
+
+        if (!sandbox_enabled) {
+            effective_value = shell_v2_hard_value(field);
+            source = "hard_fallback";
+        } else if (override) {
+            effective_value = shell_v2_redacted_override_value(field, override);
+            source = "runtime";
+        } else {
+            effective_value = field->serializer(snapshot, field);
+            source = shell_v2_source_name(shell_v2_field_source(snapshot, field));
+        }
+        if (!effective_value || shell_v2_json_path_set(effective, path, effective_value) != 0)
+            goto fail;
+        if (override &&
+            shell_v2_json_path_set(saved_overrides,
+                                   path,
+                                   shell_v2_redacted_override_value(field, override)) != 0)
+            goto fail;
+
+        if (json_object_set_new(status, "source", json_string(source)) != 0 ||
+            json_object_set_new(status,
+                                "diagnostic",
+                                diagnostic ? json_string(diagnostic) : json_null()) != 0 ||
+            json_object_set_new(status,
+                                "capability",
+                                json_string(shell_v2_capability(field))) != 0)
+            goto fail;
+        bounds = shell_v2_field_bounds(snapshot, field, sandbox_enabled);
+        if (bounds && json_object_set_new(status, "bounds", bounds) != 0)
+            goto fail;
+        if (json_object_set_new(field_status, path, status) != 0)
+            goto fail;
+        pending_status = NULL;
+        if (shell_v2_json_path_set(
+                capabilities, path, json_string(shell_v2_capability(field))) != 0)
+            goto fail;
+
+        if (diagnostic) {
+            json_t *item = json_pack("{s:s,s:s,s:s}",
+                                     "field",
+                                     path,
+                                     "source",
+                                     "hard_fallback",
+                                     "reason",
+                                     diagnostic);
+
+            if (!item || json_array_append_new(diagnostics, item) != 0) {
+                json_decref(item);
                 goto fail;
+            }
         }
     }
 
-    capabilities = shell_sandbox_capabilities_json(cfg, policy_valid, sandbox_enabled);
-    if (!capabilities)
+    if (!json_is_true(shell_v2_json_path_get(effective, "capture_stderr")) &&
+        shell_v2_json_path_set(effective, "merge_stderr_to_stdout", json_false()) != 0)
         goto fail;
 
-#define SHELL_SANDBOX_SET_STATE(name, value)                                              \
+    shell_override = shell_v2_json_path_get(overrides, "shell_enabled");
+    effective_shell = shell_v2_json_path_get(effective, "shell_enabled");
+
+#define SHELL_V2_SET(name, value)                                                         \
     do {                                                                                  \
         if (json_object_set_new(root, name, value) != 0)                                  \
             goto fail;                                                                     \
     } while (0)
 
-    SHELL_SANDBOX_SET_STATE("revision", json_integer(revision));
-    SHELL_SANDBOX_SET_STATE("persistence", json_string("process"));
-    SHELL_SANDBOX_SET_STATE("applies_to", json_string("new_executions"));
-    SHELL_SANDBOX_SET_STATE("shell_enabled",
-                            policy_valid ? json_boolean(cfg->enabled) : json_null());
-    SHELL_SANDBOX_SET_STATE("shell_enabled_override",
-                            shell_enabled_is_set ? json_boolean(shell_enabled) : json_null());
-    SHELL_SANDBOX_SET_STATE("sandbox_enabled", json_boolean(sandbox_enabled));
-    SHELL_SANDBOX_SET_STATE("config_loaded", json_boolean(cfg->config_loaded));
-    SHELL_SANDBOX_SET_STATE("policy_valid", json_boolean(policy_valid));
-    SHELL_SANDBOX_SET_STATE("config_path",
-                            json_string(cfg->config_path ? cfg->config_path : "(unknown)"));
-    if (!cfg->config_loaded) {
-        SHELL_SANDBOX_SET_STATE("config_error",
-                                json_string(cfg->load_error ? cfg->load_error
-                                                            : "shell_exec config unavailable"));
-    }
-    if (base) {
-        if (json_object_set_new(root, "base", base) != 0)
-            goto fail;
-        base = NULL;
-    } else {
-        SHELL_SANDBOX_SET_STATE("base", json_null());
-    }
-    if (json_object_set_new(root, "overrides", saved_overrides) != 0)
-        goto fail;
+    SHELL_V2_SET("revision", json_integer(revision));
+    SHELL_V2_SET("persistence", json_string("process"));
+    SHELL_V2_SET("applies_to", json_string("new_executions"));
+    SHELL_V2_SET("sandbox_enabled", json_boolean(sandbox_enabled));
+    SHELL_V2_SET("shell_enabled", json_boolean(json_is_true(effective_shell)));
+    SHELL_V2_SET("shell_enabled_override",
+                 shell_override ? json_boolean(json_is_true(shell_override)) : json_null());
+    SHELL_V2_SET("config_loaded", json_boolean(snapshot->config_loaded));
+    SHELL_V2_SET("config_version", json_integer(snapshot->version));
+    SHELL_V2_SET("policy_valid", json_true());
+    SHELL_V2_SET("config_path", json_string(snapshot->config_path ? snapshot->config_path : ""));
+    SHELL_V2_SET("base", base);
+    base = NULL;
+    SHELL_V2_SET("overrides", saved_overrides);
     saved_overrides = NULL;
-    if (effective) {
-        if (json_object_set_new(root, "effective", effective) != 0)
-            goto fail;
-        effective = NULL;
-    } else {
-        SHELL_SANDBOX_SET_STATE("effective", json_null());
-    }
-    if (json_object_set_new(root, "capabilities", capabilities) != 0)
-        goto fail;
+    SHELL_V2_SET("effective", effective);
+    effective = NULL;
+    SHELL_V2_SET("field_status", field_status);
+    field_status = NULL;
+    SHELL_V2_SET("diagnostics", diagnostics);
+    diagnostics = NULL;
+    SHELL_V2_SET("capabilities", capabilities);
     capabilities = NULL;
 
-#undef SHELL_SANDBOX_SET_STATE
+#undef SHELL_V2_SET
     return root;
 
 fail:
-#undef SHELL_SANDBOX_SET_STATE
+#undef SHELL_V2_SET
     json_decref(base);
     json_decref(effective);
     json_decref(saved_overrides);
+    json_decref(field_status);
     json_decref(capabilities);
+    json_decref(diagnostics);
+    json_decref(pending_status);
     json_decref(root);
     return NULL;
 }
@@ -2119,25 +1721,20 @@ int mcp_tool_system_sandbox_ctl(struct mcp_server *server,
     const json_t *action_value;
     enum shell_sandbox_action action;
     const char *invalid_field = NULL;
-    struct shell_exec_config cfg;
-    struct shell_exec_config current_cfg;
     json_t *state = NULL;
     json_t *temporary_overrides = NULL;
     json_t *changed_paths = NULL;
     json_t *value;
     json_int_t expected_revision;
     json_int_t next_revision;
-    bool temporary_shell_enabled_is_set;
-    bool temporary_shell_enabled;
     bool temporary_sandbox_enabled;
+    bool effective_shell_enabled;
     size_t leaf_count = 0u;
     int rc = -1;
 
     if (!out_result)
         return -1;
     *out_result = NULL;
-    memset(&cfg, 0, sizeof(cfg));
-    memset(&current_cfg, 0, sizeof(current_cfg));
 
     if (!shell_sandbox_token_matches(control, token)) {
         return shell_sandbox_set_error(out_result,
@@ -2156,21 +1753,14 @@ int mcp_tool_system_sandbox_ctl(struct mcp_server *server,
         return shell_sandbox_invalid_params(out_result, invalid_field);
 
     if (action == SHELL_SANDBOX_ACTION_GET) {
-        if (shell_exec_config_load(&cfg) != 0)
+        state = shell_v2_state_json(control->policy_snapshot,
+                                    control->revision,
+                                    control->sandbox_enabled,
+                                    control->overrides);
+        if (!state)
             return shell_sandbox_internal_error(out_result);
-        state = shell_sandbox_state_json(control->revision,
-                                         control->sandbox_enabled,
-                                         control->shell_enabled_is_set,
-                                         control->shell_enabled,
-                                         control->overrides,
-                                         &cfg);
-        if (!state) {
-            shell_exec_config_destroy(&cfg);
-            return shell_sandbox_internal_error(out_result);
-        }
         rc = shell_sandbox_encode_success(state, out_result);
         json_decref(state);
-        shell_exec_config_destroy(&cfg);
         return rc == 0 ? 0 : shell_sandbox_internal_error(out_result);
     }
 
@@ -2187,39 +1777,9 @@ int mcp_tool_system_sandbox_ctl(struct mcp_server *server,
                                        control->revision);
     }
 
-    if (shell_exec_config_load(&cfg) != 0)
-        return shell_sandbox_internal_error(out_result);
-    if (!cfg.config_loaded) {
-        shell_exec_config_destroy(&cfg);
-        return shell_sandbox_set_error(out_result,
-                                       "config_unavailable",
-                                       "shell sandbox configuration is unavailable",
-                                       NULL,
-                                       false,
-                                       0);
-    }
     if (!shell_sandbox_revision_can_increment(control->revision)) {
-        shell_exec_config_destroy(&cfg);
         return shell_sandbox_internal_error(out_result);
     }
-    if (shell_sandbox_config_copy(&current_cfg, &cfg) != 0)
-        goto internal_error;
-    if (shell_sandbox_apply_normalized_overrides(&current_cfg,
-                                                 control->overrides,
-                                                 control->shell_enabled_is_set,
-                                                 control->shell_enabled) != 0)
-        goto internal_error;
-    if (!shell_sandbox_policy_is_valid(&current_cfg, NULL)) {
-        shell_exec_config_destroy(&current_cfg);
-        shell_exec_config_destroy(&cfg);
-        return shell_sandbox_set_error(out_result,
-                                       "config_unavailable",
-                                       "shell sandbox configuration is unavailable",
-                                       NULL,
-                                       false,
-                                       0);
-    }
-    shell_exec_config_destroy(&current_cfg);
 
     temporary_overrides = action == SHELL_SANDBOX_ACTION_RESET
                               ? json_object()
@@ -2227,41 +1787,17 @@ int mcp_tool_system_sandbox_ctl(struct mcp_server *server,
     changed_paths = json_array();
     if (!temporary_overrides || !changed_paths)
         goto internal_error;
-    temporary_shell_enabled_is_set = control->shell_enabled_is_set;
-    temporary_shell_enabled = control->shell_enabled;
     temporary_sandbox_enabled = control->sandbox_enabled;
 
     if (action == SHELL_SANDBOX_ACTION_RESET) {
-        temporary_shell_enabled_is_set = false;
-        temporary_shell_enabled = false;
         temporary_sandbox_enabled = true;
-        if (shell_sandbox_record_path(changed_paths, "shell_enabled") !=
-                SHELL_SANDBOX_PATCH_OK ||
-            shell_sandbox_record_path(changed_paths, "sandbox_enabled") !=
+        if (shell_sandbox_record_path(changed_paths, "sandbox_enabled") !=
                 SHELL_SANDBOX_PATCH_OK ||
             shell_sandbox_record_path(changed_paths, "overrides") != SHELL_SANDBOX_PATCH_OK)
             goto internal_error;
     } else {
         struct shell_sandbox_patch_error patch_error = {0};
         enum shell_sandbox_patch_status patch_status;
-
-        value = json_object_get(arguments, "shell_enabled");
-        if (value) {
-            if (json_is_null(value)) {
-                temporary_shell_enabled_is_set = false;
-                temporary_shell_enabled = false;
-            } else if (json_is_boolean(value)) {
-                temporary_shell_enabled_is_set = true;
-                temporary_shell_enabled = json_is_true(value);
-            } else {
-                invalid_field = "shell_enabled";
-                goto invalid_params;
-            }
-            if (shell_sandbox_record_path(changed_paths, "shell_enabled") !=
-                SHELL_SANDBOX_PATCH_OK)
-                goto internal_error;
-            leaf_count++;
-        }
 
         value = json_object_get(arguments, "sandbox_enabled");
         if (value) {
@@ -2278,11 +1814,12 @@ int mcp_tool_system_sandbox_ctl(struct mcp_server *server,
 
         value = json_object_get(arguments, "overrides");
         if (value) {
-            patch_status = shell_sandbox_apply_overrides_patch(temporary_overrides,
-                                                               value,
-                                                               changed_paths,
-                                                               &leaf_count,
-                                                               &patch_error);
+            patch_status = shell_v2_apply_overrides_patch(control->policy_snapshot,
+                                                          temporary_overrides,
+                                                          value,
+                                                          changed_paths,
+                                                          &leaf_count,
+                                                          &patch_error);
             if (patch_status == SHELL_SANDBOX_PATCH_INVALID) {
                 invalid_field = patch_error.field;
                 goto invalid_params;
@@ -2290,7 +1827,6 @@ int mcp_tool_system_sandbox_ctl(struct mcp_server *server,
             if (patch_status == SHELL_SANDBOX_PATCH_UNSUPPORTED) {
                 json_decref(temporary_overrides);
                 json_decref(changed_paths);
-                shell_exec_config_destroy(&cfg);
                 return shell_sandbox_set_error(out_result,
                                                "unsupported_on_platform",
                                                "sandbox field is unsupported on this platform",
@@ -2308,22 +1844,13 @@ int mcp_tool_system_sandbox_ctl(struct mcp_server *server,
     }
 
     next_revision = control->revision + 1;
-    state = shell_sandbox_state_json(next_revision,
-                                     temporary_sandbox_enabled,
-                                     temporary_shell_enabled_is_set,
-                                     temporary_shell_enabled,
-                                     temporary_overrides,
-                                     &cfg);
+    state = shell_v2_state_json(control->policy_snapshot,
+                                next_revision,
+                                temporary_sandbox_enabled,
+                                temporary_overrides);
     if (!state)
         goto internal_error;
-    if (!json_is_true(json_object_get(state, "policy_valid"))) {
-        json_decref(state);
-        json_decref(temporary_overrides);
-        json_decref(changed_paths);
-        shell_sandbox_policy_is_valid(&cfg, &invalid_field);
-        shell_exec_config_destroy(&cfg);
-        return shell_sandbox_invalid_params(out_result, invalid_field);
-    }
+    effective_shell_enabled = json_is_true(json_object_get(state, "shell_enabled"));
     if (shell_sandbox_encode_success(state, out_result) != 0)
         goto internal_error;
     json_decref(state);
@@ -2332,32 +1859,26 @@ int mcp_tool_system_sandbox_ctl(struct mcp_server *server,
     json_decref(control->overrides);
     control->overrides = temporary_overrides;
     temporary_overrides = NULL;
-    control->shell_enabled_is_set = temporary_shell_enabled_is_set;
-    control->shell_enabled = temporary_shell_enabled;
     control->sandbox_enabled = temporary_sandbox_enabled;
     control->revision = next_revision;
     shell_sandbox_audit_log(action == SHELL_SANDBOX_ACTION_RESET ? "reset" : "update",
                             expected_revision,
                             next_revision,
                             temporary_sandbox_enabled,
-                            cfg.enabled,
+                            effective_shell_enabled,
                             changed_paths);
     json_decref(changed_paths);
-    shell_exec_config_destroy(&cfg);
     return 0;
 
 invalid_params:
     json_decref(temporary_overrides);
     json_decref(changed_paths);
-    shell_exec_config_destroy(&cfg);
     return shell_sandbox_invalid_params(out_result, invalid_field);
 
 internal_error:
     json_decref(state);
     json_decref(temporary_overrides);
     json_decref(changed_paths);
-    shell_exec_config_destroy(&current_cfg);
-    shell_exec_config_destroy(&cfg);
     json_decref(*out_result);
     *out_result = NULL;
     return shell_sandbox_internal_error(out_result);
@@ -4224,24 +3745,14 @@ int mcp_tool_system_shell_exec(struct mcp_server *server,
         *out_result = mcp_tool_result_text("Failed to initialize shell sandbox policy.", true);
         goto cleanup;
     }
-    {
-        int effective_status = shell_sandbox_apply_effective_policy(&cfg,
-                                                                     control->revision,
-                                                                     control->sandbox_enabled,
-                                                                     control->shell_enabled_is_set,
-                                                                     control->shell_enabled,
-                                                                     control->overrides);
-        if (effective_status < 0) {
-            *out_result = mcp_tool_result_text("Failed to merge shell sandbox policy.", true);
-            goto cleanup;
-        }
-        if (effective_status > 0) {
-            *out_result = mcp_tool_result_text(
-                "system.shell_exec is disabled because the effective sandbox policy is invalid.",
-                true);
-            rc = 0;
-            goto cleanup;
-        }
+    cfg.sandbox_revision = 0;
+    cfg.sandbox_enabled = true;
+    cfg.shell_enabled = cfg.enabled;
+    if (!shell_sandbox_policy_is_valid(&cfg, NULL)) {
+        *out_result = mcp_tool_result_text(
+            "system.shell_exec is disabled because the execution policy is invalid.", true);
+        rc = 0;
+        goto cleanup;
     }
 
     if (!cfg.enabled) {
@@ -4369,24 +3880,14 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
         *out_result = mcp_tool_result_text("Failed to initialize shell sandbox policy.", true);
         goto cleanup;
     }
-    {
-        int effective_status = shell_sandbox_apply_effective_policy(&cfg,
-                                                                     control->revision,
-                                                                     control->sandbox_enabled,
-                                                                     control->shell_enabled_is_set,
-                                                                     control->shell_enabled,
-                                                                     control->overrides);
-        if (effective_status < 0) {
-            *out_result = mcp_tool_result_text("Failed to merge shell sandbox policy.", true);
-            goto cleanup;
-        }
-        if (effective_status > 0) {
-            *out_result = mcp_tool_result_text(
-                "system.shell_start is disabled because the effective sandbox policy is invalid.",
-                true);
-            rc = 0;
-            goto cleanup;
-        }
+    cfg.sandbox_revision = 0;
+    cfg.sandbox_enabled = true;
+    cfg.shell_enabled = cfg.enabled;
+    if (!shell_sandbox_policy_is_valid(&cfg, NULL)) {
+        *out_result = mcp_tool_result_text(
+            "system.shell_start is disabled because the execution policy is invalid.", true);
+        rc = 0;
+        goto cleanup;
     }
 
     if (!cfg.enabled) {

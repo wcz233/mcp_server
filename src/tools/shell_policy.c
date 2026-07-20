@@ -15,8 +15,6 @@
 #define MCP_SHELL_POLICY_HARD_WORKING_DIRECTORY "/tmp/mcp-shell"
 #endif
 
-#define MCP_SHELL_POLICY_HARD_ENV_MAX_ITEMS 1024u
-#define MCP_SHELL_POLICY_HARD_ENV_ITEM_MAX_BYTES 255u
 #define POLICY_OFFSET(member) offsetof(struct mcp_shell_policy_defaults, member)
 
 #ifndef MCP_SHELL_EXEC_DEFAULT_CONFIG
@@ -615,8 +613,8 @@ int mcp_shell_policy_snapshot_create_hard(struct mcp_shell_policy_snapshot **out
     snapshot->control_enabled = control_enabled;
     snapshot->version = 2;
     snapshot->config_path = policy_strdup(config_path ? config_path : "(hard_profile)");
-    snapshot->environment_max_items = MCP_SHELL_POLICY_HARD_ENV_MAX_ITEMS;
-    snapshot->environment_item_max_bytes = MCP_SHELL_POLICY_HARD_ENV_ITEM_MAX_BYTES;
+    snapshot->environment_max_items = MCP_SHELL_POLICY_ENV_HARD_MAX_ITEMS;
+    snapshot->environment_item_max_bytes = MCP_SHELL_POLICY_ENV_HARD_ITEM_MAX_BYTES;
     snapshot->environment_source = MCP_SHELL_POLICY_SOURCE_HARD;
     if (!snapshot->config_path)
         goto fail;
@@ -1084,12 +1082,12 @@ static int parse_environment_field(struct mcp_shell_policy_snapshot *snapshot,
     max_items_signed = json_integer_value(max_items_json);
     max_bytes_signed = json_integer_value(max_bytes_json);
     if (max_items_signed < 0 ||
-        (uint64_t)max_items_signed > MCP_SHELL_POLICY_HARD_ENV_MAX_ITEMS ||
+        (uint64_t)max_items_signed > MCP_SHELL_POLICY_ENV_HARD_MAX_ITEMS ||
         max_bytes_signed < 0 ||
-        (uint64_t)max_bytes_signed > MCP_SHELL_POLICY_HARD_ENV_ITEM_MAX_BYTES)
+        (uint64_t)max_bytes_signed > MCP_SHELL_POLICY_ENV_HARD_ITEM_MAX_BYTES)
         fallback = "bound_above_hard_max";
-    max_items = fallback ? MCP_SHELL_POLICY_HARD_ENV_MAX_ITEMS : (size_t)max_items_signed;
-    max_bytes = fallback ? MCP_SHELL_POLICY_HARD_ENV_ITEM_MAX_BYTES : (size_t)max_bytes_signed;
+    max_items = fallback ? MCP_SHELL_POLICY_ENV_HARD_MAX_ITEMS : (size_t)max_items_signed;
+    max_bytes = fallback ? MCP_SHELL_POLICY_ENV_HARD_ITEM_MAX_BYTES : (size_t)max_bytes_signed;
 
     json_object_foreach(environment, name, value) {
         size_t value_length;
