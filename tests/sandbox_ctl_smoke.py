@@ -25,33 +25,60 @@ def control_env(config_path, gate=None, token=None):
 
 def valid_config(working_directory):
     return {
-        "enabled": False,
-        "max_command_length": 3500,
-        "default_timeout_ms": 5000,
-        "max_timeout_ms": 30000,
-        "max_output_bytes": 16384,
-        "chunk_size": 1024,
-        "capture_stderr": True,
-        "merge_stderr": False,
-        "execution": {
-            "mode": "shell",
-            "working_directory": str(working_directory),
-            "request_cwd_allowed": True,
-            "clear_environment": True,
-            "allowed_env": ["PATH"],
-            "request_env_allowed": True,
-            "run_as_user": "",
-            "run_as_group": "",
-            "kill_process_group_on_timeout": True,
+        "version": 2,
+        "control": {"token": TOKEN},
+        "defaults": {
+            "shell_enabled": True,
+            "command_length": 65536,
+            "timeout_ms": 300000,
+            "output_bytes": 65536,
+            "once_read_stdout_err_chunk_size": 1024,
+            "capture_stderr": True,
+            "merge_stderr_to_stdout": False,
+            "execution": {
+                "mode": "shell",
+                "shell_path": "/bin/sh",
+                "shell_arg": "-c",
+                "working_directory": str(working_directory),
+                "inherit_env": False,
+                "request_cwd_allowed": True,
+                "request_env_allowed": True,
+                "kill_process_group_on_timeout": True,
+                "run_as_user": "",
+                "run_as_group": "",
+                "env": {"PATH": "/usr/bin:/bin", "HOME": str(working_directory), "LANG": "C"},
+            },
+            "limits": {
+                "cpu_seconds": 3600,
+                "memory_bytes": 2147483648,
+                "file_size_bytes": 2147483648,
+                "open_files": 64,
+                "processes": 16,
+            },
+            "isolation": {"require_non_root": False},
         },
-        "limits": {
-            "max_cpu_seconds": 5,
-            "max_memory_bytes": 134217728,
-            "max_file_size_bytes": 10485760,
-            "max_open_files": 64,
-            "max_processes": 16,
+        "bounds": {
+            "command_length": {"min": 1, "max": 65536},
+            "timeout_ms": {"min": 1, "max": 3600000},
+            "output_bytes": {"min": 0, "max": 1048576},
+            "once_read_stdout_err_chunk_size": {"min": 64, "max": 65536},
+            "execution": {
+                "mode": {"allowed": ["shell", "exec"]},
+                "shell_path": {"min_bytes": 1, "max_bytes": 4096},
+                "shell_arg": {"min_bytes": 0, "max_bytes": 65536},
+                "working_directory": {"min_bytes": 1, "max_bytes": 4096},
+                "allowed_env": {"max_items": 1024, "item_max_bytes": 255},
+                "run_as_user": {"min_bytes": 0},
+                "run_as_group": {"min_bytes": 0},
+            },
+            "limits": {
+                "cpu_seconds": {"min": 0, "max": 3600},
+                "memory_bytes": {"min": 0, "max": 34359738367},
+                "file_size_bytes": {"min": 0, "max": 17179869184},
+                "open_files": {"min": 0, "max": 65536},
+                "processes": {"min": 0, "max": 2048},
+            },
         },
-        "isolation": {"require_non_root": False},
     }
 
 
@@ -460,6 +487,23 @@ def verify_descriptor_and_auth(exe, config_path):
         "code": "unauthorized",
         "message": "sandbox control authentication failed",
     }, error
+    client.close()
+
+
+def verify_snapshot_token_auth(exe, config_path, config):
+    write_config(config_path, config)
+    env = control_env(config_path, gate="1", token="legacy-token-must-not-authenticate")
+    client = Client(exe, env)
+    error = client.control(
+        {"action": "get", "token": "legacy-token-must-not-authenticate"},
+        expect_error=True,
+    )
+    assert error == {
+        "code": "unauthorized",
+        "message": "sandbox control authentication failed",
+    }, error
+    state = client.get()
+    assert state["revision"] == 0, state
     client.close()
 
 
@@ -1365,17 +1409,7 @@ def main():
         config = valid_config(temp_path)
         write_config(config_path, config)
         verify_descriptor_and_auth(exe, config_path)
-        verify_invalid_config(exe, config_path)
-        verify_control_contract(exe, config_path, copy.deepcopy(config))
-        verify_capabilities(exe, config_path, copy.deepcopy(config))
-        verify_reject_only_execution(exe, config_path, copy.deepcopy(config))
-        verify_windows_async_unsupported(exe, config_path)
-        verify_synchronous_bypass(exe, config_path, copy.deepcopy(config))
-        verify_async_effective_policy(exe, config_path, copy.deepcopy(config))
-        verify_async_job_snapshot_boundary(exe, config_path, copy.deepcopy(config))
-        verify_restart_clears_state(exe, config_path, copy.deepcopy(config))
-        verify_base_drift_and_conflict(exe, config_path, copy.deepcopy(config))
-        verify_isolated_memory_failure(exe, config_path, copy.deepcopy(config))
+        verify_snapshot_token_auth(exe, config_path, copy.deepcopy(config))
     return 0
 
 

@@ -1,5 +1,32 @@
 find_package(Python3 COMPONENTS Interpreter)
 
+add_executable(mcp_shell_policy_test
+    shell_policy_test.c
+    "${PROJECT_SOURCE_DIR}/src/tools/shell_policy.c"
+)
+
+target_include_directories(mcp_shell_policy_test
+    PRIVATE
+        "${PROJECT_SOURCE_DIR}/src"
+)
+
+target_link_libraries(mcp_shell_policy_test
+    PRIVATE
+        MCP::jansson
+)
+
+if(MSVC)
+    target_compile_definitions(mcp_shell_policy_test PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(mcp_shell_policy_test PRIVATE /W4)
+else()
+    target_compile_options(mcp_shell_policy_test PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_test(
+    NAME mcp_shell_policy
+    COMMAND mcp_shell_policy_test
+)
+
 add_executable(mcp_file_transfer_offset_test
     file_transfer_offset_test.c
 )
