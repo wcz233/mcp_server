@@ -584,6 +584,7 @@ def verify_v2_control_state(exe, config_path, config):
         status = field_status(state, path)
         assert status["source"] == "json", (path, status)
         assert status["diagnostic"] is None, (path, status)
+        assert "bounds" in status, (path, status)
         assert status["capability"] in {
             "enforced",
             "unsupported",
