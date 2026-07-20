@@ -466,6 +466,93 @@ def verify_64_bit_rlimit(client, state):
     return state
 
 
+def verify_platform_limits_and_identity(client, state, temp_path):
+    limit_names = (
+        "cpu_seconds",
+        "memory_bytes",
+        "file_size_bytes",
+        "open_files",
+        "processes",
+    )
+    if os.name == "nt":
+        for name in limit_names:
+            assert state["capabilities"]["limits"][name] == "unsupported", state
+        assert state["capabilities"]["execution"]["run_as_user"] == "unsupported", state
+        assert state["capabilities"]["execution"]["run_as_group"] == "unsupported", state
+        return state
+
+    import grp
+    import pwd
+    import resource
+
+    def within_parent_limit(resource_id, requested):
+        inherited_hard = resource.getrlimit(resource_id)[1]
+        if inherited_hard == resource.RLIM_INFINITY:
+            return requested
+        return min(requested, inherited_hard)
+
+    limits = {
+        "cpu_seconds": within_parent_limit(resource.RLIMIT_CPU, 120),
+        "memory_bytes": within_parent_limit(resource.RLIMIT_AS, 1073741824),
+        "file_size_bytes": within_parent_limit(resource.RLIMIT_FSIZE, 16777216),
+        "open_files": within_parent_limit(resource.RLIMIT_NOFILE, 128),
+        "processes": within_parent_limit(resource.RLIMIT_NPROC, 64),
+    }
+    for name in limit_names:
+        assert state["capabilities"]["limits"][name] == "enforced", state
+    assert state["capabilities"]["execution"]["run_as_user"] == "enforced", state
+    assert state["capabilities"]["execution"]["run_as_group"] == "enforced", state
+
+    expected_uid = os.geteuid()
+    expected_gid = os.getegid()
+    identity = {}
+    if expected_uid == 0:
+        target = next(entry for entry in pwd.getpwall() if entry.pw_uid != 0)
+        expected_uid = target.pw_uid
+        expected_gid = target.pw_gid
+        temp_path.chmod(0o755)
+        identity = {
+            "run_as_user": target.pw_name,
+            "run_as_group": grp.getgrgid(target.pw_gid).gr_name,
+        }
+    else:
+        identity = {"run_as_group": grp.getgrgid(expected_gid).gr_name}
+
+    probe = temp_path / "unix_policy_probe.py"
+    probe.write_text(
+        "import json, os, resource\n"
+        "print(json.dumps({\n"
+        "    'uid': os.geteuid(),\n"
+        "    'gid': os.getegid(),\n"
+        "    'cpu_seconds': resource.getrlimit(resource.RLIMIT_CPU)[0],\n"
+        "    'memory_bytes': resource.getrlimit(resource.RLIMIT_AS)[0],\n"
+        "    'file_size_bytes': resource.getrlimit(resource.RLIMIT_FSIZE)[0],\n"
+        "    'open_files': resource.getrlimit(resource.RLIMIT_NOFILE)[0],\n"
+        "    'processes': resource.getrlimit(resource.RLIMIT_NPROC)[0],\n"
+        "}))\n",
+        encoding="utf-8",
+    )
+    state = client.update(
+        state,
+        overrides={
+            "execution": {
+                "mode": "shell",
+                "shell_path": sys.executable,
+                "shell_arg": "",
+                **identity,
+            },
+            "limits": limits,
+        },
+    )
+    payload = client.shell({"command": str(probe)})
+    observed = json.loads(payload["stdout"])
+    assert observed["uid"] == expected_uid, observed
+    assert observed["gid"] == expected_gid, observed
+    for name, value in limits.items():
+        assert observed[name] == value, observed
+    return state
+
+
 def main():
     exe = sys.argv[1]
     with tempfile.TemporaryDirectory(prefix="mcp-shell-policy-") as temp_dir:
@@ -481,7 +568,8 @@ def main():
             state = verify_effective_policy(client, temp_path)
             state = verify_cwd_and_environment(client, state, temp_path)
             state = verify_output_and_shell_arg(client, state, temp_path)
-            verify_64_bit_rlimit(client, state)
+            state = verify_64_bit_rlimit(client, state)
+            verify_platform_limits_and_identity(client, state, temp_path)
         finally:
             client.close()
     return 0
