@@ -2943,6 +2943,10 @@ static void shell_exec_child_exec(const struct shell_exec_config *cfg,
         char *const argv[] = {(char *)request->command, NULL};
 
         execve(request->command, argv, envp);
+    } else if (cfg->shell_arg[0] == '\0') {
+        char *const argv[] = {(char *)cfg->shell_path, request->command, NULL};
+
+        execve(cfg->shell_path, argv, envp);
     } else {
         char *const argv[] = {(char *)cfg->shell_path, (char *)cfg->shell_arg, request->command, NULL};
 
@@ -3265,6 +3269,8 @@ static char *shell_exec_build_windows_command_line(const struct shell_exec_confi
         return NULL;
     if (cfg->mode == SHELL_EXEC_MODE_EXEC)
         snprintf(command_line, total, "%s", request->command);
+    else if (arg[0] == '\0')
+        snprintf(command_line, total, "\"%s\" %s", prefix, request->command);
     else
         snprintf(command_line, total, "\"%s\" %s %s", prefix, arg, request->command);
     return command_line;
@@ -4142,6 +4148,14 @@ static json_t *shell_exec_build_result(const struct shell_exec_config *cfg,
         goto fail;
     if (json_object_set_new(payload, "truncated",
                             json_boolean(outcome->stdout_buf.truncated || outcome->stderr_buf.truncated)) != 0)
+        goto fail;
+    if (json_object_set_new(payload,
+                            "stdout_truncated",
+                            json_boolean(outcome->stdout_buf.truncated)) != 0)
+        goto fail;
+    if (json_object_set_new(payload,
+                            "stderr_truncated",
+                            json_boolean(outcome->stderr_buf.truncated)) != 0)
         goto fail;
     if (json_object_set_new(payload, "signal", json_integer(outcome->signal_number)) != 0)
         goto fail;
