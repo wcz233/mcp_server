@@ -10,6 +10,33 @@ import time
 
 TOKEN = "s2-token-must-not-appear-7f51b36e"
 
+V2_DEFAULT_PATHS = {
+    ("shell_enabled",),
+    ("command_length",),
+    ("timeout_ms",),
+    ("output_bytes",),
+    ("once_read_stdout_err_chunk_size",),
+    ("capture_stderr",),
+    ("merge_stderr_to_stdout",),
+    ("execution", "mode"),
+    ("execution", "shell_path"),
+    ("execution", "shell_arg"),
+    ("execution", "working_directory"),
+    ("execution", "inherit_env"),
+    ("execution", "request_cwd_allowed"),
+    ("execution", "request_env_allowed"),
+    ("execution", "kill_process_group_on_timeout"),
+    ("execution", "run_as_user"),
+    ("execution", "run_as_group"),
+    ("execution", "env"),
+    ("limits", "cpu_seconds"),
+    ("limits", "memory_bytes"),
+    ("limits", "file_size_bytes"),
+    ("limits", "open_files"),
+    ("limits", "processes"),
+    ("isolation", "require_non_root"),
+}
+
 
 def control_env(config_path, gate=None, token=None):
     env = os.environ.copy()
@@ -196,6 +223,21 @@ def nested_has(value, path):
             return False
         value = value[key]
     return path[-1] in value
+
+
+def schema_leaf_paths(schema, prefix=()):
+    if schema.get("type") == "object" and "properties" in schema:
+        paths = set()
+        for key, child in schema["properties"].items():
+            paths.update(schema_leaf_paths(child, prefix + (key,)))
+        return paths
+    return {prefix}
+
+
+def schema_at_path(schema, path):
+    for key in path:
+        schema = schema["properties"][key]
+    return schema
 
 
 def override_patch(path, value):
@@ -465,6 +507,13 @@ def verify_descriptor_and_auth(exe, config_path):
     schema = descriptor["inputSchema"]
     assert schema["additionalProperties"] is False, schema
     assert schema["required"] == ["action", "token"], schema
+    assert set(schema["properties"]) == {
+        "action",
+        "token",
+        "expected_revision",
+        "sandbox_enabled",
+        "overrides",
+    }, schema
     assert schema["properties"]["overrides"]["additionalProperties"] is False, schema
     assert schema["properties"]["overrides"]["properties"]["execution"][
         "additionalProperties"
@@ -475,18 +524,217 @@ def verify_descriptor_and_auth(exe, config_path):
     assert schema["properties"]["overrides"]["properties"]["isolation"][
         "additionalProperties"
     ] is False, schema
-    max_output_options = schema["properties"]["overrides"]["properties"]["max_output_bytes"][
-        "anyOf"
-    ]
-    max_output_integer = next(item for item in max_output_options if item["type"] == "integer")
-    assert max_output_integer["minimum"] == 256, max_output_integer
-    assert max_output_integer["maximum"] == 2147483648, max_output_integer
+    override_schema = schema["properties"]["overrides"]
+    assert schema_leaf_paths(override_schema) == V2_DEFAULT_PATHS, override_schema
+    numeric_bounds = {
+        ("command_length",): (1, 65536),
+        ("timeout_ms",): (1, 3600000),
+        ("output_bytes",): (0, 1048576),
+        ("once_read_stdout_err_chunk_size",): (64, 65536),
+        ("limits", "cpu_seconds"): (0, 3600),
+        ("limits", "memory_bytes"): (0, 34359738367),
+        ("limits", "file_size_bytes"): (0, 17179869184),
+        ("limits", "open_files"): (0, 65536),
+        ("limits", "processes"): (0, 2048),
+    }
+    for path, (minimum, maximum) in numeric_bounds.items():
+        options = schema_at_path(override_schema, path)["anyOf"]
+        integer = next(item for item in options if item["type"] == "integer")
+        assert integer["minimum"] == minimum, (path, integer)
+        assert integer["maximum"] == maximum, (path, integer)
+
+    mode_options = schema_at_path(override_schema, ("execution", "mode"))["anyOf"]
+    mode = next(item for item in mode_options if item["type"] == "string")
+    assert mode["enum"] == ["shell", "exec"], mode
 
     error = client.control({"action": "get", "token": TOKEN}, expect_error=True)
     assert error == {
         "code": "unauthorized",
         "message": "sandbox control authentication failed",
     }, error
+    client.close()
+
+
+def field_status(state, path):
+    return state["field_status"][".".join(path)]
+
+
+def assert_redacted_environment(state, expected_items):
+    for section in ("base", "effective"):
+        summary = nested_get(state[section], ("execution", "env"))
+        assert summary == {"items": expected_items, "valid": True}, (section, summary)
+
+
+def verify_v2_control_state(exe, config_path, config):
+    environment_secret = "environment-value-must-not-appear-32d53d"
+    write_config(config_path, config)
+    client = Client(exe, control_env(config_path, gate="1"))
+    state = client.get()
+
+    assert state["revision"] == 0, state
+    assert state["persistence"] == "process", state
+    assert state["applies_to"] == "new_executions", state
+    assert state["config_loaded"] is True and state["config_version"] == 2, state
+    assert state["policy_valid"] is True and state["sandbox_enabled"] is True, state
+    assert state["shell_enabled"] is True and state["shell_enabled_override"] is None, state
+    assert state["overrides"] == {}, state
+    assert set(state["field_status"]) == {".".join(path) for path in V2_DEFAULT_PATHS}, state
+    assert_redacted_environment(state, 3)
+    for path in V2_DEFAULT_PATHS:
+        status = field_status(state, path)
+        assert status["source"] == "json", (path, status)
+        assert status["diagnostic"] is None, (path, status)
+        assert status["capability"] in {
+            "enforced",
+            "unsupported",
+            "reject_only",
+            "ignored",
+        }, (path, status)
+
+    update_values = {
+        ("shell_enabled",): False,
+        ("command_length",): 2048,
+        ("timeout_ms",): 2000,
+        ("output_bytes",): 0,
+        ("once_read_stdout_err_chunk_size",): 256,
+        ("capture_stderr",): True,
+        ("merge_stderr_to_stdout",): True,
+        ("execution", "mode"): "exec",
+        ("execution", "shell_path"): "cmd.exe" if os.name == "nt" else "/bin/sh",
+        ("execution", "shell_arg"): "",
+        ("execution", "working_directory"): str(config_path.parent),
+        ("execution", "inherit_env"): True,
+        ("execution", "request_cwd_allowed"): False,
+        ("execution", "request_env_allowed"): False,
+        ("execution", "kill_process_group_on_timeout"): False,
+        ("execution", "run_as_user"): "sandbox-user",
+        ("execution", "run_as_group"): "sandbox-group",
+        ("execution", "env"): {"S2_REDACTED": environment_secret},
+        ("limits", "cpu_seconds"): 1,
+        ("limits", "memory_bytes"): 34359738367,
+        ("limits", "file_size_bytes"): 17179869184,
+        ("limits", "open_files"): 32,
+        ("limits", "processes"): 8,
+        ("isolation", "require_non_root"): True,
+    }
+
+    for path in sorted(V2_DEFAULT_PATHS):
+        value = update_values[path]
+        capability = field_status(state, path)["capability"]
+        arguments = update_arguments(state, overrides=override_patch(path, value))
+        if capability == "unsupported":
+            assert_error_unchanged(
+                client,
+                arguments,
+                code="unsupported_on_platform",
+                field=".".join(path),
+            )
+            continue
+
+        previous_revision = state["revision"]
+        state = client.control(arguments)
+        assert state["revision"] == previous_revision + 1, (path, state)
+        assert field_status(state, path)["source"] == "runtime", (path, state)
+        if path == ("execution", "env"):
+            assert nested_get(state["overrides"], path) == {"items": 1, "valid": True}, state
+            assert nested_get(state["effective"], path) == {"items": 1, "valid": True}, state
+        else:
+            assert nested_get(state["overrides"], path) == value, (path, state)
+            assert nested_get(state["effective"], path) == value, (path, state)
+        assert client.get() == state, (path, state)
+
+    assert environment_secret not in json.dumps(state, ensure_ascii=False), state
+    command_status = field_status(state, ("command_length",))
+    assert command_status["bounds"] == {"min": 1, "max": 65536}, command_status
+    memory_status = field_status(state, ("limits", "memory_bytes"))
+    assert memory_status["bounds"] == {"min": 0, "max": 34359738367}, memory_status
+
+    before_invalid = copy.deepcopy(state)
+    assert_error_unchanged(
+        client,
+        update_arguments(
+            state,
+            overrides={"command_length": 4096, "unknown": "must-not-be-logged"},
+        ),
+        field="overrides",
+    )
+    assert client.get() == before_invalid, state
+    assert_error_unchanged(
+        client,
+        {
+            "action": "update",
+            "token": TOKEN,
+            "expected_revision": state["revision"] - 1,
+            "overrides": {"command_length": 4096},
+        },
+        code="revision_conflict",
+    )
+
+    state = client.control(
+        update_arguments(state, overrides=override_patch(("command_length",), None))
+    )
+    assert not nested_has(state["overrides"], ("command_length",)), state
+    assert nested_get(state["effective"], ("command_length",)) == 65536, state
+    assert field_status(state, ("command_length",))["source"] == "json", state
+
+    state = client.control(update_arguments(state, sandbox_enabled=False))
+    assert state["sandbox_enabled"] is False and state["overrides"], state
+    state = client.control(update_arguments(state, sandbox_enabled=True))
+    assert state["sandbox_enabled"] is True and state["overrides"], state
+
+    marker = config_path.parent / "s2-must-not-reach-spawn.marker"
+    marker.unlink(missing_ok=True)
+    command = shell_command(f'type nul > "{marker}"', f"touch '{marker}'")
+    result, _ = shell_result(client, {"command": command})
+    assert result["isError"] is True, result
+    assert not marker.exists(), marker
+
+    reset = client.control(
+        {"action": "reset", "token": TOKEN, "expected_revision": state["revision"]}
+    )
+    assert reset["revision"] == state["revision"] + 1, reset
+    assert reset["overrides"] == {}, reset
+    assert reset["sandbox_enabled"] is True, reset
+    assert reset["shell_enabled_override"] is None, reset
+    stderr = client.close()
+    assert environment_secret not in stderr, stderr
+    assert "must-not-be-logged" not in stderr, stderr
+
+
+def verify_field_fallback_diagnostics(exe, config_path, config):
+    config["defaults"]["command_length"] = 1024
+    config["bounds"]["command_length"]["max"] = 65537
+    write_config(config_path, config)
+    client = Client(exe, control_env(config_path, gate="1"))
+    state = client.get()
+
+    status = field_status(state, ("command_length",))
+    assert nested_get(state["base"], ("command_length",)) == 65536, state
+    assert status["source"] == "hard_fallback", status
+    assert status["bounds"] == {"min": 1, "max": 65536}, status
+    assert status["diagnostic"] == "max_exceeds_hard_max", status
+    assert state["diagnostics"] == [
+        {
+            "field": "command_length",
+            "source": "hard_fallback",
+            "reason": "max_exceeds_hard_max",
+        }
+    ], state
+    assert field_status(state, ("timeout_ms",))["source"] == "json", state
+
+    state = client.control(
+        update_arguments(state, overrides={"command_length": 65536})
+    )
+    assert nested_get(state["effective"], ("command_length",)) == 65536, state
+    assert field_status(state, ("command_length",))["source"] == "runtime", state
+    assert field_status(state, ("command_length",))["diagnostic"] == (
+        "max_exceeds_hard_max"
+    ), state
+    assert_error_unchanged(
+        client,
+        update_arguments(state, overrides={"command_length": 65537}),
+        field="command_length",
+    )
     client.close()
 
 
@@ -1410,6 +1658,8 @@ def main():
         write_config(config_path, config)
         verify_descriptor_and_auth(exe, config_path)
         verify_snapshot_token_auth(exe, config_path, copy.deepcopy(config))
+        verify_v2_control_state(exe, config_path, copy.deepcopy(config))
+        verify_field_fallback_diagnostics(exe, config_path, copy.deepcopy(config))
     return 0
 
 
