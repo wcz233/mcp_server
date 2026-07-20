@@ -389,22 +389,31 @@ def verify_output_and_shell_arg(client, state, temp_path):
     payload = client.shell({"command": shell_command("echo ignored 1>&2", "printf ignored >&2")})
     assert payload["stderr"] == "" and payload["stderr_truncated"] is False, payload
 
-    probe = temp_path / "argv_probe.py"
-    probe.write_text("import sys\nprint(len(sys.argv))\n", encoding="utf-8")
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        empty_arg_shell = system_root + r"\System32\where.exe"
+        empty_arg_command = "cmd.exe"
+    else:
+        probe = temp_path / "argv_probe.py"
+        probe.write_text("import sys\nprint(len(sys.argv))\n", encoding="utf-8")
+        empty_arg_shell = sys.executable
+        empty_arg_command = str(probe)
     state = client.update(
         state,
         overrides={
             "output_bytes": 65536,
             "capture_stderr": True,
             "merge_stderr_to_stdout": False,
-            "execution": {"shell_path": sys.executable, "shell_arg": ""},
+            "execution": {"shell_path": empty_arg_shell, "shell_arg": ""},
         },
     )
-    payload = client.shell({"command": str(probe)})
-    assert payload["stdout"].strip() == "1", payload
+    payload = client.shell({"command": empty_arg_command})
+    if os.name == "nt":
+        assert payload["stdout"].strip().lower().endswith(r"\cmd.exe"), payload
+    else:
+        assert payload["stdout"].strip() == "1", payload
 
     if os.name == "nt":
-        system_root = os.environ.get("SystemRoot", r"C:\Windows")
         exec_command = system_root + r"\System32\whoami.exe"
         default_shell_path = os.environ.get("ComSpec", system_root + r"\System32\cmd.exe")
         default_shell_arg = "/C"
