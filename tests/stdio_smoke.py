@@ -77,8 +77,11 @@ def main():
             },
         )
         shell = recv(proc)
-        assert shell["result"]["isError"] is True
-        assert "disabled" in shell["result"]["content"][0]["text"]
+        assert shell["result"]["isError"] is False
+        shell_payload = json.loads(shell["result"]["content"][0]["text"])
+        assert shell_payload["stdout"].strip() == "unsafe", shell_payload
+        assert shell_payload["sandbox_enabled"] is False, shell_payload
+        assert shell_payload["shell_enabled"] is True, shell_payload
 
         send(
             proc,

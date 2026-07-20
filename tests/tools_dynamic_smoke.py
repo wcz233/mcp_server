@@ -67,8 +67,11 @@ def verify_tool(proc, request_id, tool_name):
 
     if tool_name == "system.shell_exec":
         result = call_tool(proc, request_id, tool_name, {"command": "echo unsafe"})
-        assert result["isError"] is True, result
-        assert "disabled" in parse_text_content(result), result
+        assert result["isError"] is False, result
+        payload = assert_json_text(result)
+        assert payload["stdout"].strip() == "unsafe", payload
+        assert payload["sandbox_enabled"] is False, payload
+        assert payload["shell_enabled"] is True, payload
         return
 
     if tool_name == "system.sandbox_ctl":

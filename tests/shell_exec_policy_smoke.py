@@ -253,9 +253,10 @@ def verify_effective_policy(client, temp_path):
     assert payload["stdout"].strip() == "smoke", payload
     assert payload["sandbox_revision"] == state["revision"], payload
 
-    state = client.update(state, overrides={"command_length": 8, "timeout_ms": 50})
+    state = client.update(state, overrides={"command_length": 8})
     marker = temp_path / "strict-request.marker"
     assert_no_spawn(client, {"command": marker_command(marker) + "123456789"}, marker, "maximum length")
+    state = client.update(state, overrides={"command_length": 65536, "timeout_ms": 50})
     for value in (None, "50", 0, 51):
         assert_no_spawn(
             client,
@@ -268,6 +269,7 @@ def verify_effective_policy(client, temp_path):
     timeout_payload = client.shell({"command": timeout_command}, expect_error=True)
     assert timeout_payload["timed_out"] is True, timeout_payload
 
+    state = client.update(state, overrides={"command_length": 8})
     state = client.update(state, sandbox_enabled=False)
     assert state["overrides"]["command_length"] == 8, state
     assert state["effective"]["command_length"] == 65536, state

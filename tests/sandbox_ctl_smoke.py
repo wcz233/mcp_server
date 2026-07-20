@@ -711,10 +711,10 @@ def verify_v2_control_state(exe, config_path, config):
         },
     )
     command = shell_command(f'type nul > "{marker}"', f"touch '{marker}'")
-    result, _ = shell_result(client, {"command": command})
-    assert result["isError"] is False, result
-    assert marker.exists(), marker
-    marker.unlink()
+    result, text = shell_result(client, {"command": command})
+    assert result["isError"] is True, result
+    assert "effective v2 policy" in text, text
+    assert not marker.exists(), marker
 
     reset = client.control(
         {"action": "reset", "token": TOKEN, "expected_revision": state["revision"]}
