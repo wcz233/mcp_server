@@ -213,6 +213,157 @@ def main():
         )
         assert state["revision"] == 0, state
 
+        old_started = json_content(
+            call_tool(
+                proc,
+                101,
+                "system.shell_start",
+                {
+                    "command": (
+                        "sleep 0.6; i=0; "
+                        'while [ "$i" -lt 300 ]; do printf o; i=$((i + 1)); done'
+                    ),
+                    "label": "old-policy-snapshot",
+                },
+            )
+        )
+        old_job_id = old_started["job_id"]
+        old_snapshot = {
+            "sandbox_revision": state["revision"],
+            "sandbox_enabled": True,
+            "shell_enabled": True,
+            "timeout_ms": 1000,
+            "output_bytes": 512,
+            "once_read_stdout_err_chunk_size": 64,
+        }
+        assert_snapshot(old_started, old_snapshot)
+
+        state = json_content(
+            call_tool(
+                proc,
+                102,
+                "system.sandbox_ctl",
+                {
+                    "action": "update",
+                    "token": TOKEN,
+                    "expected_revision": state["revision"],
+                    "overrides": {"timeout_ms": 100, "output_bytes": 256},
+                },
+            )
+        )
+        new_snapshot = {
+            "sandbox_revision": state["revision"],
+            "sandbox_enabled": True,
+            "shell_enabled": True,
+            "timeout_ms": 100,
+            "output_bytes": 256,
+            "once_read_stdout_err_chunk_size": 64,
+        }
+
+        old_poll = json_content(
+            call_tool(proc, 103, "system.shell_poll", {"job_id": old_job_id})
+        )
+        assert old_poll["state"] == "running", old_poll
+        assert_snapshot(old_poll, old_snapshot)
+        old_tail = json_content(
+            call_tool(proc, 104, "system.shell_tail", {"job_id": old_job_id})
+        )
+        assert_snapshot(old_tail, old_snapshot)
+        jobs = json_content(call_tool(proc, 105, "system.shell_list", {}))["jobs"]
+        assert_snapshot(next(job for job in jobs if job["job_id"] == old_job_id), old_snapshot)
+
+        new_started = json_content(
+            call_tool(
+                proc,
+                106,
+                "system.shell_start",
+                {
+                    "command": (
+                        'i=0; while [ "$i" -lt 300 ]; do printf n; i=$((i + 1)); done; '
+                        "sleep 1"
+                    ),
+                    "label": "new-policy-snapshot",
+                },
+            )
+        )
+        new_job_id = new_started["job_id"]
+        assert_snapshot(new_started, new_snapshot)
+        new_polled = wait_for_state(proc, new_job_id, "timed_out")
+        assert_snapshot(new_polled, new_snapshot)
+        new_wait = json_content(
+            call_tool(proc, 107, "system.shell_wait", {"job_id": new_job_id, "timeout_ms": 3000})
+        )
+        assert new_wait["wait_result"] == "finished", new_wait
+        assert_snapshot(new_wait, new_snapshot)
+        new_tail = json_content(
+            call_tool(proc, 108, "system.shell_tail", {"job_id": new_job_id})
+        )
+        assert new_tail["stdout"] == "n" * 256, new_tail
+        assert new_tail["stdout_truncated"] is True, new_tail
+        assert_snapshot(new_tail, new_snapshot)
+
+        state = json_content(
+            call_tool(
+                proc,
+                109,
+                "system.sandbox_ctl",
+                {
+                    "action": "update",
+                    "token": TOKEN,
+                    "expected_revision": state["revision"],
+                    "overrides": {"shell_enabled": False},
+                },
+            )
+        )
+        blocked_marker = temp_path / "disabled-start-marker"
+        blocked = call_tool(
+            proc,
+            110,
+            "system.shell_start",
+            {"command": f"touch {blocked_marker}"},
+        )
+        assert blocked["isError"] is True, blocked
+        assert "disabled" in blocked["content"][0]["text"], blocked
+        time.sleep(0.1)
+        assert not blocked_marker.exists(), blocked_marker
+
+        old_poll = json_content(
+            call_tool(proc, 111, "system.shell_poll", {"job_id": old_job_id})
+        )
+        assert_snapshot(old_poll, old_snapshot)
+        old_wait = json_content(
+            call_tool(proc, 112, "system.shell_wait", {"job_id": old_job_id, "timeout_ms": 3000})
+        )
+        assert old_wait["state"] == "exited" and old_wait["exit_code"] == 0, old_wait
+        assert_snapshot(old_wait, old_snapshot)
+        old_tail = json_content(
+            call_tool(proc, 113, "system.shell_tail", {"job_id": old_job_id})
+        )
+        assert old_tail["stdout"] == "o" * 300, old_tail
+        assert old_tail["stdout_truncated"] is False, old_tail
+        assert_snapshot(old_tail, old_snapshot)
+        jobs = json_content(call_tool(proc, 114, "system.shell_list", {}))["jobs"]
+        assert_snapshot(next(job for job in jobs if job["job_id"] == old_job_id), old_snapshot)
+        assert_snapshot(next(job for job in jobs if job["job_id"] == new_job_id), new_snapshot)
+
+        state = json_content(
+            call_tool(
+                proc,
+                115,
+                "system.sandbox_ctl",
+                {
+                    "action": "update",
+                    "token": TOKEN,
+                    "expected_revision": state["revision"],
+                    "overrides": {
+                        "shell_enabled": None,
+                        "timeout_ms": None,
+                        "output_bytes": None,
+                    },
+                },
+            )
+        )
+
         started = call_tool(
             proc,
             5,
