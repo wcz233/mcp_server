@@ -549,16 +549,23 @@ def main():
         time.sleep(2.2)
         assert not marker.exists(), marker
 
+        timeout_marker = temp_path / "timeout-group-marker"
+        timeout_marker.unlink(missing_ok=True)
         timed_started = json_content(
             call_tool(
                 proc,
                 27,
                 "system.shell_start",
-                {"command": "sh -c 'sleep 2'", "timeout_ms": 100},
+                {
+                    "command": f"sh -c 'sleep 2; touch {timeout_marker}'",
+                    "timeout_ms": 100,
+                },
             )
         )
         timed = wait_for_state(proc, timed_started["job_id"], "timed_out")
         assert timed["signal"] != 0, timed
+        time.sleep(2.2)
+        assert not timeout_marker.exists(), timeout_marker
 
         jobs = json_content(call_tool(proc, 28, "system.shell_list", {}))["jobs"]
         ids = {job["job_id"] for job in jobs}
