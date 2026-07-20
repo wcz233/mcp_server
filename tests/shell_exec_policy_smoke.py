@@ -7,191 +7,458 @@ import time
 from pathlib import Path
 
 
-def send(proc, payload):
-    proc.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
-    proc.stdin.flush()
-
-
-def recv(proc):
-    line = proc.stdout.readline()
-    if not line:
-        stderr = proc.stderr.read()
-        raise RuntimeError(f"server closed stdout; stderr={stderr}")
-    return json.loads(line)
-
-
-def call_tool(proc, request_id, name, arguments):
-    send(
-        proc,
-        {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "tools/call",
-            "params": {"name": name, "arguments": arguments},
-        },
-    )
-    response = recv(proc)
-    assert response["id"] == request_id, response
-    return response["result"]
-
-
-def text_content(result):
-    assert result["content"][0]["type"] == "text", result
-    return result["content"][0]["text"]
-
-
-def json_content(result):
-    return json.loads(text_content(result))
+TOKEN = "s3-token-must-not-appear-49a6f31d"
+PARENT_SECRET = "s3-parent-secret-must-not-appear-867e"
+DEFAULT_SECRET = "s3-default-secret-must-not-appear-302b"
+REQUEST_SECRET = "s3-request-secret-must-not-appear-745c"
 
 
 def shell_command(command_windows, command_unix):
     return command_windows if os.name == "nt" else command_unix
 
 
+def base_environment(config_path):
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        env = {
+            "ComSpec": os.environ.get("ComSpec", system_root + r"\System32\cmd.exe"),
+            "PATH": system_root + r"\System32;" + system_root,
+            "SystemRoot": system_root,
+            "TEMP": tempfile.gettempdir(),
+            "TMP": tempfile.gettempdir(),
+        }
+    else:
+        env = {"HOME": "/tmp", "LANG": "C", "PATH": "/usr/bin:/bin"}
+    env.update(
+        {
+            "MCP_ENABLE_SANDBOX_CTL": "1",
+            "MCP_SHELL_EXEC_CONFIG": str(config_path),
+            "S3_LAYER": "parent",
+            "S3_PARENT_ONLY": "startup-snapshot",
+            "S3_PARENT_SECRET": PARENT_SECRET,
+        }
+    )
+    return env
+
+
+def valid_config(working_directory):
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        shell_path = os.environ.get("ComSpec", system_root + r"\System32\cmd.exe")
+        shell_arg = "/C"
+        configured_env = {
+            "PATH": system_root + r"\System32;" + system_root,
+            "SystemRoot": system_root,
+        }
+    else:
+        shell_path = "/bin/sh"
+        shell_arg = "-c"
+        configured_env = {"HOME": str(working_directory), "LANG": "C", "PATH": "/usr/bin:/bin"}
+    configured_env.update(
+        {
+            "S3_DEFAULT_ONLY": "configured-default",
+            "S3_DEFAULT_SECRET": DEFAULT_SECRET,
+            "S3_LAYER": "default",
+        }
+    )
+    return {
+        "version": 2,
+        "control": {"token": TOKEN},
+        "defaults": {
+            "shell_enabled": True,
+            "command_length": 65536,
+            "timeout_ms": 300000,
+            "output_bytes": 65536,
+            "once_read_stdout_err_chunk_size": 1024,
+            "capture_stderr": True,
+            "merge_stderr_to_stdout": False,
+            "execution": {
+                "mode": "shell",
+                "shell_path": shell_path,
+                "shell_arg": shell_arg,
+                "working_directory": str(working_directory),
+                "inherit_env": True,
+                "request_cwd_allowed": True,
+                "request_env_allowed": True,
+                "kill_process_group_on_timeout": True,
+                "run_as_user": "",
+                "run_as_group": "",
+                "env": configured_env,
+            },
+            "limits": {
+                "cpu_seconds": 3600,
+                "memory_bytes": 34359738367,
+                "file_size_bytes": 17179869184,
+                "open_files": 1024,
+                "processes": 512,
+            },
+            "isolation": {"require_non_root": False},
+        },
+        "bounds": {
+            "command_length": {"min": 1, "max": 65536},
+            "timeout_ms": {"min": 1, "max": 3600000},
+            "output_bytes": {"min": 0, "max": 1048576},
+            "once_read_stdout_err_chunk_size": {"min": 64, "max": 65536},
+            "execution": {
+                "mode": {"allowed": ["shell", "exec"]},
+                "shell_path": {"min_bytes": 1, "max_bytes": 4096},
+                "shell_arg": {"min_bytes": 0, "max_bytes": 65536},
+                "working_directory": {"min_bytes": 1, "max_bytes": 4096},
+                "allowed_env": {"max_items": 1024, "item_max_bytes": 255},
+                "run_as_user": {"min_bytes": 0},
+                "run_as_group": {"min_bytes": 0},
+            },
+            "limits": {
+                "cpu_seconds": {"min": 0, "max": 3600},
+                "memory_bytes": {"min": 0, "max": 34359738367},
+                "file_size_bytes": {"min": 0, "max": 17179869184},
+                "open_files": {"min": 0, "max": 65536},
+                "processes": {"min": 0, "max": 2048},
+            },
+        },
+    }
+
+
+class Client:
+    def __init__(self, exe, config_path):
+        self.stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+        self.responses = []
+        self.next_id = 1
+        self.proc = subprocess.Popen(
+            [exe],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self.stderr_file,
+            env=base_environment(config_path),
+            text=True,
+            encoding="utf-8",
+        )
+        response = self.request(
+            "initialize",
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "shell-policy-smoke", "version": "0.3"},
+            },
+        )
+        assert response["result"]["serverInfo"]["name"] == "mcp_server", response
+        self.notify("notifications/initialized", {})
+
+    def request(self, method, params):
+        request_id = self.next_id
+        self.next_id += 1
+        self.proc.stdin.write(
+            json.dumps(
+                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        self.proc.stdin.flush()
+        line = self.proc.stdout.readline()
+        if not line:
+            self.stderr_file.seek(0)
+            raise RuntimeError(f"server closed stdout; stderr={self.stderr_file.read()}")
+        response = json.loads(line)
+        self.responses.append(response)
+        assert response["id"] == request_id, response
+        return response
+
+    def notify(self, method, params):
+        self.proc.stdin.write(
+            json.dumps({"jsonrpc": "2.0", "method": method, "params": params}, separators=(",", ":"))
+            + "\n"
+        )
+        self.proc.stdin.flush()
+
+    def call(self, name, arguments):
+        response = self.request("tools/call", {"name": name, "arguments": arguments})
+        assert "result" in response, response
+        return response["result"]
+
+    def json_call(self, name, arguments, expect_error=False):
+        result = self.call(name, arguments)
+        assert result["isError"] is expect_error, result
+        assert result["content"] and result["content"][0]["type"] == "text", result
+        return result, json.loads(result["content"][0]["text"])
+
+    def control(self, arguments, expect_error=False):
+        return self.json_call("system.sandbox_ctl", arguments, expect_error)[1]
+
+    def get(self):
+        return self.control({"action": "get", "token": TOKEN})
+
+    def update(self, state, **values):
+        return self.control(
+            {
+                "action": "update",
+                "token": TOKEN,
+                "expected_revision": state["revision"],
+                **values,
+            }
+        )
+
+    def shell(self, arguments, expect_error=False):
+        return self.json_call("system.shell_exec", arguments, expect_error)[1]
+
+    def close(self):
+        if self.proc.stdin:
+            self.proc.stdin.close()
+            self.proc.stdin = None
+        self.proc.wait(timeout=5)
+        self.stderr_file.seek(0)
+        stderr = self.stderr_file.read()
+        self.stderr_file.close()
+        assert self.proc.returncode == 0, (self.proc.returncode, stderr)
+        serialized = json.dumps(self.responses, ensure_ascii=False)
+        for secret in (TOKEN, PARENT_SECRET, DEFAULT_SECRET, REQUEST_SECRET):
+            assert secret not in serialized, secret
+            assert secret not in stderr, secret
+
+
+def assert_no_spawn(client, arguments, marker, text_fragment):
+    marker.unlink(missing_ok=True)
+    result = client.call("system.shell_exec", arguments)
+    assert result["isError"] is True, result
+    text = result["content"][0]["text"]
+    assert text_fragment in text, text
+    assert not marker.exists(), marker
+
+
+def marker_command(marker):
+    return shell_command(f'echo spawned>"{marker}"', f"touch '{marker}'")
+
+
+def env_value_command(name):
+    return shell_command(
+        f"if defined {name} (echo %{name}%) else (echo unset)",
+        f'printf \'%s\' "${{{name}-unset}}"',
+    )
+
+
+def verify_descriptor(client):
+    response = client.request("tools/list", {})
+    tool = next(item for item in response["result"]["tools"] if item["name"] == "system.shell_exec")
+    properties = tool["inputSchema"]["properties"]
+    assert properties["timeout_ms"]["minimum"] == 1, properties
+    assert properties["cwd"]["type"] == "string", properties
+    assert properties["env"]["additionalProperties"] == {"type": "string"}, properties
+
+
+def verify_effective_policy(client, temp_path):
+    state = client.get()
+    assert state["effective"]["timeout_ms"] == 300000, state
+    assert state["effective"]["limits"]["memory_bytes"] == 34359738367, state
+    payload = client.shell({"command": shell_command("echo smoke", "printf smoke")})
+    assert payload["stdout"].strip() == "smoke", payload
+    assert payload["sandbox_revision"] == state["revision"], payload
+
+    state = client.update(state, overrides={"command_length": 8, "timeout_ms": 50})
+    marker = temp_path / "strict-request.marker"
+    assert_no_spawn(client, {"command": marker_command(marker) + "123456789"}, marker, "maximum length")
+    for value in (None, "50", 0, 51):
+        assert_no_spawn(
+            client,
+            {"command": marker_command(marker), "timeout_ms": value},
+            marker,
+            "timeout_ms",
+        )
+
+    timeout_command = shell_command("ping 127.0.0.1 -n 3 >nul", "sleep 1")
+    timeout_payload = client.shell({"command": timeout_command}, expect_error=True)
+    assert timeout_payload["timed_out"] is True, timeout_payload
+
+    state = client.update(state, sandbox_enabled=False)
+    assert state["overrides"]["command_length"] == 8, state
+    assert state["effective"]["command_length"] == 65536, state
+    payload = client.shell({"command": shell_command("echo 123456789", "printf 123456789")})
+    assert payload["stdout"].strip() == "123456789", payload
+    assert payload["sandbox_enabled"] is False, payload
+
+    state = client.update(state, sandbox_enabled=True)
+    assert state["overrides"]["command_length"] == 8, state
+    assert_no_spawn(client, {"command": marker_command(marker) + "123456789"}, marker, "maximum length")
+    state = client.update(state, overrides={"command_length": 65536, "timeout_ms": 300000})
+    return state
+
+
+def verify_cwd_and_environment(client, state, temp_path):
+    requested_cwd = temp_path / "requested-cwd"
+    requested_cwd.mkdir()
+    cwd_payload = client.shell({"command": shell_command("cd", "pwd"), "cwd": str(requested_cwd)})
+    assert Path(cwd_payload["stdout"].strip()).resolve() == requested_cwd.resolve(), cwd_payload
+
+    state = client.update(state, overrides={"execution": {"request_cwd_allowed": False}})
+    marker = temp_path / "cwd-disabled.marker"
+    assert_no_spawn(
+        client,
+        {"command": marker_command(marker), "cwd": str(requested_cwd)},
+        marker,
+        "cwd",
+    )
+    state = client.update(state, overrides={"execution": {"request_cwd_allowed": True}})
+
+    assert client.shell({"command": env_value_command("S3_PARENT_ONLY")})["stdout"].strip() == "startup-snapshot"
+    assert client.shell({"command": env_value_command("S3_LAYER")})["stdout"].strip() == "default"
+    request_env = {"S3_LAYER": "request", "S3_REQUEST_ONLY": "request", "S3_REQUEST_SECRET": REQUEST_SECRET}
+    payload = client.shell({"command": env_value_command("S3_LAYER"), "env": request_env})
+    assert payload["stdout"].strip() == "request", payload
+    count_command = shell_command("set S3_LAYER", "env | grep -c '^S3_LAYER='")
+    count_payload = client.shell({"command": count_command, "env": request_env})
+    if os.name == "nt":
+        assert count_payload["stdout"].strip().lower() == "s3_layer=request", count_payload
+    else:
+        assert count_payload["stdout"].strip() == "1", count_payload
+
+    state = client.update(state, overrides={"execution": {"inherit_env": False}})
+    assert client.shell({"command": env_value_command("S3_PARENT_ONLY")})["stdout"].strip() == "unset"
+    assert client.shell({"command": env_value_command("S3_DEFAULT_ONLY")})["stdout"].strip() == "configured-default"
+
+    for item_bytes in (254, 255):
+        value = "v" * (item_bytes - len("B="))
+        client.shell({"command": shell_command("echo ok", "printf ok"), "env": {"B": value}})
+    marker = temp_path / "env-item.marker"
+    too_large = "v" * (256 - len("B="))
+    assert_no_spawn(
+        client,
+        {"command": marker_command(marker), "env": {"B": too_large}},
+        marker,
+        "environment",
+    )
+
+    base_count = state["effective"]["execution"]["env"]["items"]
+    exact_env = {f"S3_{index:04d}": "x" for index in range(1024 - base_count)}
+    client.shell({"command": shell_command("echo ok", "printf ok"), "env": exact_env})
+    overflow_env = dict(exact_env)
+    overflow_env["S3_OVERFLOW"] = "x"
+    marker = temp_path / "env-count.marker"
+    assert_no_spawn(
+        client,
+        {"command": marker_command(marker), "env": overflow_env},
+        marker,
+        "environment",
+    )
+
+    state = client.update(state, overrides={"execution": {"request_env_allowed": False}})
+    marker = temp_path / "env-disabled.marker"
+    assert_no_spawn(
+        client,
+        {"command": marker_command(marker), "env": {"S3_REQUEST_ONLY": "blocked"}},
+        marker,
+        "env",
+    )
+    return client.update(
+        state,
+        overrides={"execution": {"request_env_allowed": True, "inherit_env": True}},
+    )
+
+
+def verify_output_and_shell_arg(client, state, temp_path):
+    both_streams = shell_command("echo abcdef&echo ghijkl 1>&2", "printf abcdef; printf ghijkl >&2")
+    state = client.update(
+        state,
+        overrides={
+            "output_bytes": 0,
+            "once_read_stdout_err_chunk_size": 64,
+            "capture_stderr": True,
+            "merge_stderr_to_stdout": False,
+        },
+    )
+    payload = client.shell({"command": both_streams})
+    assert payload["stdout"] == "" and payload["stderr"] == "", payload
+    assert payload["truncated"] is True, payload
+    assert payload["stdout_truncated"] is True and payload["stderr_truncated"] is True, payload
+
+    state = client.update(state, overrides={"output_bytes": 4})
+    payload = client.shell({"command": both_streams})
+    assert len(payload["stdout"]) == 4 and len(payload["stderr"]) == 4, payload
+    assert payload["stdout_truncated"] is True and payload["stderr_truncated"] is True, payload
+
+    state = client.update(
+        state,
+        overrides={"output_bytes": 5, "capture_stderr": True, "merge_stderr_to_stdout": True},
+    )
+    payload = client.shell({"command": both_streams})
+    assert len(payload["stdout"]) == 5 and payload["stderr"] == "", payload
+    assert payload["stdout_truncated"] is True and payload["stderr_truncated"] is False, payload
+
+    state = client.update(state, overrides={"capture_stderr": False, "merge_stderr_to_stdout": True})
+    assert state["effective"]["merge_stderr_to_stdout"] is False, state
+    payload = client.shell({"command": shell_command("echo ignored 1>&2", "printf ignored >&2")})
+    assert payload["stderr"] == "" and payload["stderr_truncated"] is False, payload
+
+    probe = temp_path / "argv_probe.py"
+    probe.write_text("import sys\nprint(len(sys.argv))\n", encoding="utf-8")
+    state = client.update(
+        state,
+        overrides={
+            "output_bytes": 65536,
+            "capture_stderr": True,
+            "merge_stderr_to_stdout": False,
+            "execution": {"shell_path": sys.executable, "shell_arg": ""},
+        },
+    )
+    payload = client.shell({"command": str(probe)})
+    assert payload["stdout"].strip() == "1", payload
+
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        exec_command = system_root + r"\System32\whoami.exe"
+        default_shell_path = os.environ.get("ComSpec", system_root + r"\System32\cmd.exe")
+        default_shell_arg = "/C"
+    else:
+        exec_command = "/usr/bin/true"
+        default_shell_path = "/bin/sh"
+        default_shell_arg = "-c"
+    state = client.update(state, overrides={"execution": {"mode": "exec"}})
+    payload = client.shell({"command": exec_command})
+    assert payload["exit_code"] == 0, payload
+    state = client.update(
+        state,
+        overrides={
+            "execution": {
+                "mode": "shell",
+                "shell_path": default_shell_path,
+                "shell_arg": default_shell_arg,
+            }
+        },
+    )
+    return state
+
+
+def verify_64_bit_rlimit(client, state):
+    if os.name == "nt":
+        payload = client.shell({"command": "echo windows-limits-ignored"})
+        assert payload["stdout"].strip() == "windows-limits-ignored", payload
+        return state
+
+    state = client.update(state, overrides={"limits": {"memory_bytes": 34359738367}})
+    assert state["effective"]["limits"]["memory_bytes"] == 34359738367, state
+    payload = client.shell({"command": "ulimit -v"})
+    reported_kib = int(payload["stdout"].strip())
+    assert reported_kib * 1024 <= 34359738367, payload
+    assert 34359738367 - reported_kib * 1024 < 1024, payload
+    return state
+
+
 def main():
     exe = sys.argv[1]
-    env = os.environ.copy()
-    env["MCP_ENABLE_SHELL_EXEC"] = "1"
-    env["MCP_SHOULD_NOT_LEAK"] = "secret"
-    env.pop("MCP_ENABLE_SANDBOX_CTL", None)
-    env.pop("MCP_SANDBOX_CTL_TOKEN", None)
-    env["MCP_SHELL_EXEC_CONFIG"] = os.path.join(
-        os.path.dirname(__file__), "shell_exec_test_config.json"
-    )
-    proc = subprocess.Popen(
-        [exe],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        text=True,
-        encoding="utf-8",
-    )
-
-    try:
-        send(
-            proc,
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "shell-policy-smoke", "version": "0.1"},
-                },
-            },
+    with tempfile.TemporaryDirectory(prefix="mcp-shell-policy-") as temp_dir:
+        temp_path = Path(temp_dir)
+        config_path = temp_path / "shell_exec.json"
+        config_path.write_text(
+            json.dumps(valid_config(temp_path), separators=(",", ":")),
+            encoding="utf-8",
         )
-        recv(proc)
-        send(proc, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
-
-        ok = call_tool(
-            proc,
-            2,
-            "system.shell_exec",
-            {"command": shell_command("echo smoke", "echo smoke")},
-        )
-        assert ok["isError"] is False, ok
-        payload = json_content(ok)
-        assert payload["stdout"].strip() == "smoke", payload
-        assert payload["stderr"] == "", payload
-        assert payload["exit_code"] == 0, payload
-        assert payload["timed_out"] is False, payload
-        assert payload["truncated"] is False, payload
-
-        shell_syntax = call_tool(
-            proc,
-            3,
-            "system.shell_exec",
-            {"command": shell_command("echo smoke && echo ok", "echo smoke && echo ok")},
-        )
-        assert shell_syntax["isError"] is False, shell_syntax
-        syntax_payload = json_content(shell_syntax)
-        assert [line.strip() for line in syntax_payload["stdout"].splitlines()] == [
-            "smoke",
-            "ok",
-        ], syntax_payload
-
-        if os.name == "nt":
-            dir_payload = json_content(
-                call_tool(
-                    proc,
-                    31,
-                    "system.shell_exec",
-                    {"command": "dir"},
-                )
-            )
-            assert dir_payload["stdout"] != "", dir_payload
-            assert dir_payload["stderr"] == "", dir_payload
-            assert dir_payload["exit_code"] == 0, dir_payload
-
-        cwd = call_tool(
-            proc,
-            4,
-            "system.shell_exec",
-            {"command": shell_command("cd", "pwd")},
-        )
-        assert cwd["isError"] is False, cwd
-        cwd_payload = json_content(cwd)
-        expected_cwd = str(Path(".").resolve())
-        assert cwd_payload["stdout"].strip().lower() == expected_cwd.lower(), cwd_payload
-
-        env_clean = call_tool(
-            proc,
-            5,
-            "system.shell_exec",
-            {
-                "command": shell_command(
-                    'if defined MCP_SHOULD_NOT_LEAK (echo %MCP_SHOULD_NOT_LEAK%) else (echo unset)',
-                    'printf \'%s\' "${MCP_SHOULD_NOT_LEAK-unset}"',
-                )
-            },
-        )
-        assert env_clean["isError"] is False, env_clean
-        env_payload = json_content(env_clean)
-        assert env_payload["stdout"].strip() == "unset", env_payload
-
-        for index, timeout_value in enumerate((None, "50", 0, 5001, 300001), start=40):
-            marker = Path(tempfile.gettempdir()) / f"mcp_shell_exec_invalid_timeout_{os.getpid()}_{index}"
-            marker.unlink(missing_ok=True)
-            command = shell_command(
-                f'echo invalid>"{marker}"',
-                f"touch '{marker}'",
-            )
-            invalid_timeout = call_tool(
-                proc,
-                index,
-                "system.shell_exec",
-                {"command": command, "timeout_ms": timeout_value},
-            )
-            marker_created = marker.exists()
-            marker.unlink(missing_ok=True)
-            assert invalid_timeout["isError"] is True, invalid_timeout
-            assert "timeout_ms" in text_content(invalid_timeout), invalid_timeout
-            assert not marker_created, marker
-
-        if os.name != "nt":
-            marker = f"/tmp/mcp_shell_exec_marker_{os.getpid()}"
-            timed_out = call_tool(
-                proc,
-                6,
-                "system.shell_exec",
-                {
-                    "command": f"sh -c 'sleep 2; touch {marker}' & wait",
-                    "timeout_ms": 50,
-                },
-            )
-            assert timed_out["isError"] is True, timed_out
-            timeout_payload = json_content(timed_out)
-            assert timeout_payload["timed_out"] is True, timeout_payload
-            assert timeout_payload["signal"] != 0, timeout_payload
-            time.sleep(2.2)
-            assert not os.path.exists(marker), marker
-    finally:
-        if proc.stdin:
-            proc.stdin.close()
-        proc.wait(timeout=5)
-
+        client = Client(exe, config_path)
+        try:
+            verify_descriptor(client)
+            state = verify_effective_policy(client, temp_path)
+            state = verify_cwd_and_environment(client, state, temp_path)
+            state = verify_output_and_shell_arg(client, state, temp_path)
+            verify_64_bit_rlimit(client, state)
+        finally:
+            client.close()
     return 0
 
 

@@ -207,6 +207,11 @@ def main():
         exec_timeout = shell_exec["inputSchema"]["properties"]["timeout_ms"]
         assert exec_timeout["minimum"] == 1, exec_timeout
         assert exec_timeout["maximum"] == 300000, exec_timeout
+        exec_cwd = shell_exec["inputSchema"]["properties"]["cwd"]
+        assert exec_cwd["type"] == "string", exec_cwd
+        exec_env = shell_exec["inputSchema"]["properties"]["env"]
+        assert exec_env["type"] == "object", exec_env
+        assert exec_env["additionalProperties"] == {"type": "string"}, exec_env
         shell_start = next(tool for tool in tools if tool["name"] == "system.shell_start")
         start_properties = shell_start["inputSchema"]["properties"]
         assert start_properties["timeout_ms"]["minimum"] == 1, start_properties
