@@ -173,6 +173,8 @@ struct mcp_shell_policy_snapshot {
     size_t environment_max_items;
     size_t environment_item_max_bytes;
     enum mcp_shell_policy_source environment_source;
+    struct mcp_shell_policy_env_var *startup_env_vars;
+    size_t startup_env_var_count;
     const char *diagnostics[MCP_SHELL_POLICY_FIELD_COUNT];
 };
 

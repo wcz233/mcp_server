@@ -179,6 +179,38 @@ static int test_hard_profile(void)
     return 0;
 }
 
+static int test_start_environment_snapshot(void)
+{
+    const char *name = "MCP_S3_START_ENV_SNAPSHOT_TEST";
+    const char *initial = "initial-parent-value";
+    struct mcp_shell_policy_snapshot *snapshot = NULL;
+    size_t index;
+    bool found = false;
+
+#ifdef _WIN32
+    CHECK(_putenv_s(name, initial) == 0);
+#else
+    CHECK(setenv(name, initial, 1) == 0);
+#endif
+    CHECK(mcp_shell_policy_snapshot_create_hard(&snapshot, "(unit-hard)", false) == 0);
+    CHECK(snapshot != NULL);
+#ifdef _WIN32
+    CHECK(_putenv_s(name, "changed-parent-value") == 0);
+#else
+    CHECK(setenv(name, "changed-parent-value", 1) == 0);
+#endif
+    for (index = 0; index < snapshot->startup_env_var_count; index++) {
+        if (strcmp(snapshot->startup_env_vars[index].name, name) == 0) {
+            CHECK(strcmp(snapshot->startup_env_vars[index].value, initial) == 0);
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+    mcp_shell_policy_snapshot_destroy(snapshot);
+    return 0;
+}
+
 static int test_utf8_byte_length_fallback(void)
 {
     json_t *root = valid_root();
@@ -270,7 +302,8 @@ static int test_strict_type_rejection(void)
 int main(void)
 {
     if (test_field_directory() != 0 || test_valid_config_and_token_copy() != 0 ||
-        test_hard_profile() != 0 || test_utf8_byte_length_fallback() != 0 ||
+        test_hard_profile() != 0 || test_start_environment_snapshot() != 0 ||
+        test_utf8_byte_length_fallback() != 0 ||
         test_field_fallbacks() != 0 || test_strict_type_rejection() != 0)
         return 1;
     return 0;

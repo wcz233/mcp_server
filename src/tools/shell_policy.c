@@ -6,6 +6,9 @@
 #include <string.h>
 
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
 #define MCP_SHELL_POLICY_HARD_SHELL_PATH "cmd.exe"
 #define MCP_SHELL_POLICY_HARD_SHELL_ARG "/C"
 #define MCP_SHELL_POLICY_HARD_WORKING_DIRECTORY "."
@@ -518,6 +521,129 @@ static int policy_env_append(struct mcp_shell_policy_env_var **vars,
     return 0;
 }
 
+static bool policy_env_name_equals(const char *left, const char *right)
+{
+#ifdef _WIN32
+    return _stricmp(left, right) == 0;
+#else
+    return strcmp(left, right) == 0;
+#endif
+}
+
+static int policy_env_set(struct mcp_shell_policy_env_var **vars,
+                          size_t *count,
+                          const char *name,
+                          const char *value)
+{
+    size_t index;
+
+    for (index = 0; index < *count; index++) {
+        if (policy_env_name_equals((*vars)[index].name, name)) {
+            char *copy = policy_strdup(value);
+
+            if (!copy)
+                return -1;
+            free((*vars)[index].value);
+            (*vars)[index].value = copy;
+            return 0;
+        }
+    }
+    return policy_env_append(vars, count, name, value);
+}
+
+#ifdef _WIN32
+static char *policy_env_utf8_from_wide(const WCHAR *value, int length)
+{
+    int utf8_length;
+    char *utf8;
+
+    utf8_length = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, value, length, NULL, 0, NULL, NULL);
+    if (utf8_length <= 0)
+        return NULL;
+    utf8 = malloc((size_t)utf8_length + 1u);
+    if (!utf8)
+        return NULL;
+    if (WideCharToMultiByte(CP_UTF8,
+                            WC_ERR_INVALID_CHARS,
+                            value,
+                            length,
+                            utf8,
+                            utf8_length,
+                            NULL,
+                            NULL) != utf8_length) {
+        free(utf8);
+        return NULL;
+    }
+    utf8[utf8_length] = '\0';
+    return utf8;
+}
+#endif
+
+static int policy_capture_start_environment(struct mcp_shell_policy_snapshot *snapshot)
+{
+#ifdef _WIN32
+    LPWCH environment = GetEnvironmentStringsW();
+    const WCHAR *entry;
+
+    if (!environment)
+        return -1;
+    for (entry = environment; *entry; entry += wcslen(entry) + 1u) {
+        char *utf8;
+        char *separator;
+
+        if (*entry == L'=')
+            continue;
+        utf8 = policy_env_utf8_from_wide(entry, (int)wcslen(entry));
+        if (!utf8) {
+            FreeEnvironmentStringsW(environment);
+            return -1;
+        }
+        separator = strchr(utf8, '=');
+        if (separator && separator != utf8) {
+            *separator = '\0';
+            if (policy_env_set(&snapshot->startup_env_vars,
+                               &snapshot->startup_env_var_count,
+                               utf8,
+                               separator + 1u) != 0) {
+                free(utf8);
+                FreeEnvironmentStringsW(environment);
+                return -1;
+            }
+        }
+        free(utf8);
+    }
+    FreeEnvironmentStringsW(environment);
+#else
+    extern char **environ;
+    char **entry;
+
+    for (entry = environ; entry && *entry; entry++) {
+        const char *separator = strchr(*entry, '=');
+        size_t name_length;
+        char *name;
+
+        if (!separator || separator == *entry)
+            continue;
+        name_length = (size_t)(separator - *entry);
+        name = malloc(name_length + 1u);
+        if (!name)
+            return -1;
+        memcpy(name, *entry, name_length);
+        name[name_length] = '\0';
+        if (policy_env_set(&snapshot->startup_env_vars,
+                           &snapshot->startup_env_var_count,
+                           name,
+                           separator + 1u) != 0) {
+            free(name);
+            return -1;
+        }
+        free(name);
+    }
+#endif
+    return 0;
+}
+
 static int policy_set_hard_environment(struct mcp_shell_policy_snapshot *snapshot)
 {
 #ifdef _WIN32
@@ -624,6 +750,8 @@ int mcp_shell_policy_snapshot_create_hard(struct mcp_shell_policy_snapshot **out
             goto fail;
     }
     if (policy_set_hard_environment(snapshot) != 0)
+        goto fail;
+    if (policy_capture_start_environment(snapshot) != 0)
         goto fail;
 
     *out = snapshot;
@@ -1318,6 +1446,7 @@ void mcp_shell_policy_snapshot_destroy(struct mcp_shell_policy_snapshot *snapsho
     }
     policy_env_destroy(snapshot->defaults.execution.env_vars,
                        snapshot->defaults.execution.env_var_count);
+    policy_env_destroy(snapshot->startup_env_vars, snapshot->startup_env_var_count);
     free(snapshot);
 }
 
