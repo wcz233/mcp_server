@@ -712,12 +712,12 @@ def verify_field_fallback_diagnostics(exe, config_path, config):
     assert nested_get(state["base"], ("command_length",)) == 65536, state
     assert status["source"] == "hard_fallback", status
     assert status["bounds"] == {"min": 1, "max": 65536}, status
-    assert status["diagnostic"] == "max_exceeds_hard_max", status
+    assert status["diagnostic"] == "bound_above_hard_max", status
     assert state["diagnostics"] == [
         {
             "field": "command_length",
             "source": "hard_fallback",
-            "reason": "max_exceeds_hard_max",
+            "reason": "bound_above_hard_max",
         }
     ], state
     assert field_status(state, ("timeout_ms",))["source"] == "json", state
@@ -728,7 +728,7 @@ def verify_field_fallback_diagnostics(exe, config_path, config):
     assert nested_get(state["effective"], ("command_length",)) == 65536, state
     assert field_status(state, ("command_length",))["source"] == "runtime", state
     assert field_status(state, ("command_length",))["diagnostic"] == (
-        "max_exceeds_hard_max"
+        "bound_above_hard_max"
     ), state
     assert_error_unchanged(
         client,
