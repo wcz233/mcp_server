@@ -591,6 +591,24 @@ def verify_v2_control_state(exe, config_path, config):
             "reject_only",
             "ignored",
         }, (path, status)
+    assert field_status(state, ("shell_enabled",))["capability"] == "ignored", state
+    assert field_status(state, ("execution", "mode"))["capability"] == "ignored", state
+    if os.name == "nt":
+        assert field_status(state, ("limits", "memory_bytes"))["capability"] == (
+            "unsupported"
+        ), state
+        assert field_status(state, ("limits", "cpu_seconds"))["capability"] == (
+            "unsupported"
+        ), state
+        assert field_status(state, ("isolation", "require_non_root"))["capability"] == (
+            "reject_only"
+        ), state
+    else:
+        assert field_status(state, ("limits", "memory_bytes"))["capability"] == "ignored", state
+        assert field_status(state, ("limits", "cpu_seconds"))["capability"] == "ignored", state
+        assert field_status(state, ("isolation", "require_non_root"))["capability"] == (
+            "ignored"
+        ), state
 
     update_values = {
         ("shell_enabled",): False,
