@@ -24,6 +24,17 @@ struct capability_close_context {
     bool handler_saw_cleared;
 };
 
+static void capability_test_frame(void *arg,
+                                  unsigned int server_id,
+                                  const unsigned char *payload,
+                                  size_t len)
+{
+    (void)arg;
+    (void)server_id;
+    (void)payload;
+    (void)len;
+}
+
 static void capability_test_closed(void *arg, unsigned int server_id)
 {
     struct capability_close_context *context = arg;
@@ -71,7 +82,7 @@ static int test_capabilities_cleared_on_close(void)
     if (mcp_peer_transport_register_handler(transport,
                                             "CAPT",
                                             "capability-close-test",
-                                            NULL,
+                                            capability_test_frame,
                                             NULL,
                                             capability_test_closed,
                                             &context) != 0 ||
