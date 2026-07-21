@@ -146,6 +146,24 @@ def sha256(path):
     return h.hexdigest()
 
 
+def assert_directory_integrity(result, files_verified):
+    assert result["integrity"] == {
+        "algorithm": "sha256",
+        "status": "verified",
+        "files_verified": files_verified,
+    }, result
+
+
+def assert_file_integrity(result, path):
+    integrity = result["integrity"]
+    assert integrity == {
+        "algorithm": "sha256",
+        "status": "verified",
+        "files_verified": 1,
+        "digest": sha256(path),
+    }, result
+
+
 def assert_tree_equal(src, dst):
     for root, _, files in os.walk(src):
         rel_root = Path(root).relative_to(src)
@@ -202,8 +220,13 @@ def main():
         load_plugin(sock_a, plugin_path, 3)
         load_plugin(sock_b, plugin_path, 3)
 
-        peer_b, _ = wait_for_peer(sock_a, tcp_b, 4)
-        peer_a, _ = wait_for_peer(sock_b, tcp_a, 4)
+        tools = call(sock_a, 4, "tools/list", {})["result"]["tools"]
+        descriptions = {tool["name"]: tool["description"] for tool in tools}
+        for name in ("server.send", "server.recv"):
+            assert "whole-file SHA-256 verification" in descriptions[name], descriptions[name]
+
+        peer_b, _ = wait_for_peer(sock_a, tcp_b, 5)
+        peer_a, _ = wait_for_peer(sock_b, tcp_a, 5)
         assert peer_a > 0 and peer_b > 0
 
         src = Path(tmp) / "src"
@@ -233,6 +256,7 @@ def main():
         )
         assert send_result["files_transferred"] >= 3, send_result
         assert send_result["files_skipped"] == 0, send_result
+        assert_directory_integrity(send_result, 3)
         assert_tree_equal(src, dst / "src")
 
         send_skip = json_text(
@@ -245,6 +269,7 @@ def main():
             )
         )
         assert send_skip["files_skipped"] >= 3, send_skip
+        assert_directory_integrity(send_skip, 3)
 
         # Resume: create a partial file at the receiver and remove final file.
         target = dst / "src" / "sub" / "file2.bin"
@@ -261,6 +286,7 @@ def main():
             )
         )
         assert resume_result["bytes_transferred"] < send_result["bytes_transferred"], resume_result
+        assert_directory_integrity(resume_result, 3)
         assert_tree_equal(src, dst / "src")
 
         recv_result = json_text(
@@ -273,6 +299,7 @@ def main():
             )
         )
         assert recv_result["files_transferred"] >= 3, recv_result
+        assert_directory_integrity(recv_result, 3)
         assert_tree_equal(dst, pull / "dst")
 
         send_file_result = json_text(
@@ -285,6 +312,7 @@ def main():
             )
         )
         assert send_file_result["files_transferred"] == 1, send_file_result
+        assert_file_integrity(send_file_result, file_src_dir / "single.txt")
         assert (Path(tmp) / "single.txt").read_text(encoding="utf-8") == "single\n"
 
         recv_file_result = json_text(
@@ -297,7 +325,28 @@ def main():
             )
         )
         assert recv_file_result["files_transferred"] == 1, recv_file_result
+        assert_file_integrity(recv_file_result, remote_fetch_dir / "fetched.txt")
         assert (Path(tmp) / "fetched.txt").read_bytes() == fetched_bytes
+
+        empty_src = file_src_dir / "empty.bin"
+        empty_target = Path(tmp) / "empty-target.bin"
+        empty_src.write_bytes(b"")
+        empty_result = json_text(
+            call_tool(
+                sock_a,
+                21,
+                "server.send",
+                {
+                    "server_id": peer_b,
+                    "local_path": str(empty_src),
+                    "remote_path": str(empty_target),
+                },
+                timeout=15.0,
+            )
+        )
+        assert empty_result["files_transferred"] == 1, empty_result
+        assert_file_integrity(empty_result, empty_src)
+        assert empty_target.read_bytes() == b""
 
         missing_recv = call_tool(
             sock_a,
@@ -381,6 +430,7 @@ def main():
         assert resume_large["files_transferred"] == 1, resume_large
         assert resume_large["bytes_total"] == resume_size, resume_large
         assert resume_large["bytes_transferred"] == resume_tail_size, resume_large
+        assert_file_integrity(resume_large, resume_src)
         assert sha256(resume_src) == sha256(resume_target)
         assert not resume_part.exists(), resume_part
 

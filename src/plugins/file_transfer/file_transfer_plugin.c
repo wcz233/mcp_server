@@ -821,6 +821,18 @@ static bool manifest_is_single_file_root(struct manifest_entry *entries, size_t 
            strcmp(entries[0].relpath, ".") == 0;
 }
 
+static unsigned int manifest_file_count(struct manifest_entry *entries, size_t count)
+{
+    unsigned int files = 0;
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        if (entries[i].type == 'f')
+            files++;
+    }
+    return files;
+}
+
 enum mft_path_separator_mode {
     MFT_PATH_SEPARATOR_POSIX = 0,
     MFT_PATH_SEPARATOR_WINDOWS = 1,
@@ -2899,6 +2911,8 @@ static int send_summary(const char *invocation_id,
                         size_t files_total,
                         unsigned int files_transferred,
                         unsigned int files_skipped,
+                        unsigned int files_verified,
+                        const char *digest,
                         uint64_t bytes_total,
                         uint64_t bytes_transferred,
                         unsigned long long started_ms)
@@ -2926,11 +2940,32 @@ static int send_summary(const char *invocation_id,
                                 "duration_ms",
                                 (json_int_t)(now - started_ms),
                                 "errors");
+    json_t *integrity = digest ?
+                            json_pack("{s:s,s:s,s:i,s:s}",
+                                      "algorithm",
+                                      "sha256",
+                                      "status",
+                                      "verified",
+                                      "files_verified",
+                                      (int)files_verified,
+                                      "digest",
+                                      digest) :
+                            json_pack("{s:s,s:s,s:i}",
+                                      "algorithm",
+                                      "sha256",
+                                      "status",
+                                      "verified",
+                                      "files_verified",
+                                      (int)files_verified);
     char *dump;
     int rc;
 
-    if (!summary)
+    if (!summary || !integrity || json_object_set(summary, "integrity", integrity) != 0) {
+        json_decref(integrity);
+        json_decref(summary);
         return -1;
+    }
+    json_decref(integrity);
     dump = json_dumps(summary, JSON_COMPACT | JSON_ENSURE_ASCII);
     rc = dump ? g_plugin.host->complete_async_ok(g_plugin.host->host_context,
                                                  invocation_id,
@@ -4788,6 +4823,9 @@ static void finalize_receive_after_work(uv_work_t *req, int status)
                      ctx->entry_count,
                      ctx->finalize_files_transferred,
                      ctx->finalize_files_skipped,
+                     manifest_file_count(ctx->entries, ctx->entry_count),
+                     manifest_is_single_file_root(ctx->entries, ctx->entry_count) ?
+                         ctx->entries[0].hash : NULL,
                      ctx->finalize_bytes_total,
                      ctx->finalize_bytes_transferred,
                      ctx->started_ms);
@@ -4838,6 +4876,8 @@ static void handle_complete(unsigned int server_id, json_t *payload)
     size_t summary_files_total = 0;
     unsigned int summary_files_transferred = 0;
     unsigned int summary_files_skipped = 0;
+    unsigned int summary_files_verified = 0;
+    char summary_digest[65] = "";
     uint64_t summary_bytes_total = 0;
     uint64_t summary_bytes_transferred = 0;
     unsigned long long summary_started_ms = 0;
@@ -4926,6 +4966,9 @@ static void handle_complete(unsigned int server_id, json_t *payload)
         summary_files_total = ctx->entry_count;
         summary_files_transferred = files_transferred;
         summary_files_skipped = files_skipped;
+        summary_files_verified = manifest_file_count(ctx->entries, ctx->entry_count);
+        if (manifest_is_single_file_root(ctx->entries, ctx->entry_count))
+            snprintf(summary_digest, sizeof(summary_digest), "%s", ctx->entries[0].hash);
         summary_bytes_total = bytes_total;
         summary_bytes_transferred = bytes_transferred;
         summary_started_ms = ctx->started_ms;
@@ -4942,6 +4985,8 @@ static void handle_complete(unsigned int server_id, json_t *payload)
                      summary_files_total,
                      summary_files_transferred,
                      summary_files_skipped,
+                     summary_files_verified,
+                     summary_digest[0] ? summary_digest : NULL,
                      summary_bytes_total,
                      summary_bytes_transferred,
                      summary_started_ms);
@@ -5055,7 +5100,8 @@ static int register_tools(void)
         "\"required\":[\"server_id\",\"local_path\",\"remote_path\"]}";
     struct mcp_plugin_tool_descriptor send_desc = {
         "server.send",
-        "Send a local file or directory to a discovered MCP server through MFT1.",
+        "Send a local file or directory to a discovered MCP server through MFT1. "
+        "Success is returned only after whole-file SHA-256 verification by the receiver.",
         schema,
         "file_transfer_plugin",
         "1.0",
@@ -5069,7 +5115,8 @@ static int register_tools(void)
     };
     struct mcp_plugin_tool_descriptor recv_desc = {
         "server.recv",
-        "Receive a remote file or directory from a discovered MCP server through MFT1.",
+        "Receive a remote file or directory from a discovered MCP server through MFT1. "
+        "Success is returned only after whole-file SHA-256 verification by the receiver.",
         schema,
         "file_transfer_plugin",
         "1.0",
