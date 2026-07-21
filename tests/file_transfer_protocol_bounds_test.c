@@ -178,6 +178,9 @@ cleanup:
 struct frame_capture {
     unsigned int calls;
     uint32_t payload_len;
+    unsigned char frame_type;
+    size_t json_len;
+    char json[256];
 };
 
 static int capture_frame(void *host_context,
@@ -186,12 +189,75 @@ static int capture_frame(void *host_context,
                          uint32_t payload_len)
 {
     struct frame_capture *capture = host_context;
+    const unsigned char *frame = payload;
+    size_t json_len = payload_len >= 8 ? payload_len - 8u : 0;
 
     (void)server_id;
-    (void)payload;
     capture->calls++;
     capture->payload_len = payload_len;
+    if (payload_len < 8)
+        return 0;
+    capture->frame_type = frame[5];
+    if (json_len >= sizeof(capture->json))
+        json_len = sizeof(capture->json) - 1u;
+    memcpy(capture->json, frame + 8, json_len);
+    capture->json[json_len] = '\0';
+    capture->json_len = json_len;
     return 0;
+}
+
+static int test_invalid_offer_abort(void)
+{
+    struct frame_capture capture = {0};
+    struct mcp_plugin_host_api host = {0};
+    json_t *manifest = make_file_manifest(1);
+    json_t *payload = NULL;
+    json_t *abort = NULL;
+    json_t *abort_id;
+    json_t *abort_message;
+    json_t *item;
+    json_t *block;
+    int rc = -1;
+
+    if (!manifest)
+        return -1;
+    item = json_array_get(json_object_get(manifest, "entries"), 0);
+    block = json_array_get(json_object_get(item, "blocks"), 0);
+    if (json_object_set_new(block, "hash", json_string("2087b8be")) != 0)
+        goto cleanup;
+    payload = json_pack("{s:s,s:s,s:O}",
+                        "transfer_id",
+                        "invalid-manifest-offer",
+                        "remote_path",
+                        ".",
+                        "manifest",
+                        manifest);
+    if (!payload)
+        goto cleanup;
+
+    host.host_context = &capture;
+    host.peer_transport_send_frame = capture_frame;
+    g_plugin.host = &host;
+    handle_offer(17, payload);
+    if (capture.calls != 1 || capture.frame_type != MFT_FRAME_ABORT)
+        goto cleanup;
+    abort = json_loadb(capture.json, capture.json_len, JSON_REJECT_DUPLICATES, NULL);
+    if (!abort)
+        goto cleanup;
+    abort_id = json_object_get(abort, "transfer_id");
+    abort_message = json_object_get(abort, "message");
+    if (!json_is_string(abort_id) || !json_is_string(abort_message) ||
+        strcmp(json_string_value(abort_id), "invalid-manifest-offer") != 0 ||
+        strcmp(json_string_value(abort_message), "Invalid file transfer manifest.") != 0)
+        goto cleanup;
+    rc = 0;
+
+cleanup:
+    g_plugin.host = NULL;
+    json_decref(abort);
+    json_decref(payload);
+    json_decref(manifest);
+    return rc;
 }
 
 static json_t *make_sized_payload(size_t text_len)
@@ -504,6 +570,7 @@ static int test_accept_bounds(void)
 int main(void)
 {
     if (test_outgoing_frame_bound() != 0 ||
+        test_invalid_offer_abort() != 0 ||
         test_crc32_contract() != 0 ||
         test_frame_bounds() != 0 ||
         test_manifest_count_bounds() != 0 ||
