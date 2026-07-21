@@ -201,13 +201,22 @@ def wait_for_udp(sock, deadline):
 
 
 class FakePeer:
-    def __init__(self, tcp_port, respond_to_ping, support_data_channel=False):
+    def __init__(
+        self,
+        tcp_port,
+        respond_to_ping,
+        support_data_channel=False,
+        duplicate_initialize_response=False,
+    ):
         self.tcp_port = tcp_port
         self.respond_to_ping = respond_to_ping
         self.support_data_channel = support_data_channel
+        self.duplicate_initialize_response = duplicate_initialize_response
         self.heartbeats = []
         self.data_connections = 0
         self.control_data_frames = 0
+        self.hello_frames = 0
+        self.protocol_events = []
         self.hello_seen = threading.Event()
         self.data_link_failed = threading.Event()
         self._lock = threading.Lock()
@@ -231,6 +240,13 @@ class FakePeer:
             pass
         self._thread.join(timeout=2)
         self._listener.close()
+
+    def assert_initialized_before_hello(self):
+        with self._lock:
+            events = list(self.protocol_events)
+            hello_frames = self.hello_frames
+        assert events[:3] == ["initialize", "initialized", "hello"], events
+        assert hello_frames == 2, (hello_frames, events)
 
     def _run(self):
         while not self._stop.is_set():
@@ -258,6 +274,9 @@ class FakePeer:
                     frame_type = payload[5]
                     if frame_type == 1:
                         hello = json.loads(payload[8:].decode("utf-8"))
+                        with self._lock:
+                            self.hello_frames += 1
+                            self.protocol_events.append("hello")
                         if self.support_data_channel:
                             assert "mft.v1.data_channel" in hello.get("capabilities", []), hello
                             self.hello_seen.set()
@@ -312,20 +331,26 @@ class FakePeer:
                 if request.get("method") == "initialize":
                     identity = request.get("params", {}).get("mcp_peer_identity", {})
                     data_channel = identity.get("data_channel") is True
+                    if not data_channel:
+                        with self._lock:
+                            self.protocol_events.append("initialize")
                     if data_channel:
                         with self._lock:
                             self.data_connections += 1
                             data_index = self.data_connections
                         if data_index > 1:
                             continue
-                    send_frame(
-                        conn,
-                        {
-                            "jsonrpc": "2.0",
-                            "id": request["id"],
-                            "result": {},
-                        },
-                    )
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {},
+                    }
+                    send_frame(conn, response)
+                    if not data_channel:
+                        with self._lock:
+                            self.protocol_events.append("initialized")
+                        if self.duplicate_initialize_response:
+                            send_frame(conn, response)
                     continue
                 if request.get("method") != "ping":
                     continue
@@ -377,6 +402,7 @@ def main():
         fake_tcp_online,
         respond_to_ping=True,
         support_data_channel=file_transfer_mode != "n",
+        duplicate_initialize_response=True,
     )
     timeout_peer = FakePeer(fake_tcp_timeout, respond_to_ping=False)
     online_peer.start()
@@ -421,6 +447,35 @@ def main():
         assert online_peer.heartbeats[-1] - online_peer.heartbeats[0] >= 0.8, online_peer.heartbeats
         if file_transfer_mode != "n":
             assert online_peer.hello_seen.wait(2), "missing MFT1 data-channel negotiation"
+            online_peer.assert_initialized_before_hello()
+
+            online_peer.close()
+            online_peer = FakePeer(
+                fake_tcp_online,
+                respond_to_ping=True,
+                support_data_channel=True,
+                duplicate_initialize_response=True,
+            )
+            online_peer.start()
+            udp_sock.sendto(
+                udp_packet("fake-online-restarted", fake_tcp_online),
+                ("127.0.0.1", discovery_server),
+            )
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                payload = call_tool(sock, 23, "server.list_servers", {"wait_ms": 100})
+                peer = peer_entry(payload, fake_tcp_online)
+                if (
+                    peer
+                    and peer["state"] == "online"
+                    and peer["tcp_connected"] is True
+                    and online_peer.hello_seen.wait(0.1)
+                ):
+                    break
+                time.sleep(0.1)
+            assert peer and peer["state"] == "online" and peer["tcp_connected"] is True, payload
+            assert online_peer.hello_seen.is_set(), "missing MFT1 negotiation after peer restart"
+            online_peer.assert_initialized_before_hello()
 
             with tempfile.NamedTemporaryFile(delete=False) as transfer_file:
                 transfer_file.write(b"d" * (1024 * 1024))
