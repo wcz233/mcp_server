@@ -206,6 +206,28 @@ static void unlink_connection(struct mcp_peer_connection *conn)
     }
 }
 
+static void clear_peer_capabilities(struct mcp_peer_transport *transport,
+                                    unsigned int server_id)
+{
+    struct peer_capability **current;
+
+    if (!transport || server_id == 0)
+        return;
+
+    current = &transport->capabilities;
+    while (*current) {
+        struct peer_capability *capability = *current;
+
+        if (capability->server_id == server_id) {
+            *current = capability->next;
+            free(capability->name);
+            free(capability);
+            continue;
+        }
+        current = &capability->next;
+    }
+}
+
 static void notify_peer_closed(struct mcp_peer_connection *conn)
 {
     struct peer_handler *handler;
@@ -214,6 +236,7 @@ static void notify_peer_closed(struct mcp_peer_connection *conn)
         return;
 
     conn->close_notified = true;
+    clear_peer_capabilities(conn->transport, conn->server_id);
     for (handler = conn->transport->handlers; handler; handler = handler->next) {
         if (handler->on_peer_closed)
             handler->on_peer_closed(handler->arg, conn->server_id);
@@ -231,6 +254,7 @@ void mcp_peer_transport_notify_closed(struct mcp_peer_transport *transport,
     if (!transport || server_id == 0)
         return;
 
+    clear_peer_capabilities(transport, server_id);
     current = &transport->external_peers;
     while (*current) {
         struct external_peer *peer = *current;
