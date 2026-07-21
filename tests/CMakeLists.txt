@@ -125,11 +125,13 @@ add_test(
 
 add_executable(mcp_file_transfer_negotiation_test
     file_transfer_negotiation_test.c
+    "${PROJECT_SOURCE_DIR}/src/transport/peer_transport.c"
 )
 
 target_include_directories(mcp_file_transfer_negotiation_test
     PRIVATE
         "${PROJECT_SOURCE_DIR}/include"
+        "${PROJECT_SOURCE_DIR}/src"
 )
 
 target_compile_definitions(mcp_file_transfer_negotiation_test

@@ -1,5 +1,6 @@
 #define MCP_FILE_TRANSFER_PLUGIN_BUILTIN 1
 #include "../src/plugins/file_transfer/file_transfer_plugin.c"
+#include "transport/peer_transport.h"
 
 #include <stdio.h>
 
@@ -14,6 +15,105 @@ struct negotiation_test_context {
     unsigned int errors;
     char last_error[128];
 };
+
+struct capability_close_context {
+    struct mcp_peer_transport *transport;
+    unsigned int target_server_id;
+    unsigned int other_server_id;
+    unsigned int close_calls;
+    bool handler_saw_cleared;
+};
+
+static void capability_test_closed(void *arg, unsigned int server_id)
+{
+    struct capability_close_context *context = arg;
+
+    if (server_id != context->target_server_id)
+        return;
+    context->close_calls++;
+    context->handler_saw_cleared =
+        !mcp_peer_transport_has_capability(context->transport,
+                                           server_id,
+                                           MFT_CAP_BLOCK_ACK) &&
+        !mcp_peer_transport_has_capability(context->transport,
+                                           server_id,
+                                           MFT_CAP_CRC32) &&
+        mcp_peer_transport_has_capability(context->transport,
+                                          context->other_server_id,
+                                          MFT_CAP_BLOCK_ACK);
+}
+
+static void direct_connect_closed(void *arg,
+                                  struct mcp_peer_connection *conn,
+                                  int status)
+{
+    (void)arg;
+    if (status == 0)
+        mcp_peer_connection_close(conn);
+}
+
+static int test_capabilities_cleared_on_close(void)
+{
+    uv_loop_t loop;
+    struct mcp_peer_transport *transport = NULL;
+    struct capability_close_context context = {0};
+    struct sockaddr_in addr;
+    int rc = -1;
+
+    if (uv_loop_init(&loop) != 0)
+        return -1;
+    if (mcp_peer_transport_create(&transport, &loop, 1024, 0) != 0)
+        goto cleanup_loop;
+
+    context.transport = transport;
+    context.target_server_id = 7;
+    context.other_server_id = 8;
+    if (mcp_peer_transport_register_handler(transport,
+                                            "CAPT",
+                                            "capability-close-test",
+                                            NULL,
+                                            NULL,
+                                            capability_test_closed,
+                                            &context) != 0 ||
+        mcp_peer_transport_set_capability(transport, 7, MFT_CAP_BLOCK_ACK, true) != 0 ||
+        mcp_peer_transport_set_capability(transport, 7, MFT_CAP_CRC32, true) != 0 ||
+        mcp_peer_transport_set_capability(transport, 8, MFT_CAP_BLOCK_ACK, true) != 0)
+        goto cleanup_transport;
+
+    mcp_peer_transport_notify_connected(transport, 7);
+    mcp_peer_transport_notify_closed(transport, 7);
+    if (context.close_calls != 1 || !context.handler_saw_cleared ||
+        mcp_peer_transport_has_capability(transport, 7, MFT_CAP_BLOCK_ACK) ||
+        mcp_peer_transport_has_capability(transport, 7, MFT_CAP_CRC32) ||
+        !mcp_peer_transport_has_capability(transport, 8, MFT_CAP_BLOCK_ACK))
+        goto cleanup_transport;
+    mcp_peer_transport_notify_closed(transport, 7);
+    if (mcp_peer_transport_has_capability(transport, 7, MFT_CAP_BLOCK_ACK) ||
+        !mcp_peer_transport_has_capability(transport, 8, MFT_CAP_BLOCK_ACK))
+        goto cleanup_transport;
+
+    if (mcp_peer_transport_set_capability(transport, 9, MFT_CAP_BLOCK_ACK, true) != 0 ||
+        uv_ip4_addr("127.0.0.1", 0, &addr) != 0)
+        goto cleanup_transport;
+    (void)mcp_peer_transport_connect(transport,
+                                     9,
+                                     (const struct sockaddr *)&addr,
+                                     NULL,
+                                     direct_connect_closed);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    if (mcp_peer_transport_has_capability(transport, 9, MFT_CAP_BLOCK_ACK) ||
+        !mcp_peer_transport_has_capability(transport, 8, MFT_CAP_BLOCK_ACK))
+        goto cleanup_transport;
+
+    rc = 0;
+
+cleanup_transport:
+    mcp_peer_transport_destroy(transport);
+cleanup_loop:
+    if (uv_loop_close(&loop) != 0)
+        rc = -1;
+    return rc;
+}
 
 static unsigned long long negotiation_test_now_ms(void *host_context)
 {
@@ -120,6 +220,9 @@ int main(void)
     json_t *hello = NULL;
     unsigned long long next_deadline = 0;
     int rc = 1;
+
+    if (test_capabilities_cleared_on_close() != 0)
+        goto cleanup;
 
     context.now_ms = 1000;
     host.host_context = &context;
