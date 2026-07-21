@@ -85,6 +85,7 @@ struct discovery_peer_conn {
     bool closing;
     bool mcp_initialize_sent;
     bool mcp_initialized;
+    bool peer_notified;
     bool data_channel;
     char *rx_buf;
     size_t rx_len;
@@ -921,11 +922,8 @@ static void peer_connect_cb(uv_connect_t *req, int status)
     }
 
     conn->connected = true;
-    if (!conn->data_channel) {
+    if (!conn->data_channel)
         peer_mark_heartbeat_ok(conn->peer);
-        mcp_peer_transport_notify_connected(conn->discovery->server->peer_transport,
-                                            conn->peer->server_id);
-    }
     if (uv_read_start((uv_stream_t *)&conn->tcp, peer_conn_alloc_cb, peer_conn_read_cb) != 0)
         peer_conn_fail(conn);
     else if (peer_send_initialize(conn) != 0)
@@ -1430,6 +1428,12 @@ static bool peer_handle_initialize_response(struct discovery_peer_conn *conn, js
         conn->mcp_initialized = true;
         peer_send_initialized_notification(conn);
         if (!conn->data_channel) {
+            if (!conn->peer_notified) {
+                conn->peer_notified = true;
+                mcp_peer_transport_notify_connected(
+                    conn->discovery->server->peer_transport,
+                    conn->peer->server_id);
+            }
             peer_mark_heartbeat_ok(conn->peer);
             peer_send_pending_proxies(conn);
         }
@@ -1731,7 +1735,6 @@ unsigned int mcp_server_discovery_note_peer_identity(struct mcp_server_discovery
     if (!peer)
         return 0;
 
-    mcp_peer_transport_notify_connected(discovery->server->peer_transport, peer->server_id);
     return peer->server_id;
 }
 
