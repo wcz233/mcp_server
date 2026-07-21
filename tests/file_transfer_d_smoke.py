@@ -99,6 +99,17 @@ def start_server(exe, tcp_port, discovery_port, peer_discovery_port, cwd):
     )
 
 
+def stop_server(proc):
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
 def initialize(sock, name):
     init = call(
         sock,
@@ -133,6 +144,29 @@ def wait_for_peer(sock, tcp_port, start_id):
                 return server["server_id"], request_id
         time.sleep(0.1)
     raise AssertionError(f"peer not connected: {last_payload}")
+
+
+def wait_for_peer_disconnect(sock, tcp_port, start_id):
+    request_id = start_id
+    deadline = time.time() + 8
+    last_payload = None
+    while time.time() < deadline:
+        last_payload = json_text(
+            call_tool(sock, request_id, "server.list_servers", {"wait_ms": 100})
+        )
+        request_id += 1
+        server = next(
+            (
+                entry
+                for entry in last_payload["servers"]
+                if entry["address"] == f"127.0.0.1:{tcp_port}"
+            ),
+            None,
+        )
+        if not server or not server["tcp_connected"]:
+            return request_id
+        time.sleep(0.1)
+    raise AssertionError(f"peer did not disconnect: {last_payload}")
 
 
 def sha256(path):
@@ -210,6 +244,7 @@ def main():
     sock_b = None
 
     try:
+        proc_a_pid = proc_a.pid
         sock_a = wait_for_tcp(tcp_a, proc_a)
         sock_b = wait_for_tcp(tcp_b, proc_b)
         initialize(sock_a, "mft-a")
@@ -258,6 +293,68 @@ def main():
         assert send_result["files_skipped"] == 0, send_result
         assert_directory_integrity(send_result, 3)
         assert_tree_equal(src, dst / "src")
+
+        sock_b.close()
+        sock_b = None
+        stop_server(proc_b)
+        next_request_id = wait_for_peer_disconnect(sock_a, tcp_b, 40)
+        proc_b = start_server(exe, tcp_b, discovery_b, discovery_a, tmp)
+        sock_b = wait_for_tcp(tcp_b, proc_b)
+        initialize(sock_b, "mft-b-restarted")
+        call(sock_b, 2, "tools/list", {})
+        load_plugin(sock_b, plugin_path, 3)
+
+        peer_b, next_request_id = wait_for_peer(sock_a, tcp_b, next_request_id)
+        peer_a, _ = wait_for_peer(sock_b, tcp_a, 5)
+        assert proc_a.pid == proc_a_pid and proc_a.poll() is None
+        assert peer_a > 0 and peer_b > 0
+
+        restart_src = file_src_dir / "restart-203.bin"
+        restart_target = Path(tmp) / "restart-target.bin"
+        restart_pull = Path(tmp) / "restart-pull"
+        restart_part = Path(str(restart_target) + ".part")
+        restart_src.write_bytes(bytes(range(203)))
+        restart_pull.mkdir()
+        restart_send = json_text(
+            call_tool(
+                sock_a,
+                50,
+                "server.send",
+                {
+                    "server_id": peer_b,
+                    "local_path": str(restart_src),
+                    "remote_path": str(restart_target),
+                    "timeout_ms": 10000,
+                },
+                timeout=15.0,
+            )
+        )
+        assert restart_send["files_transferred"] == 1, restart_send
+        assert_file_integrity(restart_send, restart_src)
+        assert restart_target.stat().st_size == restart_src.stat().st_size
+        assert sha256(restart_target) == sha256(restart_src)
+        assert not restart_part.exists(), restart_part
+
+        restart_recv = json_text(
+            call_tool(
+                sock_a,
+                51,
+                "server.recv",
+                {
+                    "server_id": peer_b,
+                    "remote_path": str(restart_target),
+                    "local_path": str(restart_pull),
+                    "timeout_ms": 10000,
+                },
+                timeout=15.0,
+            )
+        )
+        restart_pulled = restart_pull / restart_target.name
+        assert restart_recv["files_transferred"] == 1, restart_recv
+        assert_file_integrity(restart_recv, restart_target)
+        assert restart_pulled.stat().st_size == restart_target.stat().st_size
+        assert sha256(restart_pulled) == sha256(restart_target)
+        assert not Path(str(restart_pulled) + ".part").exists()
 
         send_skip = json_text(
             call_tool(
@@ -489,12 +586,7 @@ def main():
             if sock:
                 sock.close()
         for proc in (proc_a, proc_b):
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
+            stop_server(proc)
         shutil.rmtree(tmp, ignore_errors=True)
 
     return 0
