@@ -4280,6 +4280,44 @@ static void resume_pending_negotiations(struct pending_negotiation *pending)
     }
 }
 
+static char *copy_offer_transfer_id(json_t *transfer_id)
+{
+    const char *value;
+    size_t len;
+    char *copy;
+
+    if (!json_is_string(transfer_id))
+        return NULL;
+    value = json_string_value(transfer_id);
+    len = json_string_length(transfer_id);
+    if (!value || len == 0 || len >= 256u || strlen(value) != len)
+        return NULL;
+    copy = malloc(len + 1u);
+    if (!copy)
+        return NULL;
+    memcpy(copy, value, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+static void log_offer_rejection(unsigned int server_id,
+                                const char *stage,
+                                const char *error)
+{
+    char message[192];
+
+    if (!g_plugin.host || !g_plugin.host->log_error)
+        return;
+    snprintf(message,
+             sizeof(message),
+             "mft reject offer server=%u type=%u stage=%s error=%s",
+             server_id,
+             (unsigned int)MFT_FRAME_OFFER,
+             stage,
+             error);
+    g_plugin.host->log_error(g_plugin.host->host_context, message);
+}
+
 static void handle_offer(unsigned int server_id, json_t *payload)
 {
     json_t *transfer_id = json_object_get(payload, "transfer_id");
@@ -4297,14 +4335,24 @@ static void handle_offer(unsigned int server_id, json_t *payload)
         g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
                                                      server_id,
                                                      MFT_CAP_CRC32);
-    char *transfer_id_value = NULL;
+    char *transfer_id_value = copy_offer_transfer_id(transfer_id);
 
-    if (!json_is_string(transfer_id) || !json_is_string(remote_path) ||
-        manifest_to_entries(manifest, crc32_enabled, &entries, &count) != 0)
-        return;
-    transfer_id_value = mft_strdup(json_string_value(transfer_id));
     if (!transfer_id_value) {
-        free_entries(entries, count);
+        log_offer_rejection(server_id, "transfer_id", "invalid_transfer_id");
+        return;
+    }
+    if (!json_is_string(remote_path)) {
+        log_offer_rejection(server_id, "remote_path", "invalid_remote_path");
+        send_abort_frame(server_id, transfer_id_value, "Invalid file transfer offer.");
+        free(transfer_id_value);
+        return;
+    }
+    if (manifest_to_entries(manifest, crc32_enabled, &entries, &count) != 0) {
+        log_offer_rejection(server_id, "manifest", "invalid_manifest");
+        send_abort_frame(server_id,
+                         transfer_id_value,
+                         "Invalid file transfer manifest.");
+        free(transfer_id_value);
         return;
     }
 
@@ -4326,6 +4374,7 @@ static void handle_offer(unsigned int server_id, json_t *payload)
         source_name_value = ctx->source_name;
     if (source_name_value &&
         (strcmp(source_name_value, ".") == 0 || !path_is_safe_rel(source_name_value))) {
+        log_offer_rejection(server_id, "source_name", "invalid_source_name");
         free_entries(entries, count);
         if (ctx) {
             unlink_transfer(ctx);
@@ -4349,6 +4398,7 @@ static void handle_offer(unsigned int server_id, json_t *payload)
                              source_name_value,
                              entries,
                              count) != 0) {
+        log_offer_rejection(server_id, "target_path", "invalid_target_path");
         free_entries(entries, count);
         if (ctx) {
             unlink_transfer(ctx);
