@@ -2297,36 +2297,63 @@ int mcp_server_discovery_list_async(struct mcp_server_discovery *discovery,
     return 0;
 }
 
+static json_t *build_system_status_summary(json_t *status)
+{
+    static const char *fields[] = {
+        "hostname",
+        "os",
+        "machine",
+        "memory_total_bytes",
+        "memory_available_bytes",
+        "commands",
+    };
+    json_t *summary = json_object();
+    size_t i;
+
+    if (!summary)
+        return NULL;
+    if (!json_is_object(status))
+        return summary;
+
+    for (i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        json_t *value = json_object_get(status, fields[i]);
+
+        if (value)
+            json_object_set(summary, fields[i], value);
+    }
+
+    return summary;
+}
+
 static json_t *build_server_entry(const char *scope,
                                   unsigned int server_id,
                                   const char *address,
-                                  const char *ip,
                                   unsigned int port,
                                   const char *state,
                                   bool tcp_connected,
                                   unsigned long long last_seen_ms,
-                                  json_t *status,
-                                  json_t *tools_list)
+                                  json_t *status)
 {
     json_t *entry = json_object();
+    json_t *status_summary;
 
     if (!entry)
         return NULL;
 
+    status_summary = build_system_status_summary(status);
+    if (!status_summary) {
+        json_decref(entry);
+        return NULL;
+    }
+
     json_object_set_new(entry, "server_id", json_integer((json_int_t)server_id));
     json_object_set_new(entry, "address", json_string(address));
-    json_object_set_new(entry, "ip", json_string(ip));
     json_object_set_new(entry, "port", json_integer((json_int_t)port));
     json_object_set_new(entry, "scope", json_string(scope));
     json_object_set_new(entry, "state", json_string(state));
     json_object_set_new(entry, "tcp_connected", json_boolean(tcp_connected));
     json_object_set_new(entry, "last_seen_ms", json_integer((json_int_t)last_seen_ms));
-    if (status)
-        json_object_set(entry, "system_status", status);
-    else
-        json_object_set_new(entry, "system_status", json_object());
-    if (tools_list)
-        json_object_set(entry, "tools_list", tools_list);
+    json_object_set_new(entry, "system_status", status_summary);
 
     return entry;
 }
@@ -2347,13 +2374,11 @@ static json_t *build_local_server_entry(struct mcp_server_discovery *discovery)
     entry = build_server_entry("local",
                                0,
                                address,
-                               ip,
                                discovery->tcp_port,
                                "online",
                                true,
                                mcp_now_ms(),
-                               status,
-                               NULL);
+                               status);
     json_decref(status);
     free(address);
     return entry;
@@ -2383,13 +2408,11 @@ json_t *mcp_server_discovery_snapshot_json(struct mcp_server_discovery *discover
         entry = build_server_entry("remote",
                                    peer->server_id,
                                    peer->id,
-                                   peer->ip,
                                    peer->port,
                                    peer_state_name(peer->state),
                                    peer->conn && peer->conn->connected,
                                    peer->last_seen_ms,
-                                   peer->status,
-                                   peer->tools_list);
+                                   peer->status);
         if (!entry)
             goto fail;
 
