@@ -283,6 +283,17 @@ def successful_job_payload(client, name, arguments):
     return json.loads(result["content"][0]["text"])
 
 
+def wait_for_job_state(client, job_id, wanted, deadline_seconds=5.0):
+    deadline = time.monotonic() + deadline_seconds
+    last = None
+    while time.monotonic() < deadline:
+        last = successful_job_payload(client, "system.shell_poll", {"job_id": job_id})
+        if last["state"] == wanted:
+            return last
+        time.sleep(0.05)
+    raise AssertionError(f"job did not reach {wanted}: {last}")
+
+
 def assert_job_error(client, name, arguments, expected_text):
     response = client.call(name, arguments)
     result = response["result"]
@@ -1486,6 +1497,7 @@ def verify_async_effective_policy(exe, config_path, config):
     waited = successful_job_payload(
         client, "system.shell_wait", {"job_id": started["job_id"], "timeout_ms": 3000}
     )
+    wait_for_job_state(client, started["job_id"], "exited")
     tailed = successful_job_payload(client, "system.shell_tail", {"job_id": started["job_id"]})
     listed = successful_job_payload(client, "system.shell_list", {})
     for payload in (waited, tailed, next(job for job in listed["jobs"] if job["job_id"] == started["job_id"])):
@@ -1503,7 +1515,7 @@ def verify_async_effective_policy(exe, config_path, config):
     timed_wait = successful_job_payload(
         client, "system.shell_wait", {"job_id": timed["job_id"], "timeout_ms": 3000}
     )
-    assert timed_wait["state"] == "timed_out", timed_wait
+    timed_wait = wait_for_job_state(client, timed["job_id"], "timed_out")
     time.sleep(0.4)
     assert not marker.exists(), marker
     marker.unlink(missing_ok=True)
@@ -1560,6 +1572,7 @@ def verify_async_job_snapshot_boundary(exe, config_path, config):
     for payload in (poll_a, tail_a, wait_a, next(job for job in listed_a["jobs"] if job["job_id"] == started_a["job_id"])):
         assert payload["sandbox_revision"] == revision_a, payload
         assert payload["sandbox_enabled"] is True and payload["shell_enabled"] is True, payload
+    wait_for_job_state(client, started_a["job_id"], "exited")
     final_a = successful_job_payload(client, "system.shell_tail", {"job_id": started_a["job_id"]})
     assert final_a["state"] == "exited" and final_a["stdout"] == "firstsecond", final_a
     assert final_a["stdout_truncated"] is False, final_a
@@ -1575,7 +1588,7 @@ def verify_async_job_snapshot_boundary(exe, config_path, config):
     wait_b = successful_job_payload(
         client, "system.shell_wait", {"job_id": started_b["job_id"], "timeout_ms": 3000}
     )
-    assert wait_b["state"] == "timed_out", wait_b
+    wait_b = wait_for_job_state(client, started_b["job_id"], "timed_out")
     time.sleep(0.3)
     assert not marker_b.exists(), marker_b
     marker_b.unlink(missing_ok=True)

@@ -369,7 +369,7 @@ def main():
             5,
             "system.shell_start",
             {
-                "command": "printf '%s|%s|' \"$PWD\" \"$S4_ENV\"; sleep 0.2; printf done",
+                "command": "printf '%s|%s|' \"$PWD\" \"$S4_ENV\"; sleep 0.4; printf done",
                 "cwd": str(async_cwd),
                 "env": {"S4_ENV": "request"},
                 "timeout_ms": 800,
@@ -398,13 +398,16 @@ def main():
         )
         assert_snapshot(poll_payload, expected_snapshot)
 
+        wait_started = time.monotonic()
         wait_payload = json_content(
             call_tool(proc, 7, "system.shell_wait", {"job_id": job_id, "timeout_ms": 3000})
         )
-        assert wait_payload["wait_result"] == "finished", wait_payload
-        assert wait_payload["state"] == "exited", wait_payload
-        assert wait_payload["exit_code"] == 0, wait_payload
+        assert time.monotonic() - wait_started < 1.0, wait_payload
+        assert wait_payload["wait_result"] == "still_running", wait_payload
+        assert wait_payload["state"] == "running", wait_payload
         assert_snapshot(wait_payload, expected_snapshot)
+        final_payload = wait_for_state(proc, job_id, "exited")
+        assert final_payload["exit_code"] == 0, final_payload
 
         tail_payload = json_content(call_tool(proc, 8, "system.shell_tail", {"job_id": job_id}))
         expected_stdout = f"{async_cwd}|request|done"
@@ -431,7 +434,8 @@ def main():
         truncated_wait = json_content(
             call_tool(proc, 11, "system.shell_wait", {"job_id": truncated_job_id, "timeout_ms": 3000})
         )
-        assert truncated_wait["state"] == "exited", truncated_wait
+        if truncated_wait["state"] != "exited":
+            truncated_wait = wait_for_state(proc, truncated_job_id, "exited")
         truncated_tail = json_content(call_tool(proc, 12, "system.shell_tail", {"job_id": truncated_job_id}))
         assert truncated_tail["stdout"] == "x" * 256, truncated_tail
         assert truncated_tail["stdout_truncated"] is True, truncated_tail
@@ -521,6 +525,8 @@ def main():
             call_tool(proc, 23, "system.shell_wait", {"job_id": zero_job_id, "timeout_ms": 3000})
         )
         assert_snapshot(zero_wait, zero_expected)
+        if zero_wait["state"] != "exited":
+            wait_for_state(proc, zero_job_id, "exited")
         zero_tail = json_content(call_tool(proc, 24, "system.shell_tail", {"job_id": zero_job_id}))
         assert zero_tail["stdout"] == "" and zero_tail["stdout_truncated"] is True, zero_tail
         assert_snapshot(zero_tail, zero_expected)

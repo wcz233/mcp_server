@@ -373,6 +373,49 @@ def peer_entry(payload, port):
     )
 
 
+def wait_for_online_peer(sock, tcp_port, start_id):
+    request_id = start_id
+    deadline = time.time() + 8
+    last_payload = None
+    while time.time() < deadline:
+        last_payload = call_tool(sock, request_id, "server.list_servers", {"wait_ms": 100})
+        request_id += 1
+        peer = peer_entry(last_payload, tcp_port)
+        if peer and peer["state"] == "online" and peer["tcp_connected"]:
+            return peer, request_id
+        time.sleep(0.1)
+    raise AssertionError(f"peer did not become online: {last_payload}")
+
+
+def cache_remote_tools(sock, request_id, server_id):
+    response = call(
+        sock,
+        request_id,
+        "tools/call",
+        {
+            "name": "gateway.proxy_tool",
+            "arguments": {"server_id": server_id, "tool_name": "tools_list", "args": {}},
+        },
+    )
+    tools = response["result"]["tools"]
+    assert any(tool["name"] == "system.ping" for tool in tools), tools
+
+
+def proxy_ping(sock, request_id, server_id):
+    response = call(
+        sock,
+        request_id,
+        "tools/call",
+        {
+            "name": "gateway.proxy_tool",
+            "arguments": {"server_id": server_id, "tool_name": "system.ping", "args": {}},
+        },
+    )
+    result = response["result"]
+    assert result["isError"] is False, result
+    assert result["content"][0]["text"] == "pong", result
+
+
 def blocking_command():
     if os.name == "nt":
         ping = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "ping.exe")
@@ -410,6 +453,7 @@ def main():
 
     proc = start_server(exe, tcp_server, discovery_server, fake_discovery)
     broadcast_proc = None
+    observer_sock = None
     sock = None
     transfer_sock = None
     transfer_path = None
@@ -513,13 +557,86 @@ def main():
             assert peer and peer["state"] == "online" and peer["tcp_connected"] is True, payload
 
         sock.settimeout(8.0)
-        blocked = call_tool(
-            sock,
-            20,
-            "system.shell_exec",
-            {"command": blocking_command(), "timeout_ms": 5000},
-        )
-        assert blocked["exit_code"] == 0 and blocked["timed_out"] is False, blocked
+        if os.name == "nt":
+            blocked = call_tool(
+                sock,
+                20,
+                "system.shell_exec",
+                {"command": blocking_command(), "timeout_ms": 5000},
+            )
+            assert blocked["exit_code"] == 0 and blocked["timed_out"] is False, blocked
+        else:
+            broadcast_proc = start_server(
+                exe,
+                broadcast_tcp,
+                broadcast_discovery,
+                discovery_server,
+            )
+            observer_sock = wait_for_tcp(broadcast_tcp, broadcast_proc)
+            observer_sock.settimeout(8.0)
+            initialize(observer_sock)
+            observed_server, observer_request_id = wait_for_online_peer(
+                observer_sock, tcp_server, 2
+            )
+            cache_remote_tools(observer_sock, observer_request_id, observed_server["server_id"])
+            observer_request_id += 1
+
+            started = call_tool(
+                sock,
+                20,
+                "system.shell_start",
+                {"command": blocking_command(), "timeout_ms": 5000},
+            )
+            ping_result = {}
+
+            def ping_during_wait():
+                try:
+                    time.sleep(0.25)
+                    proxy_ping(
+                        observer_sock,
+                        observer_request_id,
+                        observed_server["server_id"],
+                    )
+                    ping_result["ok"] = True
+                except Exception as exc:
+                    ping_result["error"] = exc
+
+            ping_thread = threading.Thread(target=ping_during_wait, daemon=True)
+            ping_thread.start()
+            wait_started = time.monotonic()
+            waited = call_tool(
+                sock,
+                21,
+                "system.shell_wait",
+                {"job_id": started["job_id"], "timeout_ms": 5000},
+            )
+            wait_elapsed = time.monotonic() - wait_started
+            assert wait_elapsed < 1.0, (wait_elapsed, waited)
+            assert waited["wait_result"] == "still_running", waited
+            ping_thread.join(timeout=3)
+            assert not ping_thread.is_alive(), ping_result
+            assert ping_result.get("ok") is True, ping_result
+
+            request_id = 22
+            deadline = time.time() + 6
+            while time.time() < deadline:
+                job = call_tool(sock, request_id, "system.shell_poll", {"job_id": started["job_id"]})
+                request_id += 1
+                if job["state"] == "exited":
+                    break
+                time.sleep(0.1)
+            assert job["state"] == "exited" and job["exit_code"] == 0, job
+            observed_after, _ = wait_for_online_peer(
+                observer_sock, tcp_server, observer_request_id + 1
+            )
+            assert observed_after["server_id"] == observed_server["server_id"], observed_after
+
+            observer_sock.close()
+            observer_sock = None
+            broadcast_proc.terminate()
+            broadcast_proc.wait(timeout=5)
+            broadcast_proc = None
+
         payload = call_tool(sock, 21, "server.list_servers", {"wait_ms": 100})
         peer = peer_entry(payload, fake_tcp_online)
         assert peer and peer["state"] == "online" and peer["tcp_connected"] is True, payload
@@ -585,6 +702,8 @@ def main():
     finally:
         if sock:
             sock.close()
+        if observer_sock:
+            observer_sock.close()
         if transfer_sock:
             transfer_sock.close()
         proc.terminate()
