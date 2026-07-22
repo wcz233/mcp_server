@@ -367,7 +367,7 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
 
     if (register_tool(registry,
                       "system.shell_wait",
-                      "Wait briefly for an asynchronous shell job to finish.",
+                      "Refresh and immediately return the current state of an asynchronous shell job.",
                       mcp_schema_shell_wait(),
                       "builtin",
                       "L4",

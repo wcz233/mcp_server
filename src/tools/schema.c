@@ -390,7 +390,7 @@ json_t *mcp_schema_shell_wait(void)
                   "type",
                   "integer",
                   "description",
-                  "Maximum local wait in milliseconds.",
+                  "Compatibility parameter from 0 to 5000; the tool always refreshes status without waiting.",
                   "minimum",
                   0,
                   "maximum",

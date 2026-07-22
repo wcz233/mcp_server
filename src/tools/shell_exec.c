@@ -4656,7 +4656,6 @@ int mcp_tool_system_shell_wait(struct mcp_server *server,
     const char *job_id;
     struct shell_job *job;
     unsigned int timeout_ms = 0;
-    unsigned long long deadline;
     json_t *payload;
 
     if (!shell_job_id_arg(invocation, &job_id)) {
@@ -4675,19 +4674,11 @@ int mcp_tool_system_shell_wait(struct mcp_server *server,
         return 0;
     }
 
-    deadline = mcp_now_ms() + timeout_ms;
-    for (;;) {
-        shell_jobs_poll_all(server->shell_jobs);
-        job = shell_job_find(server->shell_jobs, job_id);
-        if (!job) {
-            *out_result = mcp_tool_result_text("Shell job was not found.", true);
-            return 0;
-        }
-        if (shell_job_is_final(job) && !shell_job_needs_poll(job))
-            break;
-        if (mcp_now_ms() >= deadline)
-            break;
-        uv_sleep(10);
+    shell_jobs_poll_all(server->shell_jobs);
+    job = shell_job_find(server->shell_jobs, job_id);
+    if (!job) {
+        *out_result = mcp_tool_result_text("Shell job was not found.", true);
+        return 0;
     }
 
     payload = shell_job_status_json(job);
