@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,33 @@ import subprocess
 import signal
 import sys
 import time
+
+
+SERVER_ENTRY_KEYS = {
+    "server_id",
+    "address",
+    "port",
+    "scope",
+    "state",
+    "tcp_connected",
+    "last_seen_ms",
+    "system_status",
+}
+SYSTEM_STATUS_KEYS = {
+    "hostname",
+    "os",
+    "machine",
+    "memory_total_bytes",
+    "memory_available_bytes",
+    "commands",
+}
+REQUIRED_SYSTEM_STATUS_KEYS = {
+    "hostname",
+    "os",
+    "memory_total_bytes",
+    "memory_available_bytes",
+    "commands",
+}
 
 
 def encode(payload):
@@ -139,6 +167,50 @@ def proxy_tools_list(sock, request_id, server_id):
     return result
 
 
+def assert_server_entry_contract(server):
+    assert set(server) == SERVER_ENTRY_KEYS, server
+    status = server["system_status"]
+    assert set(status).issubset(SYSTEM_STATUS_KEYS), status
+    assert REQUIRED_SYSTEM_STATUS_KEYS.issubset(status), status
+    assert status["memory_total_bytes"] > 0, status
+    assert 0 <= status["memory_available_bytes"] <= status["memory_total_bytes"], status
+    assert isinstance(status["commands"], dict), status
+    assert all(
+        isinstance(name, str) and isinstance(path, str)
+        for name, path in status["commands"].items()
+    ), status
+
+
+def assert_full_status_available(summary, full_status):
+    for key in ("hostname", "os", "machine", "memory_total_bytes", "commands"):
+        if key in summary:
+            assert summary[key] == full_status[key], (summary, full_status)
+    if full_status["os"] != "windows":
+        assert {"kernel", "uid", "gid"}.issubset(full_status), full_status
+        assert not {"kernel", "uid", "gid"}.intersection(summary), summary
+
+
+def normalized_server_list_size(payload):
+    normalized = copy.deepcopy(payload)
+    for server in normalized["servers"]:
+        server["last_seen_ms"] = 0
+        server["system_status"]["memory_available_bytes"] = 0
+    return len(json.dumps(normalized, separators=(",", ":"), ensure_ascii=True))
+
+
+def assert_equivalent_scale_reduction(local, peer, tools_payload):
+    compact_servers = [copy.deepcopy(local)]
+    compact_servers.extend(copy.deepcopy(peer) for _ in range(4))
+    compact_payload = {"total": 5, "servers": compact_servers}
+    legacy_payload = copy.deepcopy(compact_payload)
+    for server in legacy_payload["servers"][1:4]:
+        server["tools_list"] = tools_payload
+
+    compact_chars = len(json.dumps(compact_payload, separators=(",", ":"), ensure_ascii=True))
+    legacy_chars = len(json.dumps(legacy_payload, separators=(",", ":"), ensure_ascii=True))
+    assert compact_chars * 10 <= legacy_chars, (compact_chars, legacy_chars)
+
+
 def file_transfer_plugin_path(exe):
     directory = Path(exe).resolve().parent
     for name in (
@@ -187,13 +259,13 @@ def main():
         local = local_payload["servers"][0]
         assert local["address"] == f"127.0.0.1:{tcp_a}", local
         assert local["server_id"] == 0, local
-        assert local["ip"] == "127.0.0.1", local
         assert local["port"] == tcp_a, local
         assert local["scope"] == "local", local
         assert local["state"] == "online", local
         assert local["tcp_connected"] is True, local
-        assert "system_status" in local, local
-        assert "hostname" in local["system_status"], local
+        assert_server_entry_contract(local)
+        local_full_status = parse_text_json(call_tool(sock_a, 101, "system.get_status", {}))
+        assert_full_status_available(local["system_status"], local_full_status)
 
         proc_b = start_server(exe, tcp_b, discovery_b, discovery_a, shell_exec="1")
         sock_b = wait_for_tcp(tcp_b, proc_b)
@@ -214,18 +286,18 @@ def main():
 
         assert payload is not None, "missing discovery response"
         assert payload["total"] >= 2, payload
+        for server in payload["servers"]:
+            assert_server_entry_contract(server)
         local = next(server for server in payload["servers"] if server["address"] == f"127.0.0.1:{tcp_a}")
         assert local["scope"] == "local", local
         assert local["server_id"] == 0, local
         peer = next(server for server in payload["servers"] if server["address"] == f"127.0.0.1:{tcp_b}")
         peer_server_id = peer["server_id"]
         assert peer_server_id > 0, peer
-        assert peer["ip"] == "127.0.0.1", peer
         assert peer["port"] == tcp_b, peer
         assert peer["scope"] == "remote", peer
         assert peer["state"] == "online", peer
-        assert "system_status" in peer, peer
-        assert "hostname" in peer["system_status"], peer
+        compact_size = normalized_server_list_size(payload)
 
         direct_tools_payload = call(sock_b, 2, "tools/list", {})["result"]
         management_payload = parse_text_json(call_tool(sock_b, 3, "registry.list_tools", {}))
@@ -242,6 +314,7 @@ def main():
             "enabled" not in tool and "version" not in tool
             for tool in direct_tools_payload["tools"]
         ), direct_tools_payload
+        assert_equivalent_scale_reduction(local, peer, management_payload)
 
         tools_payload = proxy_tools_list(sock_a, 5, peer_server_id)
         assert tools_payload == direct_tools_payload, tools_payload
@@ -255,10 +328,18 @@ def main():
             server for server in cached_payload["servers"] if server["address"] == f"127.0.0.1:{tcp_b}"
         )
         assert cached_peer["server_id"] == peer_server_id, cached_peer
-        assert "tools_list" in cached_peer, cached_peer
-        assert cached_peer["tools_list"] == tools_payload, cached_peer
-        cached_names = {tool["name"] for tool in cached_peer["tools_list"]["tools"]}
-        assert "system.ping" in cached_names, cached_peer
+        assert_server_entry_contract(cached_peer)
+        assert normalized_server_list_size(cached_payload) == compact_size, cached_payload
+
+        remote_full_status = parse_text_json(
+            call_tool(
+                sock_a,
+                102,
+                "gateway.proxy_tool",
+                {"server_id": peer_server_id, "tool_name": "system.get_status", "args": {}},
+            )
+        )
+        assert_full_status_available(cached_peer["system_status"], remote_full_status)
 
         result = call_tool(
             sock_a,
@@ -282,6 +363,10 @@ def main():
 
             tools_payload = proxy_tools_list(sock_a, 8, peer_server_id)
             assert tools_payload == direct_tools_payload, tools_payload
+            plugin_payload = parse_text_json(
+                call_tool(sock_a, 103, "server.list_servers", {"wait_ms": 100})
+            )
+            assert normalized_server_list_size(plugin_payload) == compact_size, plugin_payload
             proxied = call_tool(
                 sock_a,
                 9,
@@ -300,6 +385,10 @@ def main():
                 tool["name"] for tool in direct_tools_payload["tools"]
             }, direct_tools_payload
             assert proxy_tools_list(sock_a, 10, peer_server_id) == direct_tools_payload
+            unloaded_payload = parse_text_json(
+                call_tool(sock_a, 104, "server.list_servers", {"wait_ms": 100})
+            )
+            assert normalized_server_list_size(unloaded_payload) == compact_size, unloaded_payload
 
         timed_out = call_tool(
             sock_a,
@@ -359,6 +448,7 @@ def main():
 
         assert offline_payload is not None, "missing offline response"
         peer = next(server for server in offline_payload["servers"] if server["address"] == f"127.0.0.1:{tcp_b}")
+        assert_server_entry_contract(peer)
         assert peer["server_id"] == peer_server_id, peer
         assert peer["state"] == "offline", peer
         assert peer["tcp_connected"] is False, peer
@@ -387,6 +477,7 @@ def main():
 
         assert restarted_payload is not None, "missing restarted peer response"
         peer = next(server for server in restarted_payload["servers"] if server["address"] == f"127.0.0.1:{tcp_b}")
+        assert_server_entry_contract(peer)
         assert peer["server_id"] == peer_server_id, peer
         assert peer["state"] == "online", peer
         assert peer["tcp_connected"] is True, peer
