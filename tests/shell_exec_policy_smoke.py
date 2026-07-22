@@ -320,47 +320,49 @@ def assert_compact_shell_result(payload, command, expected_stdout, revision):
 
 def verify_compact_result_contract(client, state, temp_path):
     if os.name == "nt":
-        system_root = os.environ.get("SystemRoot", r"C:\Windows")
-        default_shell_path = os.environ.get("ComSpec", system_root + r"\System32\cmd.exe")
+        one_byte_command = "0"
+        normal_command = "echo stage3-regular"
+        max_command_prefix = "echo stage3-max&rem "
+        once_command = "echo x>>stage3-once.marker"
+        marker_content = "x\n"
         default_shell_arg = "/C"
     else:
-        default_shell_path = "/bin/sh"
+        one_byte_command = ":"
+        normal_command = "printf stage3-regular"
+        max_command_prefix = "printf stage3-max #"
+        once_command = "printf x >> stage3-once.marker"
+        marker_content = "x"
         default_shell_arg = "-c"
 
     configured_max = 4096
-    state = client.update(
-        state,
-        overrides={
-            "command_length": configured_max,
-            "execution": {"mode": "shell", "shell_path": sys.executable, "shell_arg": "-c"},
-        },
-    )
+    state = client.update(state, overrides={"command_length": configured_max})
 
-    cases = [("0", ""), ("print('stage3-regular')", "stage3-regular")]
-    max_command_prefix = "print('stage3-max')#"
     max_command = max_command_prefix + "x" * (configured_max - len(max_command_prefix))
     assert len(max_command.encode("utf-8")) == configured_max, len(max_command)
-    cases.append((max_command, "stage3-max"))
 
-    for command, expected_stdout in cases:
+    if os.name == "nt":
+        state = client.update(state, overrides={"execution": {"shell_arg": "/C exit"}})
+    payload = client.shell({"command": one_byte_command})
+    assert_compact_shell_result(payload, one_byte_command, "", state["revision"])
+    if os.name == "nt":
+        state = client.update(state, overrides={"execution": {"shell_arg": default_shell_arg}})
+
+    for command, expected_stdout in (
+        (normal_command, "stage3-regular"),
+        (max_command, "stage3-max"),
+    ):
         payload = client.shell({"command": command})
         assert_compact_shell_result(payload, command, expected_stdout, state["revision"])
 
     marker = temp_path / "stage3-once.marker"
-    command = "open('stage3-once.marker','a').write('x')"
-    payload = client.shell({"command": command})
-    assert_compact_shell_result(payload, command, "", state["revision"])
-    assert marker.read_text(encoding="utf-8") == "x", marker.read_text(encoding="utf-8")
+    payload = client.shell({"command": once_command})
+    assert_compact_shell_result(payload, once_command, "", state["revision"])
+    assert marker.read_text(encoding="utf-8") == marker_content, marker.read_text(encoding="utf-8")
 
     return client.update(
         state,
         overrides={
             "command_length": 65536,
-            "execution": {
-                "mode": "shell",
-                "shell_path": default_shell_path,
-                "shell_arg": default_shell_arg,
-            },
         },
     )
 
