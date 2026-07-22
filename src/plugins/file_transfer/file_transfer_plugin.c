@@ -313,6 +313,11 @@ struct pending_negotiation {
     struct pending_negotiation *next;
 };
 
+struct hello_outstanding {
+    unsigned int server_id;
+    struct hello_outstanding *next;
+};
+
 struct mft_plugin {
     const struct mcp_plugin_host_api *host;
     unsigned long long next_transfer;
@@ -426,6 +431,7 @@ struct pending_pump {
 
 static struct mft_plugin g_plugin;
 static struct pending_negotiation *g_pending_negotiations;
+static struct hello_outstanding *g_hello_outstanding;
 
 static struct transfer_context *find_transfer(const char *transfer_id);
 static void unlink_transfer(struct transfer_context *ctx);
@@ -2058,7 +2064,7 @@ static int manifest_to_entries(json_t *manifest,
     return 0;
 }
 
-static int send_hello(unsigned int server_id)
+static int send_hello_frame(unsigned int server_id)
 {
     json_t *payload = json_pack("{s:i,s:[s,s,s,s,s,s],s:i,s:i,s:i,s:i}",
                                 "version",
@@ -2082,6 +2088,76 @@ static int send_hello(unsigned int server_id)
 
     json_decref(payload);
     return rc;
+}
+
+static int mark_hello_outstanding(unsigned int server_id)
+{
+    struct hello_outstanding *current;
+    struct hello_outstanding *entry;
+
+    mft_lock();
+    for (current = g_hello_outstanding; current; current = current->next) {
+        if (current->server_id == server_id) {
+            mft_unlock();
+            return 1;
+        }
+    }
+    entry = calloc(1, sizeof(*entry));
+    if (!entry) {
+        mft_unlock();
+        return -1;
+    }
+    entry->server_id = server_id;
+    entry->next = g_hello_outstanding;
+    g_hello_outstanding = entry;
+    mft_unlock();
+    return 0;
+}
+
+static bool clear_hello_outstanding(unsigned int server_id)
+{
+    struct hello_outstanding **current;
+    bool found = false;
+
+    mft_lock();
+    current = &g_hello_outstanding;
+    while (*current) {
+        struct hello_outstanding *entry = *current;
+
+        if (entry->server_id == server_id) {
+            *current = entry->next;
+            free(entry);
+            found = true;
+            break;
+        }
+        current = &entry->next;
+    }
+    mft_unlock();
+    return found;
+}
+
+static void free_hello_outstanding(struct hello_outstanding *entry)
+{
+    while (entry) {
+        struct hello_outstanding *next = entry->next;
+
+        free(entry);
+        entry = next;
+    }
+}
+
+static int send_hello_request(unsigned int server_id)
+{
+    int marked = mark_hello_outstanding(server_id);
+
+    if (marked > 0)
+        return 0;
+    if (marked < 0)
+        return -1;
+    if (send_hello_frame(server_id) == 0)
+        return 0;
+    clear_hello_outstanding(server_id);
+    return -1;
 }
 
 static void free_pending_negotiation(struct pending_negotiation *pending)
@@ -2205,7 +2281,7 @@ static void scan_negotiation_timeouts(unsigned long long now,
 static void on_peer_connected(void *user_data, unsigned int server_id)
 {
     (void)user_data;
-    send_hello(server_id);
+    send_hello_request(server_id);
 }
 
 static void abort_transfers_for_peer(unsigned int server_id);
@@ -2215,6 +2291,7 @@ static void on_peer_closed(void *user_data, unsigned int server_id)
     struct pending_negotiation *pending;
 
     (void)user_data;
+    clear_hello_outstanding(server_id);
     pending = take_pending_negotiations(server_id);
     abort_transfers_for_peer(server_id);
     complete_pending_negotiation_errors(pending,
@@ -2226,8 +2303,10 @@ static void handle_hello(unsigned int server_id, json_t *payload)
     json_t *capabilities = json_object_get(payload, "capabilities");
     json_t *cap;
     size_t i;
-    int should_reply = 0;
+    bool is_response;
     struct pending_negotiation *pending = NULL;
+
+    is_response = clear_hello_outstanding(server_id);
 
     json_array_foreach(capabilities, i, cap) {
         const char *name;
@@ -2241,18 +2320,14 @@ static void handle_hello(unsigned int server_id, json_t *payload)
             strcmp(name, MFT_CAP_CHUNK_WINDOW) == 0 ||
             strcmp(name, MFT_CAP_CRC32) == 0 ||
             strcmp(name, MFT_CAP_DATA_CHANNEL) == 0) {
-            if (!g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
-                                                              server_id,
-                                                              name))
-                should_reply = 1;
             g_plugin.host->peer_transport_set_capability(g_plugin.host->host_context,
                                                          server_id,
                                                          name,
                                                          1);
         }
     }
-    if (should_reply)
-        send_hello(server_id);
+    if (!is_response)
+        send_hello_frame(server_id);
     if (g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
                                                      server_id,
                                                      MFT_CAP_BLOCK_ACK))
@@ -5540,7 +5615,7 @@ MFT_PLUGIN_EXPORT int MFT_PLUGIN_INVOKE(const char *invocation_id,
     if (!g_plugin.host->peer_transport_has_capability(g_plugin.host->host_context,
                                                       server_id,
                                                       MFT_CAP_BLOCK_ACK)) {
-        if (send_hello(server_id) != 0 ||
+        if (send_hello_request(server_id) != 0 ||
             queue_pending_negotiation(invocation_id,
                                       server_id,
                                       json_string_value(local_path),
@@ -5580,6 +5655,7 @@ MFT_PLUGIN_EXPORT int MFT_PLUGIN_INVOKE(const char *invocation_id,
 MFT_PLUGIN_EXPORT int MFT_PLUGIN_SHUTDOWN(void)
 {
     struct pending_negotiation *pending;
+    struct hello_outstanding *hello_outstanding;
 
     if (g_plugin.sync_initialized) {
         mft_lock();
@@ -5594,8 +5670,11 @@ MFT_PLUGIN_EXPORT int MFT_PLUGIN_SHUTDOWN(void)
     mft_lock();
     pending = g_pending_negotiations;
     g_pending_negotiations = NULL;
+    hello_outstanding = g_hello_outstanding;
+    g_hello_outstanding = NULL;
     mft_unlock();
     free_pending_negotiations(pending);
+    free_hello_outstanding(hello_outstanding);
     while (g_transfers) {
         struct transfer_context *ctx = g_transfers;
 
