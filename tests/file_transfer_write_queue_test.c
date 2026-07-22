@@ -364,7 +364,7 @@ cleanup_loop:
     return rc;
 }
 
-static int run_terminal_crc32_mismatch_test(void)
+static int run_terminal_crc32_mismatch_test(const char *scope)
 {
     const char transfer_id[] = "test-transfer";
     const size_t frame_size = 88 + sizeof(transfer_id) - 1 + MFT_MAX_CHUNK;
@@ -409,11 +409,23 @@ static int run_terminal_crc32_mismatch_test(void)
     write_u16_be(frame + 6, (uint16_t)(sizeof(transfer_id) - 1));
     write_u32_be(frame + 8, 1);
     write_u32_be(frame + 20, MFT_MAX_CHUNK);
-    memcpy(frame + 24, "00000000", 8);
     memcpy(frame + 88, transfer_id, sizeof(transfer_id) - 1);
     data = frame + 88 + sizeof(transfer_id) - 1;
     memset(data, 0x5a, MFT_MAX_CHUNK);
     bytes_crc32(data, MFT_MAX_CHUNK, actual_hash);
+    if (strcmp(scope, "chunk") == 0) {
+        memcpy(frame + 24, "00000000", 8);
+        snprintf(ctx->entries[0].blocks[0].hash,
+                 sizeof(ctx->entries[0].blocks[0].hash),
+                 "%s",
+                 actual_hash);
+    } else {
+        memcpy(frame + 24, actual_hash, 8);
+        snprintf(ctx->entries[0].blocks[0].hash,
+                 sizeof(ctx->entries[0].blocks[0].hash),
+                 "%s",
+                 "00000000");
+    }
 
     host.host_context = &context;
     host.now_ms = test_now_ms;
@@ -433,7 +445,7 @@ static int run_terminal_crc32_mismatch_test(void)
     payload = json_loads(context.error, JSON_REJECT_DUPLICATES, &json_error);
     if (!payload || !json_string_equals(payload, "code", "checksum_mismatch") ||
         !json_string_equals(payload, "algorithm", "crc32") ||
-        !json_string_equals(payload, "checksum_scope", "chunk") ||
+        !json_string_equals(payload, "checksum_scope", scope) ||
         !json_string_equals(payload, "expected", "00000000") ||
         !json_string_equals(payload, "actual", actual_hash))
         goto cleanup_transfer;
@@ -548,5 +560,7 @@ cleanup_loop:
         rc = run_window_credit_test();
     if (rc == 0)
         rc = run_recovered_crc32_mismatch_test();
-    return rc == 0 ? run_terminal_crc32_mismatch_test() : rc;
+    if (rc == 0)
+        rc = run_terminal_crc32_mismatch_test("chunk");
+    return rc == 0 ? run_terminal_crc32_mismatch_test("block") : rc;
 }
