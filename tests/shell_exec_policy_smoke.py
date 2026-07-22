@@ -11,6 +11,19 @@ TOKEN = "s3-token-must-not-appear-49a6f31d"
 PARENT_SECRET = "s3-parent-secret-must-not-appear-867e"
 DEFAULT_SECRET = "s3-default-secret-must-not-appear-302b"
 REQUEST_SECRET = "s3-request-secret-must-not-appear-745c"
+SHELL_EXEC_RESULT_FIELDS = {
+    "stdout",
+    "stderr",
+    "exit_code",
+    "timed_out",
+    "truncated",
+    "stdout_truncated",
+    "stderr_truncated",
+    "signal",
+    "sandbox_revision",
+    "sandbox_enabled",
+    "shell_enabled",
+}
 
 
 def shell_command(command_windows, command_unix):
@@ -240,6 +253,7 @@ def verify_descriptor(client):
     response = client.request("tools/list", {})
     tool = next(item for item in response["result"]["tools"] if item["name"] == "system.shell_exec")
     properties = tool["inputSchema"]["properties"]
+    assert "does not repeat the command" in tool["description"], tool
     assert properties["timeout_ms"]["minimum"] == 1, properties
     assert properties["cwd"]["type"] == "string", properties
     assert properties["env"]["additionalProperties"] == {"type": "string"}, properties
@@ -286,6 +300,69 @@ def verify_effective_policy(client, temp_path):
     assert_no_spawn(client, {"command": marker_command(marker) + "123456789"}, marker, "maximum length")
     state = client.update(state, overrides={"command_length": 65536, "timeout_ms": 300000})
     return state
+
+
+def assert_compact_shell_result(payload, command, expected_stdout, revision):
+    assert set(payload) == SHELL_EXEC_RESULT_FIELDS, payload
+    assert command not in (value for value in payload.values() if isinstance(value, str)), payload
+    assert payload["stdout"].strip() == expected_stdout, payload
+    assert payload["stderr"] == "", payload
+    assert payload["exit_code"] == 0, payload
+    assert payload["timed_out"] is False, payload
+    assert payload["truncated"] is False, payload
+    assert payload["stdout_truncated"] is False, payload
+    assert payload["stderr_truncated"] is False, payload
+    assert payload["signal"] == 0, payload
+    assert payload["sandbox_revision"] == revision, payload
+    assert payload["sandbox_enabled"] is True, payload
+    assert payload["shell_enabled"] is True, payload
+
+
+def verify_compact_result_contract(client, state, temp_path):
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        default_shell_path = os.environ.get("ComSpec", system_root + r"\System32\cmd.exe")
+        default_shell_arg = "/C"
+    else:
+        default_shell_path = "/bin/sh"
+        default_shell_arg = "-c"
+
+    configured_max = 4096
+    state = client.update(
+        state,
+        overrides={
+            "command_length": configured_max,
+            "execution": {"mode": "shell", "shell_path": sys.executable, "shell_arg": "-c"},
+        },
+    )
+
+    cases = [("0", ""), ("print('stage3-regular')", "stage3-regular")]
+    max_command_prefix = "print('stage3-max')#"
+    max_command = max_command_prefix + "x" * (configured_max - len(max_command_prefix))
+    assert len(max_command.encode("utf-8")) == configured_max, len(max_command)
+    cases.append((max_command, "stage3-max"))
+
+    for command, expected_stdout in cases:
+        payload = client.shell({"command": command})
+        assert_compact_shell_result(payload, command, expected_stdout, state["revision"])
+
+    marker = temp_path / "stage3-once.marker"
+    command = "open('stage3-once.marker','a').write('x')"
+    payload = client.shell({"command": command})
+    assert_compact_shell_result(payload, command, "", state["revision"])
+    assert marker.read_text(encoding="utf-8") == "x", marker.read_text(encoding="utf-8")
+
+    return client.update(
+        state,
+        overrides={
+            "command_length": 65536,
+            "execution": {
+                "mode": "shell",
+                "shell_path": default_shell_path,
+                "shell_arg": default_shell_arg,
+            },
+        },
+    )
 
 
 def verify_cwd_and_environment(client, state, temp_path):
@@ -566,6 +643,7 @@ def main():
         try:
             verify_descriptor(client)
             state = verify_effective_policy(client, temp_path)
+            state = verify_compact_result_contract(client, state, temp_path)
             state = verify_cwd_and_environment(client, state, temp_path)
             state = verify_output_and_shell_arg(client, state, temp_path)
             state = verify_64_bit_rlimit(client, state)

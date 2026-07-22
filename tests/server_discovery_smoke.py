@@ -240,6 +240,7 @@ def main():
         assert timed_out["isError"] is True, timed_out
         assert "gateway_proxy_timed_out" in timed_out["content"][0]["text"], timed_out
 
+        proxy_command = slow_python_command(0.3, "proxy-ok")
         completed = call_tool(
             sock_a,
             72,
@@ -247,12 +248,16 @@ def main():
             {
                 "server_id": peer_server_id,
                 "tool_name": "system.shell_exec",
-                "args": {"command": slow_python_command(0.3, "proxy-ok"), "timeout_ms": 1500},
+                "args": {"command": proxy_command, "timeout_ms": 1500},
                 "proxy_timeout_ms": 2000,
             },
         )
         assert completed["isError"] is False, completed
         completed_payload = parse_text_json(completed)
+        assert "command" not in completed_payload, completed_payload
+        assert proxy_command not in (
+            value for value in completed_payload.values() if isinstance(value, str)
+        ), completed_payload
         assert completed_payload["stdout"].strip() == "proxy-ok", completed_payload
         assert completed_payload["timed_out"] is False, completed_payload
 
