@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 import shlex
 import socket
 import struct
@@ -122,6 +123,35 @@ def parse_text_json(result):
     return json.loads(result["content"][0]["text"])
 
 
+def proxy_tools_list(sock, request_id, server_id):
+    response = call(
+        sock,
+        request_id,
+        "tools/call",
+        {
+            "name": "gateway.proxy_tool",
+            "arguments": {"server_id": server_id, "tool_name": "tools_list", "args": {}},
+        },
+    )
+    result = response["result"]
+    assert "content" not in result, result
+    assert isinstance(result.get("tools"), list), result
+    return result
+
+
+def file_transfer_plugin_path(exe):
+    directory = Path(exe).resolve().parent
+    for name in (
+        "mcp_file_transfer_plugin.dll",
+        "mcp_file_transfer_plugin.so",
+        "mcp_file_transfer_plugin.dylib",
+    ):
+        candidate = directory / name
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def slow_python_command(seconds, text):
     code = f"import time; time.sleep({seconds}); print({text!r})"
     if os.name == "nt":
@@ -135,6 +165,7 @@ def main():
     tcp_b = int(sys.argv[3])
     discovery_a = int(sys.argv[4])
     discovery_b = int(sys.argv[5])
+    plugin_path = file_transfer_plugin_path(exe)
     proc_a = start_server(exe, tcp_a, discovery_a, discovery_b)
     proc_b = None
     sock_a = None
@@ -196,13 +227,24 @@ def main():
         assert "system_status" in peer, peer
         assert "hostname" in peer["system_status"], peer
 
-        result = call_tool(
-            sock_a,
-            5,
-            "gateway.proxy_tool",
-            {"server_id": peer_server_id, "tool_name": "tools_list", "args": {}},
-        )
-        tools_payload = parse_text_json(result)
+        direct_tools_payload = call(sock_b, 2, "tools/list", {})["result"]
+        management_payload = parse_text_json(call_tool(sock_b, 3, "registry.list_tools", {}))
+        assert (
+            management_payload["registryVersion"] == direct_tools_payload["registryVersion"]
+        ), management_payload
+        assert {tool["name"] for tool in management_payload["tools"]} == {
+            tool["name"] for tool in direct_tools_payload["tools"]
+        }, management_payload
+        assert all(
+            "enabled" in tool and "version" in tool for tool in management_payload["tools"]
+        ), management_payload
+        assert all(
+            "enabled" not in tool and "version" not in tool
+            for tool in direct_tools_payload["tools"]
+        ), direct_tools_payload
+
+        tools_payload = proxy_tools_list(sock_a, 5, peer_server_id)
+        assert tools_payload == direct_tools_payload, tools_payload
         remote_tool_names = {tool["name"] for tool in tools_payload["tools"]}
         assert "system.ping" in remote_tool_names, tools_payload
         assert "gateway.proxy_tool" in remote_tool_names, tools_payload
@@ -214,6 +256,7 @@ def main():
         )
         assert cached_peer["server_id"] == peer_server_id, cached_peer
         assert "tools_list" in cached_peer, cached_peer
+        assert cached_peer["tools_list"] == tools_payload, cached_peer
         cached_names = {tool["name"] for tool in cached_peer["tools_list"]["tools"]}
         assert "system.ping" in cached_names, cached_peer
 
@@ -225,6 +268,38 @@ def main():
         )
         assert result["isError"] is False, result
         assert result["content"][0]["text"] == "pong", result
+
+        if plugin_path:
+            loaded = parse_text_json(
+                call_tool(sock_b, 4, "plugin_tools.insmod", {"package_path": plugin_path})
+            )
+            plugin_id = loaded["plugin_id"]
+            assert {"server.send", "server.recv"}.issubset(loaded["tools"]), loaded
+
+            direct_tools_payload = call(sock_b, 5, "tools/list", {})["result"]
+            direct_names = {tool["name"] for tool in direct_tools_payload["tools"]}
+            assert {"server.send", "server.recv"}.issubset(direct_names), direct_tools_payload
+
+            tools_payload = proxy_tools_list(sock_a, 8, peer_server_id)
+            assert tools_payload == direct_tools_payload, tools_payload
+            proxied = call_tool(
+                sock_a,
+                9,
+                "gateway.proxy_tool",
+                {"server_id": peer_server_id, "tool_name": "server.send", "args": {}},
+            )
+            assert proxied["isError"] is True, proxied
+            assert "session snapshot" not in proxied["content"][0]["text"], proxied
+
+            unloaded = parse_text_json(
+                call_tool(sock_b, 6, "plugin_tools.rmmod", {"plugin_id": plugin_id})
+            )
+            assert unloaded["unloaded"] is True, unloaded
+            direct_tools_payload = call(sock_b, 7, "tools/list", {})["result"]
+            assert "server.send" not in {
+                tool["name"] for tool in direct_tools_payload["tools"]
+            }, direct_tools_payload
+            assert proxy_tools_list(sock_a, 10, peer_server_id) == direct_tools_payload
 
         timed_out = call_tool(
             sock_a,
