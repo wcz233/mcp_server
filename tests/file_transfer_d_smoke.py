@@ -459,6 +459,7 @@ def main():
         )
         assert missing_recv["isError"] is True, missing_recv
         assert "Remote path" in missing_recv["content"][0]["text"], missing_recv
+        assert "sha256_mismatch" not in missing_recv["content"][0]["text"], missing_recv
 
         window_size = 16 * 1024 * 1024
         window_src = file_src_dir / "window-src.bin"
@@ -578,9 +579,17 @@ def main():
         assert corrupted, "partial file was not corrupted during transfer"
         corrupt_result = transfer["result"]
         assert corrupt_result["isError"] is True, corrupt_result
-        assert "finalize" in corrupt_result["content"][0]["text"].lower(), corrupt_result
         assert not corrupt_target.exists(), corrupt_target
         assert corrupt_part.exists(), corrupt_part
+        error_text = corrupt_result["content"][0]["text"]
+        assert len(error_text.encode("utf-8")) <= 1024, corrupt_result
+        assert json.loads(error_text) == {
+            "code": "sha256_mismatch",
+            "message": "Received file failed whole-file SHA-256 verification.",
+            "path": ".",
+            "expected_sha256": sha256(corrupt_src),
+            "actual_sha256": sha256(corrupt_part),
+        }, corrupt_result
     finally:
         for sock in (sock_a, sock_b):
             if sock:

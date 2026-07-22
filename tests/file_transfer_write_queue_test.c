@@ -16,7 +16,7 @@ struct test_host_context {
     bool error_called;
     unsigned int window_updates;
     unsigned int block_acks;
-    char error[128];
+    char error[2048];
 };
 
 static unsigned long long test_now_ms(void *host_context)
@@ -60,6 +60,13 @@ static int test_send_frame(void *host_context,
             context->block_acks++;
     }
     return 0;
+}
+
+static bool json_string_equals(json_t *object, const char *key, const char *expected)
+{
+    json_t *value = json_object_get(object, key);
+
+    return json_is_string(value) && strcmp(json_string_value(value), expected) == 0;
 }
 
 static struct transfer_context *make_receive_context(FILE *fp, size_t size)
@@ -270,6 +277,197 @@ cleanup:
     return rc;
 }
 
+static int run_recovered_crc32_mismatch_test(void)
+{
+    const char transfer_id[] = "test-transfer";
+    const size_t frame_size = 88 + sizeof(transfer_id) - 1 + MFT_MAX_CHUNK;
+    struct test_host_context context = {0};
+    struct mcp_plugin_host_api host = {0};
+    struct transfer_context *ctx = NULL;
+    unsigned char *frame = NULL;
+    unsigned char *data;
+    char actual_hash[9];
+    FILE *fp = NULL;
+    int rc = 1;
+
+    if (uv_loop_init(&context.loop) != 0)
+        return 1;
+    fp = tmpfile();
+    if (!fp)
+        goto cleanup_loop;
+    ctx = make_receive_context(fp, MFT_MAX_CHUNK);
+    if (!ctx)
+        goto cleanup_file;
+    ctx->crc32_enabled = true;
+    ctx->entries[0].block_crc32 = true;
+
+    frame = calloc(1, frame_size);
+    if (!frame)
+        goto cleanup_transfer;
+    memcpy(frame, MFT_MAGIC, 4);
+    frame[4] = MFT_VERSION;
+    frame[5] = MFT_FRAME_DATA;
+    write_u16_be(frame + 6, (uint16_t)(sizeof(transfer_id) - 1));
+    write_u32_be(frame + 8, 1);
+    write_u32_be(frame + 20, MFT_MAX_CHUNK);
+    memcpy(frame + 24, "00000000", 8);
+    memcpy(frame + 88, transfer_id, sizeof(transfer_id) - 1);
+    data = frame + 88 + sizeof(transfer_id) - 1;
+    memset(data, 0x5a, MFT_MAX_CHUNK);
+    bytes_crc32(data, MFT_MAX_CHUNK, actual_hash);
+    snprintf(ctx->entries[0].blocks[0].hash,
+             sizeof(ctx->entries[0].blocks[0].hash),
+             "%s",
+             actual_hash);
+
+    host.host_context = &context;
+    host.now_ms = test_now_ms;
+    host.get_loop = test_get_loop;
+    host.complete_async_error = test_complete_async_error;
+    host.peer_transport_send_frame = test_send_frame;
+    g_plugin.host = &host;
+    g_transfers = ctx;
+
+    handle_data(1, frame, frame_size);
+    uv_run(&context.loop, UV_RUN_DEFAULT);
+    if (!g_transfers)
+        ctx = NULL;
+    if (context.error_called || g_transfers != ctx ||
+        ctx->entries[0].blocks[0].retries != 1 ||
+        ctx->entries[0].blocks[0].received_ok)
+        goto cleanup_transfer;
+
+    memcpy(frame + 24, actual_hash, 8);
+    handle_data(1, frame, frame_size);
+    uv_run(&context.loop, UV_RUN_DEFAULT);
+    if (!g_transfers)
+        ctx = NULL;
+    if (context.error_called || g_transfers != ctx ||
+        !ctx->entries[0].blocks[0].received_ok)
+        goto cleanup_transfer;
+    rc = 0;
+
+cleanup_transfer:
+    free(frame);
+    if (g_transfers) {
+        free_transfer(g_transfers);
+        g_transfers = NULL;
+    } else if (ctx) {
+        free_transfer(ctx);
+    }
+    memset(&g_plugin, 0, sizeof(g_plugin));
+cleanup_file:
+    fclose(fp);
+cleanup_loop:
+    if (uv_loop_close(&context.loop) != 0)
+        rc = 1;
+    return rc;
+}
+
+static int run_terminal_crc32_mismatch_test(void)
+{
+    const char transfer_id[] = "test-transfer";
+    const size_t frame_size = 88 + sizeof(transfer_id) - 1 + MFT_MAX_CHUNK;
+    struct test_host_context context = {0};
+    struct mcp_plugin_host_api host = {0};
+    struct transfer_context *ctx = NULL;
+    unsigned char *frame = NULL;
+    unsigned char *data;
+    char actual_hash[9];
+    char long_path[513];
+    json_error_t json_error;
+    json_t *payload = NULL;
+    json_t *value;
+    const char *reported_path;
+    FILE *fp = NULL;
+    int rc = 1;
+
+    if (uv_loop_init(&context.loop) != 0)
+        return 1;
+    fp = tmpfile();
+    if (!fp)
+        goto cleanup_loop;
+    ctx = make_receive_context(fp, MFT_MAX_CHUNK);
+    if (!ctx)
+        goto cleanup_file;
+    memset(long_path, 'p', sizeof(long_path) - 1);
+    long_path[sizeof(long_path) - 1] = '\0';
+    free(ctx->entries[0].relpath);
+    ctx->entries[0].relpath = mft_strdup(long_path);
+    if (!ctx->entries[0].relpath)
+        goto cleanup_transfer;
+    ctx->crc32_enabled = true;
+    ctx->entries[0].block_crc32 = true;
+    ctx->entries[0].blocks[0].retries = MFT_MAX_BLOCK_RETRIES;
+
+    frame = calloc(1, frame_size);
+    if (!frame)
+        goto cleanup_transfer;
+    memcpy(frame, MFT_MAGIC, 4);
+    frame[4] = MFT_VERSION;
+    frame[5] = MFT_FRAME_DATA;
+    write_u16_be(frame + 6, (uint16_t)(sizeof(transfer_id) - 1));
+    write_u32_be(frame + 8, 1);
+    write_u32_be(frame + 20, MFT_MAX_CHUNK);
+    memcpy(frame + 24, "00000000", 8);
+    memcpy(frame + 88, transfer_id, sizeof(transfer_id) - 1);
+    data = frame + 88 + sizeof(transfer_id) - 1;
+    memset(data, 0x5a, MFT_MAX_CHUNK);
+    bytes_crc32(data, MFT_MAX_CHUNK, actual_hash);
+
+    host.host_context = &context;
+    host.now_ms = test_now_ms;
+    host.get_loop = test_get_loop;
+    host.complete_async_error = test_complete_async_error;
+    host.peer_transport_send_frame = test_send_frame;
+    g_plugin.host = &host;
+    g_transfers = ctx;
+
+    handle_data(1, frame, frame_size);
+    uv_run(&context.loop, UV_RUN_DEFAULT);
+    if (!g_transfers)
+        ctx = NULL;
+    if (!context.error_called || g_transfers != NULL ||
+        strlen(context.error) > 1024)
+        goto cleanup_transfer;
+    payload = json_loads(context.error, JSON_REJECT_DUPLICATES, &json_error);
+    if (!payload || !json_string_equals(payload, "code", "checksum_mismatch") ||
+        !json_string_equals(payload, "algorithm", "crc32") ||
+        !json_string_equals(payload, "checksum_scope", "chunk") ||
+        !json_string_equals(payload, "expected", "00000000") ||
+        !json_string_equals(payload, "actual", actual_hash))
+        goto cleanup_transfer;
+    value = json_object_get(payload, "offset");
+    if (!json_is_integer(value) || json_integer_value(value) != 0)
+        goto cleanup_transfer;
+    value = json_object_get(payload, "size_bytes");
+    if (!json_is_integer(value) || json_integer_value(value) != MFT_MAX_CHUNK ||
+        !json_is_true(json_object_get(payload, "path_truncated")))
+        goto cleanup_transfer;
+    reported_path = json_string_value(json_object_get(payload, "path"));
+    if (!reported_path || strlen(reported_path) >= strlen(long_path) ||
+        strncmp(reported_path, long_path, strlen(reported_path)) != 0)
+        goto cleanup_transfer;
+    rc = 0;
+
+cleanup_transfer:
+    json_decref(payload);
+    free(frame);
+    if (g_transfers) {
+        free_transfer(g_transfers);
+        g_transfers = NULL;
+    } else if (ctx) {
+        free_transfer(ctx);
+    }
+    memset(&g_plugin, 0, sizeof(g_plugin));
+cleanup_file:
+    fclose(fp);
+cleanup_loop:
+    if (uv_loop_close(&context.loop) != 0)
+        rc = 1;
+    return rc;
+}
+
 int main(void)
 {
     const char transfer_id[] = "test-transfer";
@@ -346,5 +544,9 @@ cleanup_loop:
         rc = 1;
     if (rc == 0)
         rc = run_parallel_window_test();
-    return rc == 0 ? run_window_credit_test() : rc;
+    if (rc == 0)
+        rc = run_window_credit_test();
+    if (rc == 0)
+        rc = run_recovered_crc32_mismatch_test();
+    return rc == 0 ? run_terminal_crc32_mismatch_test() : rc;
 }
