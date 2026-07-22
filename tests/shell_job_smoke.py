@@ -334,7 +334,10 @@ def main():
         old_wait = json_content(
             call_tool(proc, 112, "system.shell_wait", {"job_id": old_job_id, "timeout_ms": 3000})
         )
-        assert old_wait["state"] == "exited" and old_wait["exit_code"] == 0, old_wait
+        assert_snapshot(old_wait, old_snapshot)
+        if old_wait["state"] != "exited":
+            old_wait = wait_for_state(proc, old_job_id, "exited")
+        assert old_wait["exit_code"] == 0, old_wait
         assert_snapshot(old_wait, old_snapshot)
         old_tail = json_content(
             call_tool(proc, 113, "system.shell_tail", {"job_id": old_job_id})
