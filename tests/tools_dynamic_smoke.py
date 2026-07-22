@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 
 def send(proc, payload):
@@ -108,6 +109,15 @@ def verify_tool(proc, request_id, tool_name):
         )
         assert waited["isError"] is False, waited
         waited_payload = assert_json_text(waited)
+        assert {key: waited_payload[key] for key in expected_snapshot} == expected_snapshot, waited_payload
+        deadline = time.monotonic() + 3
+        poll_id = request_id + 2001
+        while waited_payload["state"] != "exited" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            waited = call_tool(proc, poll_id, "system.shell_poll", {"job_id": payload["job_id"]})
+            poll_id += 1
+            assert waited["isError"] is False, waited
+            waited_payload = assert_json_text(waited)
         assert waited_payload["state"] == "exited", waited_payload
         assert {key: waited_payload[key] for key in expected_snapshot} == expected_snapshot, waited_payload
         return
