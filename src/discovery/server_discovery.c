@@ -30,7 +30,6 @@
 #define MCP_DISCOVERY_PROXY_TIMEOUT_MS_DEFAULT 5000u
 #define MCP_DISCOVERY_PROXY_TIMEOUT_MS_MAX 300000u
 #define MCP_DISCOVERY_INITIALIZE_ID "mcp_gateway_initialize"
-#define MCP_DISCOVERY_REMOTE_REGISTRY_LIST_TOOLS "registry.list_tools"
 #define MCP_DISCOVERY_MFT_DATA_CAPABILITY "mft.v1.data_channel"
 #define MCP_DISCOVERY_MFT_MAGIC "MFT1"
 #define MCP_DISCOVERY_MFT_DATA_FRAME 5u
@@ -1152,44 +1151,16 @@ static void pending_proxy_timeout_cb(uv_timer_t *timer)
     json_decref(result);
 }
 
-static bool tool_result_is_error(json_t *result)
-{
-    return json_is_true(json_object_get(result, "isError"));
-}
-
-static json_t *parse_tool_result_json_text(json_t *result)
-{
-    json_error_t error;
-    json_t *content;
-    json_t *first;
-    json_t *type;
-    json_t *text;
-
-    content = json_object_get(result, "content");
-    if (!json_is_array(content) || json_array_size(content) == 0)
-        return NULL;
-
-    first = json_array_get(content, 0);
-    type = json_object_get(first, "type");
-    text = json_object_get(first, "text");
-    if (!json_is_string(type) ||
-        strcmp(json_string_value(type), "text") != 0 ||
-        !json_is_string(text))
-        return NULL;
-
-    return json_loads(json_string_value(text), JSON_REJECT_DUPLICATES, &error);
-}
-
 static void peer_store_tools_list_from_result(struct discovery_peer *peer, json_t *result)
 {
     json_t *tools_list;
 
-    if (!peer || !json_is_object(result) || tool_result_is_error(result))
+    if (!peer ||
+        !json_is_object(result) ||
+        !json_is_array(json_object_get(result, "tools")))
         return;
 
-    tools_list = parse_tool_result_json_text(result);
-    if (!tools_list)
-        tools_list = json_deep_copy(result);
+    tools_list = json_deep_copy(result);
     if (!tools_list)
         return;
 
@@ -1225,31 +1196,32 @@ static int pending_proxy_send(struct discovery_pending_proxy *ctx)
     json_t *params;
     char *dumped;
     int rc;
-    const char *remote_tool;
 
     if (!ctx || !ctx->peer || !ctx->peer->conn || !ctx->peer->conn->connected)
         return -1;
     if (ctx->sent)
         return 0;
 
-    remote_tool = ctx->kind == MCP_DISCOVERY_PROXY_TOOLS_LIST
-        ? MCP_DISCOVERY_REMOTE_REGISTRY_LIST_TOOLS
-        : ctx->tool_name;
-
     request = json_object();
-    params = json_object();
-    if (!request || !params) {
-        json_decref(params);
-        json_decref(request);
+    if (!request)
         return -1;
-    }
 
     json_object_set_new(request, "jsonrpc", json_string("2.0"));
     json_object_set_new(request, "id", json_string(ctx->remote_id));
-    json_object_set_new(request, "method", json_string("tools/call"));
-    json_object_set_new(params, "name", json_string(remote_tool));
-    json_object_set(params, "arguments", ctx->arguments);
-    json_object_set_new(request, "params", params);
+    if (ctx->kind == MCP_DISCOVERY_PROXY_TOOLS_LIST) {
+        json_object_set_new(request, "method", json_string("tools/list"));
+        json_object_set(request, "params", ctx->arguments);
+    } else {
+        params = json_object();
+        if (!params) {
+            json_decref(request);
+            return -1;
+        }
+        json_object_set_new(request, "method", json_string("tools/call"));
+        json_object_set_new(params, "name", json_string(ctx->tool_name));
+        json_object_set(params, "arguments", ctx->arguments);
+        json_object_set_new(request, "params", params);
+    }
 
     dumped = json_dumps(request, JSON_COMPACT | JSON_ENSURE_ASCII);
     json_decref(request);
