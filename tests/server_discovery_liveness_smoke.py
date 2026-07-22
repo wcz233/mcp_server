@@ -246,7 +246,7 @@ class FakePeer:
             events = list(self.protocol_events)
             hello_frames = self.hello_frames
         assert events[:3] == ["initialize", "initialized", "hello"], events
-        assert hello_frames == 2, (hello_frames, events)
+        assert hello_frames == 1, (hello_frames, events)
 
     def _run(self):
         while not self._stop.is_set():
