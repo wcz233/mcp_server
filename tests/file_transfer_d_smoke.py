@@ -169,6 +169,32 @@ def wait_for_peer_disconnect(sock, tcp_port, start_id):
     raise AssertionError(f"peer did not disconnect: {last_payload}")
 
 
+def send_discovery_event(discovery_port, instance_id, tcp_port, event):
+    packet = json.dumps(
+        {
+            "mcp_server_discovery": 1,
+            "instance_id": instance_id,
+            "tcp_port": tcp_port,
+            "reply": True,
+            "event": event,
+            "advertise_host": "127.0.0.1",
+            "status": {"hostname": instance_id, "os": "test"},
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+        udp.sendto(packet, ("127.0.0.1", discovery_port))
+
+
+def close_plain_client_sessions(proc, tcp_port, name):
+    for index in range(3):
+        client = wait_for_tcp(tcp_port, proc)
+        try:
+            initialize(client, f"{name}-{index}")
+        finally:
+            client.close()
+
+
 def sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -245,6 +271,7 @@ def main():
 
     try:
         proc_a_pid = proc_a.pid
+        proc_b_pid = proc_b.pid
         sock_a = wait_for_tcp(tcp_a, proc_a)
         sock_b = wait_for_tcp(tcp_b, proc_b)
         initialize(sock_a, "mft-a")
@@ -293,6 +320,63 @@ def main():
         assert send_result["files_skipped"] == 0, send_result
         assert_directory_integrity(send_result, 3)
         assert_tree_equal(src, dst / "src")
+
+        close_plain_client_sessions(proc_a, tcp_a, "adapter-a")
+        close_plain_client_sessions(proc_b, tcp_b, "adapter-b")
+        time.sleep(0.2)
+
+        send_discovery_event(discovery_a, "mft-b-control-reconnect", tcp_b, "offline")
+        next_request_id = wait_for_peer_disconnect(sock_a, tcp_b, 40)
+        send_discovery_event(discovery_a, "mft-b-control-reconnect", tcp_b, "online")
+        peer_b, next_request_id = wait_for_peer(sock_a, tcp_b, next_request_id)
+        assert proc_a.pid == proc_a_pid and proc_a.poll() is None
+        assert proc_b.pid == proc_b_pid and proc_b.poll() is None
+
+        reconnect_src = file_src_dir / "reconnect-10.bin"
+        reconnect_target = Path(tmp) / "reconnect-target.bin"
+        reconnect_pull = Path(tmp) / "reconnect-pull"
+        reconnect_src.write_bytes(bytes(range(10)))
+        reconnect_pull.mkdir()
+        reconnect_send = json_text(
+            call_tool(
+                sock_a,
+                40,
+                "server.send",
+                {
+                    "server_id": peer_b,
+                    "local_path": str(reconnect_src),
+                    "remote_path": str(reconnect_target),
+                    "timeout_ms": 10000,
+                },
+                timeout=15.0,
+            )
+        )
+        assert reconnect_send["files_transferred"] == 1, reconnect_send
+        assert_file_integrity(reconnect_send, reconnect_src)
+        assert reconnect_target.stat().st_size == reconnect_src.stat().st_size
+        assert sha256(reconnect_target) == sha256(reconnect_src)
+        assert not Path(str(reconnect_target) + ".part").exists()
+
+        reconnect_recv = json_text(
+            call_tool(
+                sock_a,
+                41,
+                "server.recv",
+                {
+                    "server_id": peer_b,
+                    "remote_path": str(reconnect_target),
+                    "local_path": str(reconnect_pull),
+                    "timeout_ms": 10000,
+                },
+                timeout=15.0,
+            )
+        )
+        reconnect_pulled = reconnect_pull / reconnect_target.name
+        assert reconnect_recv["files_transferred"] == 1, reconnect_recv
+        assert_file_integrity(reconnect_recv, reconnect_target)
+        assert reconnect_pulled.stat().st_size == reconnect_target.stat().st_size
+        assert sha256(reconnect_pulled) == sha256(reconnect_target)
+        assert not Path(str(reconnect_pulled) + ".part").exists()
 
         sock_b.close()
         sock_b = None

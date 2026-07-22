@@ -223,6 +223,41 @@ static void free_test_transfers(void)
     }
 }
 
+static int test_hello_convergence(struct negotiation_test_context *context,
+                                  json_t *hello)
+{
+    context->block_ack = true;
+    context->chunk_window = true;
+    context->crc32 = true;
+    context->data_channel = true;
+    context->hello_frames = 0;
+    handle_hello(7, hello);
+    if (context->hello_frames != 1)
+        return -1;
+
+    context->block_ack = false;
+    context->chunk_window = false;
+    context->crc32 = false;
+    context->data_channel = false;
+    context->hello_frames = 0;
+    on_peer_connected(NULL, 7);
+    handle_hello(7, hello);
+    if (context->hello_frames != 1)
+        return -1;
+
+    context->block_ack = false;
+    context->chunk_window = false;
+    context->crc32 = false;
+    context->data_channel = false;
+    context->hello_frames = 0;
+    on_peer_connected(NULL, 7);
+    on_peer_closed(NULL, 7);
+    on_peer_closed(NULL, 7);
+    on_peer_connected(NULL, 7);
+    handle_hello(7, hello);
+    return context->hello_frames == 2 ? 0 : -1;
+}
+
 int main(void)
 {
     struct negotiation_test_context context = {0};
@@ -244,6 +279,22 @@ int main(void)
     host.peer_transport_set_capability = negotiation_test_set_capability;
     g_plugin.host = &host;
 
+    hello = json_pack("{s:[s,s,s,s]}",
+                      "capabilities",
+                      MFT_CAP_BLOCK_ACK,
+                      MFT_CAP_CHUNK_WINDOW,
+                      MFT_CAP_CRC32,
+                      MFT_CAP_DATA_CHANNEL);
+    if (!hello || test_hello_convergence(&context, hello) != 0)
+        goto cleanup;
+    json_decref(hello);
+    hello = NULL;
+
+    context.block_ack = false;
+    context.chunk_window = false;
+    context.crc32 = false;
+    context.data_channel = false;
+    context.hello_frames = 0;
     if (invoke_recv("resume-on-hello") != MCP_PLUGIN_CALL_PENDING ||
         !g_pending_negotiations || g_transfers || context.hello_frames != 1)
         goto cleanup;
@@ -262,7 +313,7 @@ int main(void)
         !context.data_channel ||
         g_pending_negotiations || !g_transfers ||
         !g_transfers->crc32_enabled ||
-        context.hello_frames != 2 || context.fetch_frames != 1)
+        context.hello_frames != 1 || context.fetch_frames != 1)
         goto cleanup;
     free_test_transfers();
 
@@ -272,7 +323,7 @@ int main(void)
     if (invoke_recv("legacy-block-ack") != MCP_PLUGIN_CALL_PENDING ||
         g_pending_negotiations || !g_transfers ||
         g_transfers->crc32_enabled ||
-        context.hello_frames != 2 || context.fetch_frames != 2)
+        context.hello_frames != 1 || context.fetch_frames != 2)
         goto cleanup;
     free_test_transfers();
 
