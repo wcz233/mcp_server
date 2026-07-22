@@ -4151,7 +4151,6 @@ void mcp_shell_jobs_destroy(struct mcp_shell_job_store *store)
 }
 
 static json_t *shell_exec_build_result(const struct shell_exec_config *cfg,
-                                       const struct shell_exec_request *request,
                                        const struct shell_exec_outcome *outcome,
                                        bool is_error)
 {
@@ -4172,8 +4171,6 @@ static json_t *shell_exec_build_result(const struct shell_exec_config *cfg,
     if (!payload || !stdout_value || !stderr_value)
         goto fail;
 
-    if (json_object_set_new(payload, "command", json_string(request->command ? request->command : "")) != 0)
-        goto fail;
     if (json_object_set_new(payload, "stdout", stdout_value) != 0)
         goto fail_detach_stdout;
     stdout_value = NULL;
@@ -4319,7 +4316,6 @@ int mcp_tool_system_shell_exec(struct mcp_server *server,
     }
 #endif
     *out_result = shell_exec_build_result(&cfg,
-                                          &request,
                                           &outcome,
                                           outcome.timed_out || outcome.exit_code != 0 ||
                                               outcome.signal_number != 0);

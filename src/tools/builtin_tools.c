@@ -315,7 +315,7 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
 
     if (register_tool(registry,
                       "system.shell_exec",
-                      "Execute a host shell command with OS-level isolation, timeout and structured output.",
+                      "Execute a host shell command with OS-level isolation, timeout and structured output; the result does not repeat the command.",
                       mcp_schema_shell_exec(),
                       "builtin",
                       "L4",
