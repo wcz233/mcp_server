@@ -181,6 +181,8 @@ typedef int mode_t;
 #define MFT_MAX_ACTIVE_WRITE_JOBS 4u
 #define MFT_MAX_WRITE_JOBS 128u
 #define MFT_MAX_WRITE_PAYLOAD (4u * 1024u * 1024u)
+#define MFT_MAX_ERROR_TEXT 1024u
+#define MFT_MAX_ERROR_PATH 160u
 #define MFT_INITIAL_SESSION_WINDOW (1024u * 1024u)
 #define MFT_INITIAL_STREAM_WINDOW (256u * 1024u)
 #define MFT_NEGOTIATION_TIMEOUT_MS 1000u
@@ -256,6 +258,18 @@ enum receive_write_result {
     RECEIVE_WRITE_IO_ERROR = 2,
 };
 
+enum receive_finalize_result {
+    RECEIVE_FINALIZE_OK = 0,
+    RECEIVE_FINALIZE_PATH_ERROR = 1,
+    RECEIVE_FINALIZE_FLUSH_ERROR = 2,
+    RECEIVE_FINALIZE_STAT_ERROR = 3,
+    RECEIVE_FINALIZE_TYPE_ERROR = 4,
+    RECEIVE_FINALIZE_SIZE_MISMATCH = 5,
+    RECEIVE_FINALIZE_READ_ERROR = 6,
+    RECEIVE_FINALIZE_SHA256_MISMATCH = 7,
+    RECEIVE_FINALIZE_RENAME_ERROR = 8,
+};
+
 enum receive_write_stage {
     RECEIVE_WRITE_PENDING = 0,
     RECEIVE_WRITE_HASHING = 1,
@@ -282,6 +296,7 @@ struct receive_write_job {
     bool discarded;
     char chunk_hash[65];
     char block_hash[65];
+    char actual_hash[65];
     enum receive_write_result result;
     enum receive_write_stage stage;
     unsigned char data[];
@@ -316,6 +331,18 @@ struct mft_plugin {
     bool shutting_down;
     unsigned int io_jobs;
     unsigned int prepare_jobs;
+};
+
+struct checksum_mismatch {
+    bool valid;
+    size_t entry_index;
+    size_t block_index;
+    uint64_t offset;
+    uint64_t size;
+    char algorithm[7];
+    char scope[6];
+    char expected[65];
+    char actual[65];
 };
 
 struct transfer_context {
@@ -358,6 +385,8 @@ struct transfer_context {
     unsigned int finalize_files_transferred;
     uint64_t finalize_bytes_total;
     uint64_t finalize_bytes_transferred;
+    char *terminal_error;
+    struct checksum_mismatch checksum_mismatch;
     unsigned int io_jobs;
     struct receive_write_job *write_head;
     struct receive_write_job *write_tail;
@@ -831,6 +860,152 @@ static unsigned int manifest_file_count(struct manifest_entry *entries, size_t c
             files++;
     }
     return files;
+}
+
+static size_t bounded_utf8_prefix(const char *value, size_t max_bytes)
+{
+    size_t len = strlen(value);
+    size_t prefix;
+
+    if (len <= max_bytes)
+        return len;
+    prefix = max_bytes;
+    while (prefix > 0 && ((unsigned char)value[prefix] & 0xc0u) == 0x80u)
+        prefix--;
+    return prefix;
+}
+
+static int set_bounded_error_path(json_t *payload, const char *path)
+{
+    size_t path_len;
+    size_t prefix_len;
+    json_t *path_value;
+
+    if (!payload || !path)
+        return -1;
+    path_len = strlen(path);
+    prefix_len = bounded_utf8_prefix(path, MFT_MAX_ERROR_PATH);
+    path_value = json_stringn(path, prefix_len);
+    if (!path_value || json_object_set_new(payload, "path", path_value) != 0)
+        return -1;
+    if (prefix_len < path_len &&
+        json_object_set_new(payload, "path_truncated", json_true()) != 0)
+        return -1;
+    return 0;
+}
+
+static char *dump_bounded_error(json_t *payload)
+{
+    char *dump;
+
+    if (!payload)
+        return NULL;
+    dump = json_dumps(payload, JSON_COMPACT | JSON_ENSURE_ASCII);
+    if (dump && strlen(dump) > MFT_MAX_ERROR_TEXT) {
+        free(dump);
+        dump = NULL;
+    }
+    return dump;
+}
+
+static char *build_whole_file_mismatch_error(const char *path,
+                                             const char *expected,
+                                             const char *actual)
+{
+    json_t *payload = json_pack("{s:s,s:s,s:s,s:s}",
+                                "code",
+                                "sha256_mismatch",
+                                "message",
+                                "Received file failed whole-file SHA-256 verification.",
+                                "expected_sha256",
+                                expected,
+                                "actual_sha256",
+                                actual);
+    char *dump;
+
+    if (!payload || set_bounded_error_path(payload, path) != 0) {
+        json_decref(payload);
+        return NULL;
+    }
+    dump = dump_bounded_error(payload);
+    json_decref(payload);
+    return dump;
+}
+
+static void record_checksum_mismatch(struct transfer_context *ctx,
+                                     size_t entry_index,
+                                     size_t block_index,
+                                     const char *scope,
+                                     uint64_t offset,
+                                     uint64_t size,
+                                     const char *expected,
+                                     const char *actual)
+{
+    struct checksum_mismatch *mismatch;
+
+    if (!ctx || entry_index >= ctx->entry_count || !scope || !expected || !actual)
+        return;
+    mismatch = &ctx->checksum_mismatch;
+    mismatch->valid = true;
+    mismatch->entry_index = entry_index;
+    mismatch->block_index = block_index;
+    mismatch->offset = offset;
+    mismatch->size = size;
+    snprintf(mismatch->algorithm,
+             sizeof(mismatch->algorithm),
+             "%s",
+             ctx->crc32_enabled ? "crc32" : "sha256");
+    snprintf(mismatch->scope, sizeof(mismatch->scope), "%s", scope);
+    snprintf(mismatch->expected, sizeof(mismatch->expected), "%s", expected);
+    snprintf(mismatch->actual, sizeof(mismatch->actual), "%s", actual);
+}
+
+static void clear_checksum_mismatch(struct transfer_context *ctx,
+                                    size_t entry_index,
+                                    size_t block_index)
+{
+    if (ctx && ctx->checksum_mismatch.valid &&
+        ctx->checksum_mismatch.entry_index == entry_index &&
+        ctx->checksum_mismatch.block_index == block_index)
+        memset(&ctx->checksum_mismatch, 0, sizeof(ctx->checksum_mismatch));
+}
+
+static char *build_checksum_mismatch_error(struct transfer_context *ctx)
+{
+    struct checksum_mismatch *mismatch;
+    json_t *payload;
+    char *dump;
+
+    if (!ctx || !ctx->checksum_mismatch.valid ||
+        ctx->checksum_mismatch.entry_index >= ctx->entry_count)
+        return NULL;
+    mismatch = &ctx->checksum_mismatch;
+    payload = json_pack("{s:s,s:s,s:s,s:s,s:I,s:I,s:s,s:s}",
+                        "code",
+                        "checksum_mismatch",
+                        "message",
+                        "Received file checksum verification failed after retry limit.",
+                        "algorithm",
+                        mismatch->algorithm,
+                        "checksum_scope",
+                        mismatch->scope,
+                        "offset",
+                        (json_int_t)mismatch->offset,
+                        "size_bytes",
+                        (json_int_t)mismatch->size,
+                        "expected",
+                        mismatch->expected,
+                        "actual",
+                        mismatch->actual);
+    if (!payload ||
+        set_bounded_error_path(payload,
+                               ctx->entries[mismatch->entry_index].relpath) != 0) {
+        json_decref(payload);
+        return NULL;
+    }
+    dump = dump_bounded_error(payload);
+    json_decref(payload);
+    return dump;
 }
 
 enum mft_path_separator_mode {
@@ -2447,21 +2622,25 @@ static void mark_receive_resume_blocks(struct transfer_context *ctx)
     }
 }
 
-static int finalize_received(const char *target_root,
-                             struct manifest_entry *entries,
-                             size_t count,
-                             json_t *accept,
-                             unsigned int *files_skipped,
-                             unsigned int *files_transferred)
+static enum receive_finalize_result finalize_received(const char *target_root,
+                                                       struct manifest_entry *entries,
+                                                       size_t count,
+                                                       json_t *accept,
+                                                       unsigned int *files_skipped,
+                                                       unsigned int *files_transferred,
+                                                       char **terminal_error)
 {
     size_t i;
 
     *files_skipped = 0;
     *files_transferred = 0;
+    *terminal_error = NULL;
     for (i = 0; i < count; i++) {
         struct manifest_entry *entry = &entries[i];
         char final_path[PATH_MAX];
         char tmp_part[PATH_MAX];
+        char actual_hash[65];
+        struct stat st;
         json_t *decision_item = json_array_get(accept, i);
         json_t *decision = decision_item ? json_object_get(decision_item, "decision") : NULL;
 
@@ -2473,17 +2652,29 @@ static int finalize_received(const char *target_root,
         }
         if (join_path(final_path, sizeof(final_path), target_root, entry->relpath) != 0 ||
             part_path(tmp_part, sizeof(tmp_part), final_path) != 0)
-            return -1;
+            return RECEIVE_FINALIZE_PATH_ERROR;
         if (flush_receive_file(entry) != 0 || close_receive_file(entry) != 0)
-            return -1;
-        if (!quick_file_matches(tmp_part, entry))
-            return -1;
+            return RECEIVE_FINALIZE_FLUSH_ERROR;
+        if (stat(tmp_part, &st) != 0)
+            return RECEIVE_FINALIZE_STAT_ERROR;
+        if (!S_ISREG(st.st_mode))
+            return RECEIVE_FINALIZE_TYPE_ERROR;
+        if ((uint64_t)st.st_size != entry->size)
+            return RECEIVE_FINALIZE_SIZE_MISMATCH;
+        if (file_sha256(tmp_part, actual_hash) != 0)
+            return RECEIVE_FINALIZE_READ_ERROR;
+        if (strcmp(actual_hash, entry->hash) != 0) {
+            *terminal_error = build_whole_file_mismatch_error(entry->relpath,
+                                                              entry->hash,
+                                                              actual_hash);
+            return RECEIVE_FINALIZE_SHA256_MISMATCH;
+        }
         chmod(tmp_part, entry->mode ? (mode_t)entry->mode : 0666);
         if (rename(tmp_part, final_path) != 0)
-            return -1;
+            return RECEIVE_FINALIZE_RENAME_ERROR;
         (*files_transferred)++;
     }
-    return 0;
+    return RECEIVE_FINALIZE_OK;
 }
 
 static int send_transfer_complete(struct transfer_context *ctx)
@@ -2997,6 +3188,7 @@ static void free_transfer(struct transfer_context *ctx)
     free(ctx->local_path);
     free(ctx->remote_path);
     free(ctx->source_name);
+    free(ctx->terminal_error);
     if (ctx->send_fp)
         fclose(ctx->send_fp);
     free_entries(ctx->entries, ctx->entry_count);
@@ -3020,13 +3212,12 @@ static void finish_receive_write_job(struct transfer_context *ctx,
 static void receive_write_work(uv_work_t *req)
 {
     struct receive_write_job *job = req->data;
-    char actual_hash[65];
 
     if (job->ctx->crc32_enabled)
-        bytes_crc32(job->data, job->data_len, actual_hash);
+        bytes_crc32(job->data, job->data_len, job->actual_hash);
     else
-        bytes_sha256(job->data, job->data_len, actual_hash);
-    if (strcmp(actual_hash, job->chunk_hash) != 0) {
+        bytes_sha256(job->data, job->data_len, job->actual_hash);
+    if (strcmp(job->actual_hash, job->chunk_hash) != 0) {
         job->result = RECEIVE_WRITE_CHUNK_MISMATCH;
         return;
     }
@@ -3131,6 +3322,7 @@ static int commit_receive_write_job(struct transfer_context *ctx,
     unsigned char hash_bytes[32];
     char actual_hash[65];
     bool nack = false;
+    bool checksum_mismatch = false;
 
     if (job->discarded)
         return 0;
@@ -3146,9 +3338,19 @@ static int commit_receive_write_job(struct transfer_context *ctx,
         *error_message = "Failed to write received file data.";
         return -1;
     }
-    if (job->result == RECEIVE_WRITE_CHUNK_MISMATCH ||
-        !block->receive_hash_started || block->receive_hash_failed ||
-        job->offset != block->receive_next_offset) {
+    if (job->result == RECEIVE_WRITE_CHUNK_MISMATCH) {
+        record_checksum_mismatch(ctx,
+                                 job->stream_id - 1,
+                                 job->block_index,
+                                 "chunk",
+                                 job->offset,
+                                 job->data_len,
+                                 job->chunk_hash,
+                                 job->actual_hash);
+        checksum_mismatch = true;
+        nack = true;
+    } else if (!block->receive_hash_started || block->receive_hash_failed ||
+               job->offset != block->receive_next_offset) {
         nack = true;
     } else if (ctx->crc32_enabled) {
         block->receive_crc32 = crc32_update(block->receive_crc32,
@@ -3156,8 +3358,18 @@ static int commit_receive_write_job(struct transfer_context *ctx,
                                             job->data_len);
         if (job->block_tail) {
             crc32_to_hex(block->receive_crc32, actual_hash);
-            if (strcmp(actual_hash, job->block_hash) != 0)
+            if (strcmp(actual_hash, job->block_hash) != 0) {
+                record_checksum_mismatch(ctx,
+                                         job->stream_id - 1,
+                                         job->block_index,
+                                         "block",
+                                         job->block_offset,
+                                         job->block_size,
+                                         job->block_hash,
+                                         actual_hash);
+                checksum_mismatch = true;
                 nack = true;
+            }
         }
     } else {
         sha256_update(&block->receive_hash_ctx, job->data, job->data_len);
@@ -3166,15 +3378,33 @@ static int commit_receive_write_job(struct transfer_context *ctx,
 
             sha256_final(&final_ctx, hash_bytes);
             hash_to_hex(hash_bytes, actual_hash);
-            if (strcmp(actual_hash, job->block_hash) != 0)
+            if (strcmp(actual_hash, job->block_hash) != 0) {
+                record_checksum_mismatch(ctx,
+                                         job->stream_id - 1,
+                                         job->block_index,
+                                         "block",
+                                         job->block_offset,
+                                         job->block_size,
+                                         job->block_hash,
+                                         actual_hash);
+                checksum_mismatch = true;
                 nack = true;
+            }
         }
     }
     if (nack) {
         int nack_rc = mark_block_nack(ctx, job->stream_id, job->block_index);
 
         if (nack_rc == -2) {
-            *error_message = "File transfer receive retry limit exceeded.";
+            if (checksum_mismatch) {
+                free(ctx->terminal_error);
+                ctx->terminal_error = build_checksum_mismatch_error(ctx);
+                *error_message = ctx->terminal_error ?
+                                     ctx->terminal_error :
+                                     "File transfer receive retry limit exceeded.";
+            } else {
+                *error_message = "File transfer receive retry limit exceeded.";
+            }
             return -1;
         }
         send_block_ack_raw(ctx->server_id,
@@ -3203,6 +3433,7 @@ static int commit_receive_write_job(struct transfer_context *ctx,
         }
     }
     if (job->block_tail) {
+        clear_checksum_mismatch(ctx, job->stream_id - 1, job->block_index);
         block->received_ok = true;
         block->receive_waiting = false;
         block->receive_hash_started = false;
@@ -3428,7 +3659,7 @@ static void complete_transfer_error_unlinked(struct transfer_context *ctx,
                                              const char *message,
                                              bool notify_peer)
 {
-    char error[256];
+    char error[MFT_MAX_ERROR_TEXT + 1];
     char *transfer_id = NULL;
     char *invocation_id = NULL;
     unsigned int server_id;
@@ -4815,12 +5046,42 @@ static void finalize_receive_work(uv_work_t *req)
 {
     struct transfer_context *ctx = req->data;
 
+    free(ctx->terminal_error);
+    ctx->terminal_error = NULL;
     ctx->finalize_result = finalize_received(ctx->local_path,
                                              ctx->entries,
                                              ctx->entry_count,
                                              ctx->accept,
                                              &ctx->finalize_files_skipped,
-                                             &ctx->finalize_files_transferred);
+                                             &ctx->finalize_files_transferred,
+                                             &ctx->terminal_error);
+}
+
+static const char *finalize_error_message(struct transfer_context *ctx, int status)
+{
+    if (status < 0)
+        return "Failed to finalize received file transfer.";
+    switch ((enum receive_finalize_result)ctx->finalize_result) {
+    case RECEIVE_FINALIZE_PATH_ERROR:
+        return "Failed to resolve received file path.";
+    case RECEIVE_FINALIZE_FLUSH_ERROR:
+        return "Failed to flush received file.";
+    case RECEIVE_FINALIZE_STAT_ERROR:
+        return "Failed to stat received file.";
+    case RECEIVE_FINALIZE_TYPE_ERROR:
+        return "Received path is not a regular file.";
+    case RECEIVE_FINALIZE_SIZE_MISMATCH:
+        return "Received file size does not match manifest.";
+    case RECEIVE_FINALIZE_READ_ERROR:
+        return "Failed to read received file for SHA-256 verification.";
+    case RECEIVE_FINALIZE_SHA256_MISMATCH:
+        return ctx->terminal_error ? ctx->terminal_error : "File transfer failed.";
+    case RECEIVE_FINALIZE_RENAME_ERROR:
+        return "Failed to rename verified received file.";
+    case RECEIVE_FINALIZE_OK:
+    default:
+        return "Failed to finalize received file transfer.";
+    }
 }
 
 static void finalize_receive_after_work(uv_work_t *req, int status)
@@ -4839,7 +5100,7 @@ static void finalize_receive_after_work(uv_work_t *req, int status)
 
     if (status < 0 || ctx->finalize_result != 0) {
         complete_transfer_error_unlinked(ctx,
-                                         "Failed to finalize received file transfer.",
+                                         finalize_error_message(ctx, status),
                                          true);
         return;
     }
