@@ -162,9 +162,9 @@ def proxy_tools_list(sock, request_id, server_id):
         },
     )
     result = response["result"]
-    assert "content" not in result, result
-    assert isinstance(result.get("tools"), list), result
-    return result
+    payload = parse_text_json(result)
+    assert isinstance(payload.get("tools"), list), payload
+    return payload
 
 
 def assert_server_entry_contract(server):
@@ -316,13 +316,22 @@ def main():
         ), direct_tools_payload
         assert_equivalent_scale_reduction(local, peer, management_payload)
 
-        tools_payload = proxy_tools_list(sock_a, 5, peer_server_id)
+        result = call_tool(
+            sock_a,
+            5,
+            "gateway.proxy_tool",
+            {"server_id": peer_server_id, "tool_name": "system.ping", "args": {}},
+        )
+        assert result["isError"] is False, result
+        assert result["content"][0]["text"] == "pong", result
+
+        tools_payload = proxy_tools_list(sock_a, 6, peer_server_id)
         assert tools_payload == direct_tools_payload, tools_payload
         remote_tool_names = {tool["name"] for tool in tools_payload["tools"]}
         assert "system.ping" in remote_tool_names, tools_payload
         assert "gateway.proxy_tool" in remote_tool_names, tools_payload
 
-        result = call_tool(sock_a, 6, "server.list_servers", {"wait_ms": 100})
+        result = call_tool(sock_a, 7, "server.list_servers", {"wait_ms": 100})
         cached_payload = parse_text_json(result)
         cached_peer = next(
             server for server in cached_payload["servers"] if server["address"] == f"127.0.0.1:{tcp_b}"
@@ -341,14 +350,20 @@ def main():
         )
         assert_full_status_available(cached_peer["system_status"], remote_full_status)
 
-        result = call_tool(
+        missing = call_tool(
             sock_a,
-            7,
+            105,
             "gateway.proxy_tool",
-            {"server_id": peer_server_id, "tool_name": "system.ping", "args": {}},
+            {
+                "server_id": peer_server_id,
+                "tool_name": "diagnostic.nonexistent",
+                "args": {},
+            },
         )
-        assert result["isError"] is False, result
-        assert result["content"][0]["text"] == "pong", result
+        assert missing["isError"] is True, missing
+        missing_text = missing["content"][0]["text"].lower()
+        assert "not advertised" in missing_text, missing
+        assert "not cached" not in missing_text, missing
 
         if plugin_path:
             loaded = parse_text_json(

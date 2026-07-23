@@ -207,19 +207,26 @@ class FakePeer:
         respond_to_ping,
         support_data_channel=False,
         duplicate_initialize_response=False,
+        delay_tools_list=False,
     ):
         self.tcp_port = tcp_port
         self.respond_to_ping = respond_to_ping
         self.support_data_channel = support_data_channel
         self.duplicate_initialize_response = duplicate_initialize_response
+        self.delay_tools_list = delay_tools_list
         self.heartbeats = []
+        self.tools_list_requests = 0
+        self.tools_call_requests = 0
         self.data_connections = 0
         self.control_data_frames = 0
         self.hello_frames = 0
         self.protocol_events = []
         self.hello_seen = threading.Event()
+        self.tools_list_seen = threading.Event()
         self.data_link_failed = threading.Event()
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._pending_tools_list = []
         self._stop = threading.Event()
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -247,6 +254,36 @@ class FakePeer:
             hello_frames = self.hello_frames
         assert events[:3] == ["initialize", "initialized", "hello"], events
         assert hello_frames == 1, (hello_frames, events)
+
+    def complete_tools_list(self):
+        with self._lock:
+            pending = list(self._pending_tools_list)
+            self._pending_tools_list.clear()
+        assert len(pending) == 1, pending
+        for conn, request_id in pending:
+            self._send_tools_list(conn, request_id)
+
+    def _send_frame(self, conn, payload):
+        with self._send_lock:
+            send_frame(conn, payload)
+
+    def _send_tools_list(self, conn, request_id):
+        self._send_frame(
+            conn,
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "system.ping",
+                            "description": "Return pong.",
+                            "inputSchema": {"type": "object", "additionalProperties": False},
+                        }
+                    ]
+                },
+            },
+        )
 
     def _run(self):
         while not self._stop.is_set():
@@ -345,18 +382,45 @@ class FakePeer:
                         "id": request["id"],
                         "result": {},
                     }
-                    send_frame(conn, response)
+                    self._send_frame(conn, response)
                     if not data_channel:
                         with self._lock:
                             self.protocol_events.append("initialized")
                         if self.duplicate_initialize_response:
-                            send_frame(conn, response)
+                            self._send_frame(conn, response)
+                    continue
+                if request.get("method") == "tools/list":
+                    with self._lock:
+                        self.tools_list_requests += 1
+                        self.tools_list_seen.set()
+                        if self.delay_tools_list:
+                            self._pending_tools_list.append((conn, request["id"]))
+                    if not self.delay_tools_list:
+                        self._send_tools_list(conn, request["id"])
+                    continue
+                if request.get("method") == "tools/call":
+                    params = request.get("params", {})
+                    if params.get("name") != "system.ping":
+                        continue
+                    with self._lock:
+                        self.tools_call_requests += 1
+                    self._send_frame(
+                        conn,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": {
+                                "content": [{"type": "text", "text": "pong"}],
+                                "isError": False,
+                            },
+                        },
+                    )
                     continue
                 if request.get("method") != "ping":
                     continue
                 self.heartbeats.append(time.time())
                 if self.respond_to_ping:
-                    send_frame(
+                    self._send_frame(
                         conn,
                         {
                             "jsonrpc": "2.0",
@@ -414,6 +478,45 @@ def proxy_ping(sock, request_id, server_id):
     result = response["result"]
     assert result["isError"] is False, result
     assert result["content"][0]["text"] == "pong", result
+
+
+def verify_automatic_tool_discovery(tcp_server, fake_peer, server_id):
+    callers = []
+    threads = []
+    outcomes = []
+    try:
+        for _ in range(2):
+            caller = socket.create_connection(("127.0.0.1", tcp_server), timeout=1.0)
+            caller.settimeout(5.0)
+            initialize(caller)
+            callers.append(caller)
+
+        def invoke(caller):
+            try:
+                proxy_ping(caller, 2, server_id)
+                outcomes.append(None)
+            except Exception as exc:
+                outcomes.append(exc)
+
+        for caller in callers:
+            thread = threading.Thread(target=invoke, args=(caller,), daemon=True)
+            thread.start()
+            threads.append(thread)
+
+        time.sleep(0.2)
+        assert all(thread.is_alive() for thread in threads), outcomes
+        assert fake_peer.tools_list_requests == 1, fake_peer.tools_list_requests
+        fake_peer.complete_tools_list()
+
+        for thread in threads:
+            thread.join(timeout=5)
+        assert all(not thread.is_alive() for thread in threads), outcomes
+        assert outcomes == [None, None], outcomes
+        assert fake_peer.tools_call_requests == 2, fake_peer.tools_call_requests
+        assert fake_peer.tools_list_requests == 1, fake_peer.tools_list_requests
+    finally:
+        for caller in callers:
+            caller.close()
 
 
 def blocking_command():
@@ -534,6 +637,7 @@ def main():
         respond_to_ping=True,
         support_data_channel=file_transfer_mode != "n",
         duplicate_initialize_response=True,
+        delay_tools_list=True,
     )
     timeout_peer = FakePeer(fake_tcp_timeout, respond_to_ping=False)
     online_peer.start()
@@ -576,6 +680,9 @@ def main():
         assert peer and peer["state"] == "online", payload
         assert len(online_peer.heartbeats) >= 2, online_peer.heartbeats
         assert online_peer.heartbeats[-1] - online_peer.heartbeats[0] >= 0.8, online_peer.heartbeats
+        assert online_peer.tools_list_seen.wait(2), "missing automatic tools/list after initialization"
+        assert online_peer.tools_list_requests == 1, online_peer.tools_list_requests
+        verify_automatic_tool_discovery(tcp_server, online_peer, peer["server_id"])
         if os.name != "nt":
             verify_nonblocking_shell_wait(
                 exe,
