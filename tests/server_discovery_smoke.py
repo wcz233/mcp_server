@@ -162,10 +162,7 @@ def proxy_tools_list(sock, request_id, server_id):
         },
     )
     result = response["result"]
-    if result.get("isError") is False and isinstance(result.get("content"), list):
-        payload = parse_text_json(result)
-    else:
-        payload = result
+    payload = parse_text_json(result)
     assert isinstance(payload.get("tools"), list), payload
     return result, payload
 
@@ -330,13 +327,7 @@ def main():
             contract_failures.append(f"automatic proxy call failed: {result}")
 
         tools_result, tools_payload = proxy_tools_list(sock_a, 6, peer_server_id)
-        if tools_result.get("isError") is not False or not isinstance(
-            tools_result.get("content"), list
-        ):
-            contract_failures.append(
-                "proxied tools/list is not a CallToolResult: "
-                f"keys={sorted(tools_result)}"
-            )
+        assert tools_result["isError"] is False, tools_result
         assert tools_payload == direct_tools_payload, tools_payload
         remote_tool_names = {tool["name"] for tool in tools_payload["tools"]}
         assert "system.ping" in remote_tool_names, tools_payload

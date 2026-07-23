@@ -1371,9 +1371,16 @@ static bool pending_proxy_complete_response(struct discovery_peer_conn *conn, js
             continue;
 
         if (result) {
-            if (ctx->kind == MCP_DISCOVERY_PROXY_TOOLS_LIST)
+            if (ctx->kind == MCP_DISCOVERY_PROXY_TOOLS_LIST) {
+                json_t *tool_result;
+
                 peer_store_tools_list_from_result(ctx->peer, result);
-            pending_proxy_finish_result(ctx, result);
+                tool_result = mcp_tool_result_json_text(result, false);
+                pending_proxy_finish_result(ctx, tool_result);
+                json_decref(tool_result);
+            } else {
+                pending_proxy_finish_result(ctx, result);
+            }
         } else {
             json_t *message = json_object_get(error, "message");
             json_t *tool_result = proxy_error_result(
