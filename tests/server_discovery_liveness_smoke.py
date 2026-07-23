@@ -56,7 +56,7 @@ def call(sock, request_id, method, params=None):
     return response
 
 
-def call_tool(sock, request_id, name, arguments=None):
+def call_tool_result(sock, request_id, name, arguments=None):
     response = call(
         sock,
         request_id,
@@ -65,6 +65,11 @@ def call_tool(sock, request_id, name, arguments=None):
     )
     result = response["result"]
     assert result["content"][0]["type"] == "text", result
+    return result
+
+
+def call_tool(sock, request_id, name, arguments=None):
+    result = call_tool_result(sock, request_id, name, arguments)
     assert result["isError"] is False, result
     return json.loads(result["content"][0]["text"])
 
@@ -94,6 +99,7 @@ def start_server(exe, tcp_port, discovery_port, peer_discovery_port):
     env["MCP_DISCOVERY_PORT"] = str(discovery_port)
     env["MCP_DISCOVERY_ADVERTISE_HOST"] = "127.0.0.1"
     env["MCP_DISCOVERY_HOSTS"] = f"127.0.0.1:{peer_discovery_port}"
+    env["MCP_DISCOVERY_PROXY_TIMEOUT_MS"] = "3000"
     env["MCP_STRICT_INIT"] = "0"
     env["MCP_ENABLE_SHELL_EXEC"] = "1"
     env["MCP_SHELL_EXEC_CONFIG"] = os.path.join(
@@ -208,12 +214,14 @@ class FakePeer:
         support_data_channel=False,
         duplicate_initialize_response=False,
         delay_tools_list=False,
+        malformed_tools_list=False,
     ):
         self.tcp_port = tcp_port
         self.respond_to_ping = respond_to_ping
         self.support_data_channel = support_data_channel
         self.duplicate_initialize_response = duplicate_initialize_response
         self.delay_tools_list = delay_tools_list
+        self.malformed_tools_list = malformed_tools_list
         self.heartbeats = []
         self.tools_list_requests = 0
         self.tools_call_requests = 0
@@ -263,25 +271,37 @@ class FakePeer:
             self._send_tools_list(conn, request_id)
         return len(pending)
 
+    def set_tools_list_behavior(self, *, delay, malformed):
+        with self._lock:
+            self.delay_tools_list = delay
+            self.malformed_tools_list = malformed
+
+    def set_respond_to_ping(self, respond):
+        with self._lock:
+            self.respond_to_ping = respond
+
     def _send_frame(self, conn, payload):
         with self._send_lock:
             send_frame(conn, payload)
 
     def _send_tools_list(self, conn, request_id):
+        with self._lock:
+            malformed = self.malformed_tools_list
+        result = {"unexpected": []} if malformed else {
+            "tools": [
+                {
+                    "name": "system.ping",
+                    "description": "Return pong.",
+                    "inputSchema": {"type": "object", "additionalProperties": False},
+                }
+            ]
+        }
         self._send_frame(
             conn,
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {
-                    "tools": [
-                        {
-                            "name": "system.ping",
-                            "description": "Return pong.",
-                            "inputSchema": {"type": "object", "additionalProperties": False},
-                        }
-                    ]
-                },
+                "result": result,
             },
         )
 
@@ -393,9 +413,10 @@ class FakePeer:
                     with self._lock:
                         self.tools_list_requests += 1
                         self.tools_list_seen.set()
-                        if self.delay_tools_list:
+                        delay_tools_list = self.delay_tools_list
+                        if delay_tools_list:
                             self._pending_tools_list.append((conn, request["id"]))
-                    if not self.delay_tools_list:
+                    if not delay_tools_list:
                         self._send_tools_list(conn, request["id"])
                     continue
                 if request.get("method") == "tools/call":
@@ -418,8 +439,10 @@ class FakePeer:
                     continue
                 if request.get("method") != "ping":
                     continue
-                self.heartbeats.append(time.time())
-                if self.respond_to_ping:
+                with self._lock:
+                    self.heartbeats.append(time.time())
+                    respond_to_ping = self.respond_to_ping
+                if respond_to_ping:
                     self._send_frame(
                         conn,
                         {
@@ -451,31 +474,20 @@ def wait_for_online_peer(sock, tcp_port, start_id):
     raise AssertionError(f"peer did not become online: {last_payload}")
 
 
-def cache_remote_tools(sock, request_id, server_id):
-    response = call(
+def proxy_tool_result(sock, request_id, server_id, tool_name, proxy_timeout_ms=None):
+    arguments = {"server_id": server_id, "tool_name": tool_name, "args": {}}
+    if proxy_timeout_ms is not None:
+        arguments["proxy_timeout_ms"] = proxy_timeout_ms
+    return call_tool_result(
         sock,
         request_id,
-        "tools/call",
-        {
-            "name": "gateway.proxy_tool",
-            "arguments": {"server_id": server_id, "tool_name": "tools_list", "args": {}},
-        },
+        "gateway.proxy_tool",
+        arguments,
     )
-    tools = response["result"]["tools"]
-    assert any(tool["name"] == "system.ping" for tool in tools), tools
 
 
 def proxy_ping(sock, request_id, server_id):
-    response = call(
-        sock,
-        request_id,
-        "tools/call",
-        {
-            "name": "gateway.proxy_tool",
-            "arguments": {"server_id": server_id, "tool_name": "system.ping", "args": {}},
-        },
-    )
-    result = response["result"]
+    result = proxy_tool_result(sock, request_id, server_id, "system.ping")
     assert result["isError"] is False, result
     assert result["content"][0]["text"] == "pong", result
 
@@ -560,8 +572,6 @@ def verify_nonblocking_shell_wait(
         observed_server, observer_request_id = wait_for_online_peer(
             observer_sock, tcp_server, 2
         )
-        cache_remote_tools(observer_sock, observer_request_id, observed_server["server_id"])
-        observer_request_id += 1
 
         started = call_tool(
             client_sock,
@@ -655,7 +665,11 @@ def main():
         duplicate_initialize_response=True,
         delay_tools_list=True,
     )
-    timeout_peer = FakePeer(fake_tcp_timeout, respond_to_ping=False)
+    timeout_peer = FakePeer(
+        fake_tcp_timeout,
+        respond_to_ping=True,
+        delay_tools_list=True,
+    )
     online_peer.start()
     timeout_peer.start()
 
@@ -707,6 +721,36 @@ def main():
             verify_automatic_tool_discovery(tcp_server, online_peer, peer["server_id"])
         )
         assert not contract_failures, "\n".join(contract_failures)
+
+        udp_sock.sendto(
+            udp_packet("fake-timeout", fake_tcp_timeout),
+            ("127.0.0.1", discovery_server),
+        )
+        failure_peer, failure_request_id = wait_for_online_peer(
+            sock, fake_tcp_timeout, 30
+        )
+        assert timeout_peer.tools_list_seen.wait(2), "missing delayed tools/list request"
+        timed_out = proxy_tool_result(
+            sock,
+            failure_request_id,
+            failure_peer["server_id"],
+            "system.ping",
+            proxy_timeout_ms=4500,
+        )
+        assert timed_out["isError"] is True, timed_out
+        assert "tools discovery timed out" in timed_out["content"][0]["text"].lower(), timed_out
+
+        timeout_peer.set_tools_list_behavior(delay=False, malformed=True)
+        malformed = proxy_tool_result(
+            sock,
+            failure_request_id + 1,
+            failure_peer["server_id"],
+            "system.ping",
+            proxy_timeout_ms=4500,
+        )
+        assert malformed["isError"] is True, malformed
+        assert "invalid tools/list response" in malformed["content"][0]["text"].lower(), malformed
+        timeout_peer.set_respond_to_ping(False)
         if os.name != "nt":
             verify_nonblocking_shell_wait(
                 exe,
@@ -747,6 +791,9 @@ def main():
             assert peer and peer["state"] == "online" and peer["tcp_connected"] is True, payload
             assert online_peer.hello_seen.is_set(), "missing MFT1 negotiation after peer restart"
             online_peer.assert_initialized_before_hello()
+            assert online_peer.tools_list_seen.wait(2), "missing tools/list after peer restart"
+            assert online_peer.tools_list_requests == 1, online_peer.tools_list_requests
+            proxy_ping(sock, 24, peer["server_id"])
 
             with tempfile.NamedTemporaryFile(delete=False) as transfer_file:
                 transfer_file.write(b"d" * (1024 * 1024))
@@ -797,7 +844,6 @@ def main():
         assert peer and peer["state"] == "online" and peer["tcp_connected"] is True, payload
         sock.settimeout(3.0)
 
-        udp_sock.sendto(udp_packet("fake-timeout", fake_tcp_timeout), ("127.0.0.1", discovery_server))
         deadline = time.time() + 7
         timeout_payload = None
         while time.time() < deadline:
