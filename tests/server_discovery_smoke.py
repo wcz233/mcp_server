@@ -162,9 +162,12 @@ def proxy_tools_list(sock, request_id, server_id):
         },
     )
     result = response["result"]
-    payload = parse_text_json(result)
+    if result.get("isError") is False and isinstance(result.get("content"), list):
+        payload = parse_text_json(result)
+    else:
+        payload = result
     assert isinstance(payload.get("tools"), list), payload
-    return payload
+    return result, payload
 
 
 def assert_server_entry_contract(server):
@@ -242,6 +245,7 @@ def main():
     proc_b = None
     sock_a = None
     sock_b = None
+    contract_failures = []
 
     try:
         sock_a = wait_for_tcp(tcp_a, proc_a)
@@ -322,10 +326,17 @@ def main():
             "gateway.proxy_tool",
             {"server_id": peer_server_id, "tool_name": "system.ping", "args": {}},
         )
-        assert result["isError"] is False, result
-        assert result["content"][0]["text"] == "pong", result
+        if result["isError"] is not False or result["content"][0]["text"] != "pong":
+            contract_failures.append(f"automatic proxy call failed: {result}")
 
-        tools_payload = proxy_tools_list(sock_a, 6, peer_server_id)
+        tools_result, tools_payload = proxy_tools_list(sock_a, 6, peer_server_id)
+        if tools_result.get("isError") is not False or not isinstance(
+            tools_result.get("content"), list
+        ):
+            contract_failures.append(
+                "proxied tools/list is not a CallToolResult: "
+                f"keys={sorted(tools_result)}"
+            )
         assert tools_payload == direct_tools_payload, tools_payload
         remote_tool_names = {tool["name"] for tool in tools_payload["tools"]}
         assert "system.ping" in remote_tool_names, tools_payload
@@ -362,8 +373,8 @@ def main():
         )
         assert missing["isError"] is True, missing
         missing_text = missing["content"][0]["text"].lower()
-        assert "not advertised" in missing_text, missing
-        assert "not cached" not in missing_text, missing
+        if "not advertised" not in missing_text or "not cached" in missing_text:
+            contract_failures.append(f"missing tool error is imprecise: {missing}")
 
         if plugin_path:
             loaded = parse_text_json(
@@ -376,7 +387,7 @@ def main():
             direct_names = {tool["name"] for tool in direct_tools_payload["tools"]}
             assert {"server.send", "server.recv"}.issubset(direct_names), direct_tools_payload
 
-            tools_payload = proxy_tools_list(sock_a, 8, peer_server_id)
+            _, tools_payload = proxy_tools_list(sock_a, 8, peer_server_id)
             assert tools_payload == direct_tools_payload, tools_payload
             plugin_payload = parse_text_json(
                 call_tool(sock_a, 103, "server.list_servers", {"wait_ms": 100})
@@ -399,7 +410,7 @@ def main():
             assert "server.send" not in {
                 tool["name"] for tool in direct_tools_payload["tools"]
             }, direct_tools_payload
-            assert proxy_tools_list(sock_a, 10, peer_server_id) == direct_tools_payload
+            assert proxy_tools_list(sock_a, 10, peer_server_id)[1] == direct_tools_payload
             unloaded_payload = parse_text_json(
                 call_tool(sock_a, 104, "server.list_servers", {"wait_ms": 100})
             )
@@ -496,6 +507,7 @@ def main():
         assert peer["server_id"] == peer_server_id, peer
         assert peer["state"] == "online", peer
         assert peer["tcp_connected"] is True, peer
+        assert not contract_failures, "\n".join(contract_failures)
     finally:
         if sock_a:
             sock_a.close()

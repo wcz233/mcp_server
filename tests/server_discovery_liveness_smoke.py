@@ -259,9 +259,9 @@ class FakePeer:
         with self._lock:
             pending = list(self._pending_tools_list)
             self._pending_tools_list.clear()
-        assert len(pending) == 1, pending
         for conn, request_id in pending:
             self._send_tools_list(conn, request_id)
+        return len(pending)
 
     def _send_frame(self, conn, payload):
         with self._send_lock:
@@ -484,6 +484,7 @@ def verify_automatic_tool_discovery(tcp_server, fake_peer, server_id):
     callers = []
     threads = []
     outcomes = []
+    failures = []
     try:
         for _ in range(2):
             caller = socket.create_connection(("127.0.0.1", tcp_server), timeout=1.0)
@@ -504,19 +505,34 @@ def verify_automatic_tool_discovery(tcp_server, fake_peer, server_id):
             threads.append(thread)
 
         time.sleep(0.2)
-        assert all(thread.is_alive() for thread in threads), outcomes
-        assert fake_peer.tools_list_requests == 1, fake_peer.tools_list_requests
-        fake_peer.complete_tools_list()
+        if not all(thread.is_alive() for thread in threads):
+            failures.append(f"proxy calls were not queued during refresh: {outcomes}")
+        if fake_peer.tools_list_requests != 1:
+            failures.append(
+                f"expected one tools/list request, got {fake_peer.tools_list_requests}"
+            )
+        completed_refreshes = fake_peer.complete_tools_list()
+        if completed_refreshes != 1:
+            failures.append(f"expected one pending refresh, got {completed_refreshes}")
 
         for thread in threads:
             thread.join(timeout=5)
-        assert all(not thread.is_alive() for thread in threads), outcomes
-        assert outcomes == [None, None], outcomes
-        assert fake_peer.tools_call_requests == 2, fake_peer.tools_call_requests
-        assert fake_peer.tools_list_requests == 1, fake_peer.tools_list_requests
+        if not all(not thread.is_alive() for thread in threads):
+            failures.append(f"queued proxy calls did not complete: {outcomes}")
+        if outcomes != [None, None]:
+            failures.append(f"queued proxy calls failed: {outcomes}")
+        if fake_peer.tools_call_requests != 2:
+            failures.append(
+                f"expected two remote tools/call requests, got {fake_peer.tools_call_requests}"
+            )
+        if fake_peer.tools_list_requests != 1:
+            failures.append(
+                f"tools/list request was not coalesced: {fake_peer.tools_list_requests}"
+            )
     finally:
         for caller in callers:
             caller.close()
+    return failures
 
 
 def blocking_command():
@@ -648,6 +664,7 @@ def main():
     sock = None
     transfer_sock = None
     transfer_path = None
+    contract_failures = []
     try:
         sock = wait_for_tcp(tcp_server, proc)
         sock.settimeout(3.0)
@@ -680,9 +697,15 @@ def main():
         assert peer and peer["state"] == "online", payload
         assert len(online_peer.heartbeats) >= 2, online_peer.heartbeats
         assert online_peer.heartbeats[-1] - online_peer.heartbeats[0] >= 0.8, online_peer.heartbeats
-        assert online_peer.tools_list_seen.wait(2), "missing automatic tools/list after initialization"
-        assert online_peer.tools_list_requests == 1, online_peer.tools_list_requests
-        verify_automatic_tool_discovery(tcp_server, online_peer, peer["server_id"])
+        if not online_peer.tools_list_seen.wait(2):
+            contract_failures.append("missing automatic tools/list after initialization")
+        if online_peer.tools_list_requests != 1:
+            contract_failures.append(
+                f"expected one initialization tools/list, got {online_peer.tools_list_requests}"
+            )
+        contract_failures.extend(
+            verify_automatic_tool_discovery(tcp_server, online_peer, peer["server_id"])
+        )
         if os.name != "nt":
             verify_nonblocking_shell_wait(
                 exe,
@@ -830,6 +853,7 @@ def main():
         packet = wait_for_udp(udp_sock, time.time() + 5)
         assert packet["event"] == "online", packet
         assert packet["tcp_port"] == broadcast_tcp, packet
+        assert not contract_failures, "\n".join(contract_failures)
     finally:
         if sock:
             sock.close()
