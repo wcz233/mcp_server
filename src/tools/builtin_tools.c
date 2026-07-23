@@ -328,7 +328,7 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
 
     if (register_tool(registry,
                       "system.shell_start",
-                      "Start a host shell command as an asynchronous tracked job.",
+                      "Start a host shell command as an asynchronous tracked job; the result does not repeat the command.",
                       mcp_schema_shell_start(),
                       "builtin",
                       "L4",
@@ -341,7 +341,7 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
 
     if (register_tool(registry,
                       "system.shell_poll",
-                      "Read status for an asynchronous shell job.",
+                      "Read status for an asynchronous shell job; the result does not repeat the command.",
                       mcp_schema_shell_job_id(),
                       "builtin",
                       "L4",
@@ -354,7 +354,7 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
 
     if (register_tool(registry,
                       "system.shell_tail",
-                      "Read buffered stdout/stderr chunks for an asynchronous shell job.",
+                      "Read buffered stdout/stderr chunks for an asynchronous shell job; the result does not repeat the command.",
                       mcp_schema_shell_tail(),
                       "builtin",
                       "L4",
@@ -367,7 +367,7 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
 
     if (register_tool(registry,
                       "system.shell_wait",
-                      "Refresh and immediately return the current state of an asynchronous shell job.",
+                      "Refresh and immediately return the current state of an asynchronous shell job; the result does not repeat the command.",
                       mcp_schema_shell_wait(),
                       "builtin",
                       "L4",
@@ -380,7 +380,7 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
 
     if (register_tool(registry,
                       "system.shell_kill",
-                      "Terminate an asynchronous shell job by process group when supported.",
+                      "Terminate an asynchronous shell job by process group when supported; the result does not repeat the command.",
                       mcp_schema_shell_kill(),
                       "builtin",
                       "L4",
@@ -393,7 +393,7 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
 
     if (register_tool(registry,
                       "system.shell_list",
-                      "List active and recently finished asynchronous shell jobs.",
+                      "List active and recently finished asynchronous shell jobs; the result does not repeat commands.",
                       mcp_schema_empty_object(),
                       "builtin",
                       "L4",

@@ -160,6 +160,11 @@ def assert_snapshot(payload, expected):
     assert {field: payload[field] for field in SNAPSHOT_FIELDS} == expected, payload
 
 
+def assert_command_omitted(payload, command):
+    assert "command" not in payload, payload
+    assert command not in (value for value in payload.values() if isinstance(value, str)), payload
+
+
 def wait_for_state(proc, job_id, wanted, deadline_seconds=5.0):
     deadline = time.time() + deadline_seconds
     last = None
@@ -188,7 +193,17 @@ def main():
     try:
         initialize(proc)
 
-        tool_schemas = {tool["name"]: tool["inputSchema"] for tool in list_tools(proc, 2)}
+        shell_tools = {tool["name"]: tool for tool in list_tools(proc, 2)}
+        tool_schemas = {name: tool["inputSchema"] for name, tool in shell_tools.items()}
+        for name in (
+            "system.shell_start",
+            "system.shell_poll",
+            "system.shell_tail",
+            "system.shell_wait",
+            "system.shell_kill",
+            "system.shell_list",
+        ):
+            assert "does not repeat" in shell_tools[name]["description"], shell_tools[name]
         start_properties = tool_schemas["system.shell_start"]["properties"]
         assert "command" in start_properties, start_properties
         assert "label" in start_properties, start_properties
@@ -367,12 +382,13 @@ def main():
             )
         )
 
+        tracked_command = "printf '%s|%s|' \"$PWD\" \"$S4_ENV\"; sleep 0.4; printf done"
         started = call_tool(
             proc,
             5,
             "system.shell_start",
             {
-                "command": "printf '%s|%s|' \"$PWD\" \"$S4_ENV\"; sleep 0.4; printf done",
+                "command": tracked_command,
                 "cwd": str(async_cwd),
                 "env": {"S4_ENV": "request"},
                 "timeout_ms": 800,
@@ -394,11 +410,13 @@ def main():
         assert start_payload["pid"] > 0, start_payload
         assert start_payload["process_group_id"] == start_payload["pid"], start_payload
         assert start_payload["rollback"]["tool_name"] == "system.shell_kill", start_payload
+        assert_command_omitted(start_payload, tracked_command)
         assert_snapshot(start_payload, expected_snapshot)
 
         poll_payload = json_content(
             call_tool(proc, 6, "system.shell_poll", {"job_id": job_id})
         )
+        assert_command_omitted(poll_payload, tracked_command)
         assert_snapshot(poll_payload, expected_snapshot)
 
         wait_started = time.monotonic()
@@ -408,6 +426,7 @@ def main():
         assert time.monotonic() - wait_started < 1.0, wait_payload
         assert wait_payload["wait_result"] == "still_running", wait_payload
         assert wait_payload["state"] == "running", wait_payload
+        assert_command_omitted(wait_payload, tracked_command)
         assert_snapshot(wait_payload, expected_snapshot)
         final_payload = wait_for_state(proc, job_id, "exited")
         assert final_payload["exit_code"] == 0, final_payload
@@ -416,10 +435,12 @@ def main():
         expected_stdout = f"{async_cwd}|request|done"
         assert tail_payload["stdout"] == expected_stdout, tail_payload
         assert tail_payload["next_stdout_offset"] == len(expected_stdout), tail_payload
+        assert_command_omitted(tail_payload, tracked_command)
         assert_snapshot(tail_payload, expected_snapshot)
 
         listed_payload = json_content(call_tool(proc, 9, "system.shell_list", {}))
         listed = next(job for job in listed_payload["jobs"] if job["job_id"] == job_id)
+        assert_command_omitted(listed, tracked_command)
         assert_snapshot(listed, expected_snapshot)
 
         truncated_started = json_content(
@@ -539,13 +560,14 @@ def main():
             marker.unlink()
         except FileNotFoundError:
             pass
+        kill_command = f"sh -c 'sleep 2; touch {marker}'"
         kill_started = json_content(
             call_tool(
                 proc,
                 25,
                 "system.shell_start",
                 {
-                    "command": f"sh -c 'sleep 2; touch {marker}'",
+                    "command": kill_command,
                     "timeout_ms": 800,
                     "label": "kill-check",
                 },
@@ -555,6 +577,7 @@ def main():
         killed = json_content(call_tool(proc, 26, "system.shell_kill", {"job_id": kill_job_id, "signal": signal.SIGTERM}))
         assert killed["state"] == "killed", killed
         assert killed["signal"] in (signal.SIGTERM, signal.SIGKILL), killed
+        assert_command_omitted(killed, kill_command)
         time.sleep(2.2)
         assert not marker.exists(), marker
 

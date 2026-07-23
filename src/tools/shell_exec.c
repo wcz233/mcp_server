@@ -145,7 +145,6 @@ struct shell_exec_outcome {
 
 struct shell_job {
     char *job_id;
-    char *command;
     char *label;
     enum shell_job_state state;
     struct shell_exec_buffer stdout_buf;
@@ -3622,7 +3621,6 @@ static void shell_job_free(struct shell_job *job)
 
     shell_job_close_pipes(job);
     free(job->job_id);
-    free(job->command);
     free(job->label);
     shell_exec_buffer_destroy(&job->stdout_buf);
     shell_exec_buffer_destroy(&job->stderr_buf);
@@ -3692,7 +3690,7 @@ static json_t *shell_job_status_json(const struct shell_job *job)
     if (!job)
         return NULL;
 
-    payload = json_pack("{s:s,s:s,s:i,s:i,s:s,s:s,s:i,s:i,s:i,s:i,s:i,s:i,s:b,s:b,s:i,s:i,s:I,s:b,s:b}",
+    payload = json_pack("{s:s,s:s,s:i,s:i,s:s,s:i,s:i,s:i,s:i,s:i,s:i,s:b,s:b,s:i,s:i,s:I,s:b,s:b}",
                         "job_id",
                         job->job_id,
                         "state",
@@ -3703,8 +3701,6 @@ static json_t *shell_job_status_json(const struct shell_job *job)
                         (json_int_t)job->process_group_id,
                         "started_at",
                         job->started_at,
-                        "command",
-                        job->command ? job->command : "",
                         "timeout_ms",
                         (json_int_t)job->timeout_ms,
                         "output_bytes",
@@ -4475,9 +4471,8 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
     job->stdout_fd = -1;
     job->stderr_fd = -1;
 #endif
-    job->command = mcp_strdup(request.command);
     job->label = label ? mcp_strdup(label) : NULL;
-    if (!job->command || (label && !job->label))
+    if (label && !job->label)
         goto cleanup;
     job->state = SHELL_JOB_RUNNING;
     job->timeout_ms = request.timeout_ms;
