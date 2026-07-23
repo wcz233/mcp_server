@@ -1449,10 +1449,16 @@ static int peer_start_tools_refresh(struct discovery_peer_conn *conn)
     ctx->timer.data = ctx;
     peer->tools_refresh = ctx;
     peer->tools_state = DISCOVERY_TOOLS_REFRESHING;
-    uv_timer_start(&ctx->timer,
-                   tools_refresh_timeout_cb,
-                   discovery_proxy_timeout_default_ms(),
-                   0);
+    if (uv_timer_start(&ctx->timer,
+                       tools_refresh_timeout_cb,
+                       discovery_proxy_timeout_default_ms(),
+                       0) != 0) {
+        peer->tools_refresh = NULL;
+        peer->tools_state = DISCOVERY_TOOLS_UNKNOWN;
+        peer->tools_generation++;
+        tools_refresh_close(ctx);
+        return -1;
+    }
 
     if (tools_refresh_send(ctx) == 0)
         return 0;
@@ -1480,6 +1486,11 @@ static bool tools_refresh_complete_response(struct discovery_peer_conn *conn, js
         !json_is_string(id) ||
         strcmp(json_string_value(id), ctx->remote_id) != 0)
         return false;
+    if (ctx->generation != conn->peer->tools_generation ||
+        conn->peer->tools_state != DISCOVERY_TOOLS_REFRESHING) {
+        tools_refresh_fail(ctx, "Remote tools discovery received a stale response.");
+        return true;
+    }
 
     result = json_object_get(root, "result");
     error = json_object_get(root, "error");
