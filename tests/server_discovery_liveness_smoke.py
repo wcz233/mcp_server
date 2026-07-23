@@ -706,6 +706,7 @@ def main():
         contract_failures.extend(
             verify_automatic_tool_discovery(tcp_server, online_peer, peer["server_id"])
         )
+        assert not contract_failures, "\n".join(contract_failures)
         if os.name != "nt":
             verify_nonblocking_shell_wait(
                 exe,
@@ -853,7 +854,6 @@ def main():
         packet = wait_for_udp(udp_sock, time.time() + 5)
         assert packet["event"] == "online", packet
         assert packet["tcp_port"] == broadcast_tcp, packet
-        assert not contract_failures, "\n".join(contract_failures)
     finally:
         if sock:
             sock.close()
