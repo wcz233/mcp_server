@@ -35,9 +35,6 @@ int mcp_server_discovery_list_async(struct mcp_server_discovery *discovery,
 json_t *mcp_server_discovery_snapshot_json(struct mcp_server_discovery *discovery);
 bool mcp_server_discovery_handle_offline_notification(struct mcp_server_discovery *discovery,
                                                       json_t *params);
-bool mcp_server_discovery_server_has_tool(struct mcp_server_discovery *discovery,
-                                          unsigned int server_id,
-                                          const char *tool_name);
 json_t *mcp_server_discovery_local_identity(struct mcp_server_discovery *discovery);
 unsigned int mcp_server_discovery_note_peer_identity(struct mcp_server_discovery *discovery,
                                                      json_t *identity,

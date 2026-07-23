@@ -112,15 +112,6 @@ static int gateway_proxy_tool_call(struct mcp_gateway *gateway,
     tool_name = json_string_value(tool_name_value);
     if (strcmp(tool_name, "tools_list") == 0)
         kind = MCP_DISCOVERY_PROXY_TOOLS_LIST;
-    else if (!mcp_server_discovery_server_has_tool(server->discovery, server_id, tool_name)) {
-        gateway->rejected_calls++;
-        *out_result = mcp_tool_result_text(
-            "Remote tool is not cached for this server. Call gateway.proxy_tool with tool_name=\"tools_list\" first.",
-            true);
-        if (created_tool_args)
-            json_decref(tool_args);
-        return MCP_GATEWAY_TOOL_ERROR;
-    }
 
     rc = mcp_server_discovery_call_remote_tool(server->discovery,
                                                id_key,
