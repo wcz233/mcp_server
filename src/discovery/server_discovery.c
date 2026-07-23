@@ -1609,7 +1609,8 @@ static void peer_send_pending_proxies(struct discovery_peer_conn *conn)
                 pending_proxy_finish_result(ctx, result);
                 json_decref(result);
             } else if (!tools_list_contains_tool(conn->peer->tools_list, ctx->tool_name)) {
-                json_t *result = proxy_error_result("Remote tool is not cached for this server.");
+                json_t *result = proxy_error_result(
+                    "Remote tool is not advertised by this server.");
                 pending_proxy_finish_result(ctx, result);
                 json_decref(result);
             } else if (pending_proxy_send(ctx) != 0) {
