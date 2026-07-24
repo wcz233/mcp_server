@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -108,8 +109,44 @@ def call_tool(proc, request_id, name, arguments=None):
     return result
 
 
+def assert_job_status(payload):
+    integer_fields = (
+        "pid",
+        "process_group_id",
+        "timeout_ms",
+        "output_bytes",
+        "once_read_stdout_err_chunk_size",
+        "deadline_ms",
+        "stdout_bytes",
+        "stderr_bytes",
+        "exit_code",
+        "signal",
+    )
+    assert all(type(payload[field]) is int for field in integer_fields), payload
+    assert payload["pid"] > 0, payload
+    assert payload["process_group_id"] > 0, payload
+    for field in integer_fields[2:8]:
+        assert payload[field] >= 0, payload
+    assert payload["signal"] >= 0, payload
+
+    started_at = datetime.fromisoformat(payload["started_at"].replace("Z", "+00:00"))
+    since_epoch = started_at - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    started_at_ms = (
+        since_epoch.days * 86400000
+        + since_epoch.seconds * 1000
+        + since_epoch.microseconds // 1000
+    )
+    assert payload["deadline_ms"] == started_at_ms + payload["timeout_ms"], payload
+
+
 def json_content(result):
-    return json.loads(result["content"][0]["text"])
+    payload = json.loads(result["content"][0]["text"])
+    if isinstance(payload, dict):
+        if "job_id" in payload:
+            assert_job_status(payload)
+        for job in payload.get("jobs", []):
+            assert_job_status(job)
+    return payload
 
 
 def initialize(proc):

@@ -3690,7 +3690,7 @@ static json_t *shell_job_status_json(const struct shell_job *job)
     if (!job)
         return NULL;
 
-    payload = json_pack("{s:s,s:s,s:i,s:i,s:s,s:i,s:i,s:i,s:i,s:i,s:i,s:b,s:b,s:i,s:i,s:I,s:b,s:b}",
+    payload = json_pack("{s:s,s:s,s:I,s:I,s:s,s:I,s:I,s:I,s:I,s:I,s:I,s:b,s:b,s:I,s:I,s:I,s:b,s:b}",
                         "job_id",
                         job->job_id,
                         "state",
