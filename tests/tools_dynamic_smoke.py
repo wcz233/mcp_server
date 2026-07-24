@@ -146,9 +146,24 @@ def verify_tool(proc, request_id, tool_name):
         return
 
     if tool_name == "gateway.proxy_tool":
-        result = call_tool(proc, request_id, tool_name, {"server_id": 1, "tool_name": "tools_list"})
-        assert result["isError"] is True, result
-        assert "not available" in parse_text_content(result), result
+        for server_id in (2147483647, 2147483648, 4294967295):
+            result = call_tool(
+                proc,
+                request_id,
+                tool_name,
+                {"server_id": server_id, "tool_name": "tools_list"},
+            )
+            assert result["isError"] is True, result
+            assert "not available" in parse_text_content(result), result
+        for server_id in (-1, 0, 4294967296, 9223372036854775807):
+            result = call_tool(
+                proc,
+                request_id,
+                tool_name,
+                {"server_id": server_id, "tool_name": "tools_list"},
+            )
+            assert result["isError"] is True, result
+            assert "requires server_id" in parse_text_content(result), result
         return
 
     if tool_name == "server.list_servers":
@@ -256,9 +271,18 @@ def main():
         assert start_properties["timeout_ms"]["maximum"] == 300000, start_properties
         assert start_properties["output_limit_bytes"]["minimum"] == 256, start_properties
         assert start_properties["output_limit_bytes"]["maximum"] == 2147483648, start_properties
+        proxy_tool = next(tool for tool in tools if tool["name"] == "gateway.proxy_tool")
+        proxy_server_id = proxy_tool["inputSchema"]["properties"]["server_id"]
+        assert proxy_server_id["minimum"] == 1, proxy_server_id
+        assert proxy_server_id["maximum"] == 4294967295, proxy_server_id
 
         if "server.send" in tool_names or "server.recv" in tool_names:
             assert {"server.send", "server.recv"}.issubset(tool_names), tool_names
+            for name in ("server.send", "server.recv"):
+                transfer_tool = next(tool for tool in tools if tool["name"] == name)
+                transfer_server_id = transfer_tool["inputSchema"]["properties"]["server_id"]
+                assert transfer_server_id["minimum"] == 1, transfer_server_id
+                assert transfer_server_id["maximum"] == 4294967295, transfer_server_id
             result = call_tool(proc, 1000, "plugin_tools.lsmod", {})
             payload = assert_json_text(result)
             plugin = next(

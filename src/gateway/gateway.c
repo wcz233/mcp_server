@@ -8,6 +8,7 @@
 #include "tools/tool_result.h"
 
 #include <jansson.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,7 +20,7 @@ struct mcp_gateway {
     unsigned long rejected_calls;
 };
 
-static bool json_integer_in_uint_range(json_t *value, unsigned int *out)
+static bool json_integer_in_uint32_range(json_t *value, uint32_t *out)
 {
     json_int_t raw;
 
@@ -27,21 +28,21 @@ static bool json_integer_in_uint_range(json_t *value, unsigned int *out)
         return false;
 
     raw = json_integer_value(value);
-    if (raw < 0 || raw > 4294967295LL)
+    if (raw < 0 || raw > UINT32_MAX)
         return false;
 
-    *out = (unsigned int)raw;
+    *out = (uint32_t)raw;
     return true;
 }
 
-static bool json_optional_integer_in_uint_range(json_t *value, unsigned int *out)
+static bool json_optional_integer_in_uint32_range(json_t *value, uint32_t *out)
 {
     if (!value) {
         *out = 0;
         return true;
     }
 
-    return json_integer_in_uint_range(value, out);
+    return json_integer_in_uint32_range(value, out);
 }
 
 static bool snapshot_contains_tool(const json_t *snapshot, const char *tool_name)
@@ -77,8 +78,8 @@ static int gateway_proxy_tool_call(struct mcp_gateway *gateway,
     json_t *tool_args;
     json_t *proxy_timeout_value;
     bool created_tool_args = false;
-    unsigned int server_id;
-    unsigned int proxy_timeout_ms;
+    uint32_t server_id;
+    uint32_t proxy_timeout_ms;
     const char *tool_name;
     enum mcp_discovery_proxy_kind kind = MCP_DISCOVERY_PROXY_TOOL;
     int rc;
@@ -94,11 +95,11 @@ static int gateway_proxy_tool_call(struct mcp_gateway *gateway,
         created_tool_args = true;
     }
 
-    if (!json_integer_in_uint_range(server_id_value, &server_id) ||
+    if (!json_integer_in_uint32_range(server_id_value, &server_id) ||
         server_id == 0 ||
         !json_is_string(tool_name_value) ||
         !json_is_object(tool_args) ||
-        !json_optional_integer_in_uint_range(proxy_timeout_value, &proxy_timeout_ms) ||
+        !json_optional_integer_in_uint32_range(proxy_timeout_value, &proxy_timeout_ms) ||
         (proxy_timeout_value && proxy_timeout_ms == 0)) {
         gateway->rejected_calls++;
         *out_result = mcp_tool_result_text(

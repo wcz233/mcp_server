@@ -18,14 +18,14 @@ struct negotiation_test_context {
 
 struct capability_close_context {
     struct mcp_peer_transport *transport;
-    unsigned int target_server_id;
-    unsigned int other_server_id;
+    uint32_t target_server_id;
+    uint32_t other_server_id;
     unsigned int close_calls;
     bool handler_saw_cleared;
 };
 
 static void capability_test_frame(void *arg,
-                                  unsigned int server_id,
+                                  uint32_t server_id,
                                   const unsigned char *payload,
                                   size_t len)
 {
@@ -35,7 +35,7 @@ static void capability_test_frame(void *arg,
     (void)len;
 }
 
-static void capability_test_closed(void *arg, unsigned int server_id)
+static void capability_test_closed(void *arg, uint32_t server_id)
 {
     struct capability_close_context *context = arg;
 
@@ -146,7 +146,7 @@ static int negotiation_test_complete_error(void *host_context,
 }
 
 static int negotiation_test_send_frame(void *host_context,
-                                       unsigned int server_id,
+                                       uint32_t server_id,
                                        const void *payload,
                                        uint32_t payload_len)
 {
@@ -164,7 +164,7 @@ static int negotiation_test_send_frame(void *host_context,
 }
 
 static int negotiation_test_has_capability(void *host_context,
-                                           unsigned int server_id,
+                                           uint32_t server_id,
                                            const char *capability)
 {
     struct negotiation_test_context *context = host_context;
@@ -182,7 +182,7 @@ static int negotiation_test_has_capability(void *host_context,
 }
 
 static int negotiation_test_set_capability(void *host_context,
-                                           unsigned int server_id,
+                                           uint32_t server_id,
                                            const char *capability,
                                            int enabled)
 {

@@ -183,8 +183,31 @@ struct frame_capture {
     char json[256];
 };
 
+struct summary_capture {
+    char json[1024];
+};
+
+static unsigned long long summary_now_ms(void *host_context)
+{
+    (void)host_context;
+    return 1000;
+}
+
+static int capture_summary(void *host_context,
+                           const char *invocation_id,
+                           const char *payload_json)
+{
+    struct summary_capture *capture = host_context;
+
+    (void)invocation_id;
+    if (strlen(payload_json) >= sizeof(capture->json))
+        return -1;
+    strcpy(capture->json, payload_json);
+    return 0;
+}
+
 static int capture_frame(void *host_context,
-                         unsigned int server_id,
+                         uint32_t server_id,
                          const void *payload,
                          uint32_t payload_len)
 {
@@ -567,6 +590,66 @@ static int test_accept_bounds(void)
     return 0;
 }
 
+static int expect_server_id(json_t *args, json_int_t raw, uint32_t expected)
+{
+    uint32_t actual = 0;
+
+    if (json_object_set_new(args, "server_id", json_integer(raw)) != 0)
+        return -1;
+    if (expected == 0)
+        return parse_server_id(args, &actual) != 0 ? 0 : -1;
+    return parse_server_id(args, &actual) == 0 && actual == expected ? 0 : -1;
+}
+
+static int test_server_id_bounds(void)
+{
+    struct summary_capture capture = {0};
+    struct mcp_plugin_host_api host = {0};
+    json_t *args = json_object();
+    json_t *summary = NULL;
+    json_t *server_id;
+    int rc = -1;
+
+    if (!args ||
+        expect_server_id(args, INT_MAX, (uint32_t)INT_MAX) != 0 ||
+        expect_server_id(args, (json_int_t)INT_MAX + 1, (uint32_t)INT_MAX + 1) != 0 ||
+        expect_server_id(args, UINT32_MAX, UINT32_MAX) != 0 ||
+        expect_server_id(args, (json_int_t)UINT32_MAX + 1, 0) != 0 ||
+        expect_server_id(args, INT64_MAX, 0) != 0 ||
+        expect_server_id(args, 0, 0) != 0 ||
+        expect_server_id(args, -1, 0) != 0)
+        goto cleanup;
+
+    host.host_context = &capture;
+    host.now_ms = summary_now_ms;
+    host.complete_async_ok = capture_summary;
+    g_plugin.host = &host;
+    if (send_summary("invocation",
+                     "transfer",
+                     UINT32_MAX,
+                     "send",
+                     0,
+                     0,
+                     0,
+                     0,
+                     NULL,
+                     0,
+                     0,
+                     1000) != 0)
+        goto cleanup;
+    summary = json_loads(capture.json, JSON_REJECT_DUPLICATES, NULL);
+    server_id = summary ? json_object_get(summary, "server_id") : NULL;
+    if (!json_is_integer(server_id) || json_integer_value(server_id) != UINT32_MAX)
+        goto cleanup;
+    rc = 0;
+
+cleanup:
+    g_plugin.host = NULL;
+    json_decref(summary);
+    json_decref(args);
+    return rc;
+}
+
 int main(void)
 {
     if (test_outgoing_frame_bound() != 0 ||
@@ -578,7 +661,8 @@ int main(void)
         test_manifest_integer_bounds() != 0 ||
         test_manifest_layout_bounds() != 0 ||
         test_manifest_total_bound() != 0 ||
-        test_accept_bounds() != 0)
+        test_accept_bounds() != 0 ||
+        test_server_id_bounds() != 0)
         return 1;
     return 0;
 }

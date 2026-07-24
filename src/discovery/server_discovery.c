@@ -52,7 +52,7 @@ struct discovery_tools_refresh;
 
 struct discovery_peer {
     char *id;
-    unsigned int server_id;
+    uint32_t server_id;
     char ip[64];
     unsigned int port;
     json_t *status;
@@ -167,7 +167,7 @@ struct mcp_server_discovery {
     unsigned long current_generation;
     unsigned long long heartbeat_id;
     unsigned long long last_heartbeat_tick_ms;
-    unsigned int next_server_id;
+    uint32_t next_server_id;
 
     struct discovery_peer *peers;
     struct discovery_pending_list *pending_lists;
@@ -188,8 +188,10 @@ static void pending_proxy_complete_for_peer(struct mcp_server_discovery *discove
 static bool tools_refresh_complete_response(struct discovery_peer_conn *conn, json_t *root);
 static bool pending_proxy_complete_response(struct discovery_peer_conn *conn, json_t *root);
 static bool peer_handle_initialize_response(struct discovery_peer_conn *conn, json_t *root);
+static struct discovery_peer *find_peer_by_server_id(struct mcp_server_discovery *discovery,
+                                                     uint32_t server_id);
 static int discovery_external_send_frame(void *arg,
-                                         unsigned int server_id,
+                                         uint32_t server_id,
                                          const void *payload,
                                          size_t len);
 
@@ -1066,7 +1068,7 @@ static int peer_send_frame(struct discovery_peer_conn *conn,
 }
 
 static int discovery_external_send_frame(void *arg,
-                                         unsigned int server_id,
+                                         uint32_t server_id,
                                          const void *payload,
                                          size_t len)
 {
@@ -1856,6 +1858,26 @@ static struct discovery_peer *find_peer(struct mcp_server_discovery *discovery,
     return NULL;
 }
 
+static uint32_t allocate_server_id(struct mcp_server_discovery *discovery)
+{
+    uint32_t first;
+    uint32_t candidate;
+
+    if (!discovery)
+        return 0;
+
+    candidate = discovery->next_server_id ? discovery->next_server_id : 1;
+    first = candidate;
+    do {
+        discovery->next_server_id = candidate == UINT32_MAX ? 1 : candidate + 1;
+        if (!find_peer_by_server_id(discovery, candidate))
+            return candidate;
+        candidate = discovery->next_server_id;
+    } while (candidate != first);
+
+    return 0;
+}
+
 static struct discovery_peer *upsert_peer(struct mcp_server_discovery *discovery,
                                           const char *ip,
                                           unsigned int port,
@@ -1864,6 +1886,7 @@ static struct discovery_peer *upsert_peer(struct mcp_server_discovery *discovery
 {
     struct discovery_peer *peer = find_peer(discovery, ip, port);
     char *id = NULL;
+    uint32_t server_id;
 
     if (!peer) {
         if (!make_peer_id(ip, port, &id))
@@ -1875,8 +1898,15 @@ static struct discovery_peer *upsert_peer(struct mcp_server_discovery *discovery
             return NULL;
         }
 
+        server_id = allocate_server_id(discovery);
+        if (server_id == 0) {
+            free(peer);
+            free(id);
+            return NULL;
+        }
+
         peer->id = id;
-        peer->server_id = discovery->next_server_id++;
+        peer->server_id = server_id;
         snprintf(peer->ip, sizeof(peer->ip), "%s", ip);
         peer->port = port;
         peer->next = discovery->peers;
@@ -2461,7 +2491,7 @@ bool mcp_server_discovery_is_open(const struct mcp_server_discovery *discovery)
 }
 
 static struct discovery_peer *find_peer_by_server_id(struct mcp_server_discovery *discovery,
-                                                     unsigned int server_id)
+                                                     uint32_t server_id)
 {
     struct discovery_peer *peer;
 
@@ -2477,7 +2507,7 @@ static struct discovery_peer *find_peer_by_server_id(struct mcp_server_discovery
 }
 
 void mcp_server_discovery_mark_peer_active(struct mcp_server_discovery *discovery,
-                                           unsigned int server_id)
+                                           uint32_t server_id)
 {
     struct discovery_peer *peer = find_peer_by_server_id(discovery, server_id);
 
@@ -2487,7 +2517,7 @@ void mcp_server_discovery_mark_peer_active(struct mcp_server_discovery *discover
 
 int mcp_server_discovery_call_remote_tool(struct mcp_server_discovery *discovery,
                                           const char *id_key,
-                                          unsigned int server_id,
+                                          uint32_t server_id,
                                           enum mcp_discovery_proxy_kind kind,
                                           const char *tool_name,
                                           json_t *arguments,
@@ -2630,7 +2660,7 @@ static json_t *build_system_status_summary(json_t *status)
 }
 
 static json_t *build_server_entry(const char *scope,
-                                  unsigned int server_id,
+                                  uint32_t server_id,
                                   const char *address,
                                   unsigned int port,
                                   const char *state,

@@ -6,6 +6,7 @@
 #include "tools/tool_result.h"
 #include "transport/peer_transport.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -625,7 +626,7 @@ static int host_complete_async_error(void *host_context,
 }
 
 static int host_peer_send_frame(void *host_context,
-                                unsigned int server_id,
+                                uint32_t server_id,
                                 const void *payload,
                                 uint32_t payload_len)
 {
@@ -643,7 +644,7 @@ static int host_peer_send_frame(void *host_context,
 }
 
 static void host_frame_on_frame(void *arg,
-                                unsigned int server_id,
+                                uint32_t server_id,
                                 const unsigned char *payload,
                                 size_t len)
 {
@@ -655,7 +656,7 @@ static void host_frame_on_frame(void *arg,
     adapter->on_frame(adapter->user_data, server_id, payload, (uint32_t)len);
 }
 
-static void host_frame_on_peer_connected(void *arg, unsigned int server_id)
+static void host_frame_on_peer_connected(void *arg, uint32_t server_id)
 {
     struct plugin_frame_adapter *adapter = arg;
 
@@ -663,7 +664,7 @@ static void host_frame_on_peer_connected(void *arg, unsigned int server_id)
         adapter->on_peer_connected(adapter->user_data, server_id);
 }
 
-static void host_frame_on_peer_closed(void *arg, unsigned int server_id)
+static void host_frame_on_peer_closed(void *arg, uint32_t server_id)
 {
     struct plugin_frame_adapter *adapter = arg;
 
@@ -745,7 +746,7 @@ static int host_peer_unregister_handler(void *host_context, const char magic[4])
 }
 
 static int host_peer_has_capability(void *host_context,
-                                    unsigned int server_id,
+                                    uint32_t server_id,
                                     const char *capability)
 {
     struct plugin_module *plugin = host_context;
@@ -761,7 +762,7 @@ static int host_peer_has_capability(void *host_context,
 }
 
 static int host_peer_set_capability(void *host_context,
-                                    unsigned int server_id,
+                                    uint32_t server_id,
                                     const char *capability,
                                     int enabled)
 {

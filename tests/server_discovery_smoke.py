@@ -169,6 +169,10 @@ def proxy_tools_list(sock, request_id, server_id):
 
 def assert_server_entry_contract(server):
     assert set(server) == SERVER_ENTRY_KEYS, server
+    if server["scope"] == "local":
+        assert server["server_id"] == 0, server
+    else:
+        assert 1 <= server["server_id"] <= 4294967295, server
     status = server["system_status"]
     assert set(status).issubset(SYSTEM_STATUS_KEYS), status
     assert REQUIRED_SYSTEM_STATUS_KEYS.issubset(status), status
@@ -287,6 +291,8 @@ def main():
 
         assert payload is not None, "missing discovery response"
         assert payload["total"] >= 2, payload
+        server_ids = [server["server_id"] for server in payload["servers"]]
+        assert len(server_ids) == len(set(server_ids)), payload
         for server in payload["servers"]:
             assert_server_entry_contract(server)
         local = next(server for server in payload["servers"] if server["address"] == f"127.0.0.1:{tcp_a}")

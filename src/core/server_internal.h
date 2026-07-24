@@ -1,6 +1,8 @@
 #ifndef MCP_SRC_CORE_SERVER_INTERNAL_H
 #define MCP_SRC_CORE_SERVER_INTERNAL_H
 
+#include <stdint.h>
+
 #include "core/in_flight.h"
 #include "mcp/core/server.h"
 #include "mcp/gateway/gateway.h"
@@ -26,7 +28,7 @@ struct mcp_client_session {
     enum mcp_session_state state;
     struct mcp_reply_target reply_to;
     json_t *tool_snapshot;
-    unsigned int peer_server_id;
+    uint32_t peer_server_id;
     bool data_channel;
     struct mcp_client_session *next;
 };

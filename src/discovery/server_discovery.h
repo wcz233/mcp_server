@@ -2,6 +2,7 @@
 #define MCP_SRC_DISCOVERY_SERVER_DISCOVERY_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include <jansson.h>
 #include <uv.h>
@@ -40,10 +41,10 @@ unsigned int mcp_server_discovery_note_peer_identity(struct mcp_server_discovery
                                                      json_t *identity,
                                                      bool data_channel);
 void mcp_server_discovery_mark_peer_active(struct mcp_server_discovery *discovery,
-                                           unsigned int server_id);
+                                           uint32_t server_id);
 int mcp_server_discovery_call_remote_tool(struct mcp_server_discovery *discovery,
                                           const char *id_key,
-                                          unsigned int server_id,
+                                          uint32_t server_id,
                                           enum mcp_discovery_proxy_kind kind,
                                           const char *tool_name,
                                           json_t *arguments,

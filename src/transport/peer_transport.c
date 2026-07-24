@@ -15,7 +15,7 @@ struct peer_write_req {
 };
 
 struct peer_thread_send_req {
-    unsigned int server_id;
+    uint32_t server_id;
     char *payload;
     size_t len;
     int rc;
@@ -42,19 +42,19 @@ struct peer_handler {
 };
 
 struct peer_capability {
-    unsigned int server_id;
+    uint32_t server_id;
     char *name;
     struct peer_capability *next;
 };
 
 struct external_peer {
-    unsigned int server_id;
+    uint32_t server_id;
     struct external_peer *next;
 };
 
 struct mcp_peer_connection {
     struct mcp_peer_transport *transport;
-    unsigned int server_id;
+    uint32_t server_id;
     void *owner;
     uv_tcp_t tcp;
     bool initialized;
@@ -163,7 +163,7 @@ static bool peer_transport_on_loop_thread(struct mcp_peer_transport *transport)
 }
 
 static struct mcp_peer_connection *find_connection(struct mcp_peer_transport *transport,
-                                                   unsigned int server_id)
+                                                   uint32_t server_id)
 {
     struct mcp_peer_connection *conn;
 
@@ -207,7 +207,7 @@ static void unlink_connection(struct mcp_peer_connection *conn)
 }
 
 static void clear_peer_capabilities(struct mcp_peer_transport *transport,
-                                    unsigned int server_id)
+                                    uint32_t server_id)
 {
     struct peer_capability **current;
 
@@ -246,7 +246,7 @@ static void notify_peer_closed(struct mcp_peer_connection *conn)
 }
 
 void mcp_peer_transport_notify_closed(struct mcp_peer_transport *transport,
-                                      unsigned int server_id)
+                                      uint32_t server_id)
 {
     struct peer_handler *handler;
     struct external_peer **current;
@@ -448,7 +448,7 @@ static void notify_peer_connected(struct mcp_peer_connection *conn)
 }
 
 void mcp_peer_transport_notify_connected(struct mcp_peer_transport *transport,
-                                         unsigned int server_id)
+                                         uint32_t server_id)
 {
     struct peer_handler *handler;
     struct external_peer *peer;
@@ -575,7 +575,7 @@ void mcp_peer_transport_destroy(struct mcp_peer_transport *transport)
 }
 
 int mcp_peer_transport_connect(struct mcp_peer_transport *transport,
-                               unsigned int server_id,
+                               uint32_t server_id,
                                const struct sockaddr *addr,
                                void *owner,
                                void (*on_connect)(void *owner,
@@ -626,7 +626,7 @@ int mcp_peer_transport_connect(struct mcp_peer_transport *transport,
 }
 
 int mcp_peer_transport_adopt(struct mcp_peer_transport *transport,
-                             unsigned int server_id,
+                             uint32_t server_id,
                              uv_tcp_t *tcp,
                              void *owner,
                              struct mcp_peer_connection **out)
@@ -767,7 +767,7 @@ int mcp_peer_connection_send_frame(struct mcp_peer_connection *conn,
 }
 
 static int peer_transport_send_frame_on_loop(struct mcp_peer_transport *transport,
-                                             unsigned int server_id,
+                                             uint32_t server_id,
                                              const void *payload,
                                              size_t len)
 {
@@ -818,7 +818,7 @@ static void thread_send_async_cb(uv_async_t *handle)
 }
 
 static int peer_transport_send_frame_threadsafe(struct mcp_peer_transport *transport,
-                                                unsigned int server_id,
+                                                uint32_t server_id,
                                                 const void *payload,
                                                 size_t len)
 {
@@ -875,7 +875,7 @@ static int peer_transport_send_frame_threadsafe(struct mcp_peer_transport *trans
 }
 
 int mcp_peer_transport_send_frame(struct mcp_peer_transport *transport,
-                                  unsigned int server_id,
+                                  uint32_t server_id,
                                   const void *payload,
                                   size_t len)
 {
@@ -885,7 +885,7 @@ int mcp_peer_transport_send_frame(struct mcp_peer_transport *transport,
 }
 
 size_t mcp_peer_transport_write_queue_bytes(struct mcp_peer_transport *transport,
-                                            unsigned int server_id)
+                                            uint32_t server_id)
 {
     struct mcp_peer_connection *conn = find_connection(transport, server_id);
 
@@ -893,7 +893,7 @@ size_t mcp_peer_transport_write_queue_bytes(struct mcp_peer_transport *transport
 }
 
 bool mcp_peer_transport_write_queue_below_high_watermark(struct mcp_peer_transport *transport,
-                                                         unsigned int server_id)
+                                                         uint32_t server_id)
 {
     struct mcp_peer_connection *conn = find_connection(transport, server_id);
 
@@ -927,7 +927,7 @@ void mcp_peer_transport_set_external_sender(struct mcp_peer_transport *transport
 }
 
 int mcp_peer_transport_dispatch_frame(struct mcp_peer_transport *transport,
-                                      unsigned int server_id,
+                                      uint32_t server_id,
                                       const void *payload,
                                       size_t len)
 {
@@ -1039,7 +1039,7 @@ void mcp_peer_transport_unregister_owner(struct mcp_peer_transport *transport,
 }
 
 static struct peer_capability *find_capability(struct mcp_peer_transport *transport,
-                                               unsigned int server_id,
+                                               uint32_t server_id,
                                                const char *capability)
 {
     struct peer_capability *current;
@@ -1053,7 +1053,7 @@ static struct peer_capability *find_capability(struct mcp_peer_transport *transp
 }
 
 int mcp_peer_transport_set_capability(struct mcp_peer_transport *transport,
-                                      unsigned int server_id,
+                                      uint32_t server_id,
                                       const char *capability,
                                       bool enabled)
 {
@@ -1097,7 +1097,7 @@ int mcp_peer_transport_set_capability(struct mcp_peer_transport *transport,
 }
 
 bool mcp_peer_transport_has_capability(struct mcp_peer_transport *transport,
-                                       unsigned int server_id,
+                                       uint32_t server_id,
                                        const char *capability)
 {
     return transport &&

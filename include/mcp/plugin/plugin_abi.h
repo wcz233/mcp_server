@@ -19,10 +19,10 @@ enum mcp_plugin_call_status {
 };
 
 typedef void (*mcp_plugin_frame_handler_fn)(void *user_data,
-                                            unsigned int server_id,
+                                            uint32_t server_id,
                                             const void *payload,
                                             uint32_t payload_len);
-typedef void (*mcp_plugin_peer_event_fn)(void *user_data, unsigned int server_id);
+typedef void (*mcp_plugin_peer_event_fn)(void *user_data, uint32_t server_id);
 
 struct mcp_plugin_tool_descriptor {
     const char *name;
@@ -61,7 +61,7 @@ struct mcp_plugin_host_api {
                                 const char *message);
 
     int (*peer_transport_send_frame)(void *host_context,
-                                     unsigned int server_id,
+                                     uint32_t server_id,
                                      const void *payload,
                                      uint32_t payload_len);
     int (*peer_transport_register_handler)(void *host_context,
@@ -72,10 +72,10 @@ struct mcp_plugin_host_api {
                                            void *user_data);
     int (*peer_transport_unregister_handler)(void *host_context, const char magic[4]);
     int (*peer_transport_has_capability)(void *host_context,
-                                         unsigned int server_id,
+                                         uint32_t server_id,
                                          const char *capability);
     int (*peer_transport_set_capability)(void *host_context,
-                                         unsigned int server_id,
+                                         uint32_t server_id,
                                          const char *capability,
                                          int enabled);
 };

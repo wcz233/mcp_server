@@ -306,7 +306,7 @@ struct pending_negotiation {
     char *invocation_id;
     char *local_path;
     char *remote_path;
-    unsigned int server_id;
+    uint32_t server_id;
     uint32_t timeout_ms;
     unsigned long long deadline_ms;
     bool receive;
@@ -314,7 +314,7 @@ struct pending_negotiation {
 };
 
 struct hello_outstanding {
-    unsigned int server_id;
+    uint32_t server_id;
     struct hello_outstanding *next;
 };
 
@@ -357,7 +357,7 @@ struct transfer_context {
     char *remote_path;
     char *source_name;
     char direction[8];
-    unsigned int server_id;
+    uint32_t server_id;
     uint32_t timeout_ms;
     unsigned long long started_ms;
     unsigned long long deadline_ms;
@@ -407,7 +407,7 @@ struct transfer_context {
 };
 
 struct pending_block_ack {
-    unsigned int server_id;
+    uint32_t server_id;
     char *transfer_id;
     uint32_t stream_id;
     size_t block_index;
@@ -443,12 +443,12 @@ static int send_pump(struct transfer_context *ctx);
 static void schedule_send_pump(struct transfer_context *ctx, unsigned int delay_ms);
 static bool accept_item_is_receive(json_t *accept, size_t index);
 static int start_send(const char *invocation_id,
-                      unsigned int server_id,
+                      uint32_t server_id,
                       const char *local_path,
                       const char *remote_path,
                       uint32_t timeout_ms);
 static int start_recv(const char *invocation_id,
-                      unsigned int server_id,
+                      uint32_t server_id,
                       const char *remote_path,
                       const char *local_path,
                       uint32_t timeout_ms);
@@ -1504,7 +1504,7 @@ static int open_receive_file(struct manifest_entry *entry,
 static int copy_file_range_chunks(FILE *fp,
                                   uint64_t offset,
                                   uint64_t end_offset,
-                                  unsigned int server_id,
+                                  uint32_t server_id,
                                   const char *transfer_id,
                                   struct transfer_context *ctx,
                                   uint32_t stream_id,
@@ -1599,7 +1599,7 @@ static int copy_file_range_chunks(FILE *fp,
     return 0;
 }
 
-static int send_json_frame(unsigned int server_id, enum mft_frame_type type, json_t *payload)
+static int send_json_frame(uint32_t server_id, enum mft_frame_type type, json_t *payload)
 {
     char *json;
     unsigned char *frame;
@@ -2064,7 +2064,7 @@ static int manifest_to_entries(json_t *manifest,
     return 0;
 }
 
-static int send_hello_frame(unsigned int server_id)
+static int send_hello_frame(uint32_t server_id)
 {
     json_t *payload = json_pack("{s:i,s:[s,s,s,s,s,s],s:i,s:i,s:i,s:i}",
                                 "version",
@@ -2090,7 +2090,7 @@ static int send_hello_frame(unsigned int server_id)
     return rc;
 }
 
-static int mark_hello_outstanding(unsigned int server_id)
+static int mark_hello_outstanding(uint32_t server_id)
 {
     struct hello_outstanding *current;
     struct hello_outstanding *entry;
@@ -2114,7 +2114,7 @@ static int mark_hello_outstanding(unsigned int server_id)
     return 0;
 }
 
-static bool clear_hello_outstanding(unsigned int server_id)
+static bool clear_hello_outstanding(uint32_t server_id)
 {
     struct hello_outstanding **current;
     bool found = false;
@@ -2146,7 +2146,7 @@ static void free_hello_outstanding(struct hello_outstanding *entry)
     }
 }
 
-static int send_hello_request(unsigned int server_id)
+static int send_hello_request(uint32_t server_id)
 {
     int marked = mark_hello_outstanding(server_id);
 
@@ -2196,7 +2196,7 @@ static void complete_pending_negotiation_errors(struct pending_negotiation *pend
 }
 
 static int queue_pending_negotiation(const char *invocation_id,
-                                     unsigned int server_id,
+                                     uint32_t server_id,
                                      const char *local_path,
                                      const char *remote_path,
                                      uint32_t timeout_ms,
@@ -2236,7 +2236,7 @@ static int queue_pending_negotiation(const char *invocation_id,
     return 0;
 }
 
-static struct pending_negotiation *take_pending_negotiations(unsigned int server_id)
+static struct pending_negotiation *take_pending_negotiations(uint32_t server_id)
 {
     struct pending_negotiation **current;
     struct pending_negotiation *head = NULL;
@@ -2278,15 +2278,15 @@ static void scan_negotiation_timeouts(unsigned long long now,
     }
 }
 
-static void on_peer_connected(void *user_data, unsigned int server_id)
+static void on_peer_connected(void *user_data, uint32_t server_id)
 {
     (void)user_data;
     send_hello_request(server_id);
 }
 
-static void abort_transfers_for_peer(unsigned int server_id);
+static void abort_transfers_for_peer(uint32_t server_id);
 
-static void on_peer_closed(void *user_data, unsigned int server_id)
+static void on_peer_closed(void *user_data, uint32_t server_id)
 {
     struct pending_negotiation *pending;
 
@@ -2298,7 +2298,7 @@ static void on_peer_closed(void *user_data, unsigned int server_id)
                                         "Peer closed during MFT1 capability negotiation.");
 }
 
-static void handle_hello(unsigned int server_id, json_t *payload)
+static void handle_hello(uint32_t server_id, json_t *payload)
 {
     json_t *capabilities = json_object_get(payload, "capabilities");
     json_t *cap;
@@ -2392,7 +2392,7 @@ static int prepare_accept(const char *target_root,
     return 0;
 }
 
-static int send_block_ack_raw(unsigned int server_id,
+static int send_block_ack_raw(uint32_t server_id,
                               const char *transfer_id,
                               uint32_t stream_id,
                               size_t block_index,
@@ -2442,7 +2442,7 @@ static int send_block_ack_raw(unsigned int server_id,
     return rc;
 }
 
-static int send_window_update_raw(unsigned int server_id,
+static int send_window_update_raw(uint32_t server_id,
                                   const char *transfer_id,
                                   uint32_t stream_id,
                                   size_t bytes)
@@ -2504,7 +2504,7 @@ static int mark_block_nack(struct transfer_context *ctx,
     return 0;
 }
 
-static void handle_ack(unsigned int server_id, json_t *payload)
+static void handle_ack(uint32_t server_id, json_t *payload)
 {
     json_t *transfer_id = json_object_get(payload, "transfer_id");
     json_t *stream_id_json = json_object_get(payload, "stream_id");
@@ -2584,7 +2584,7 @@ static void handle_ack(unsigned int server_id, json_t *payload)
     mft_signal_timer();
 }
 
-static void handle_window_update(unsigned int server_id, json_t *payload)
+static void handle_window_update(uint32_t server_id, json_t *payload)
 {
     json_t *transfer_id = json_object_get(payload, "transfer_id");
     json_t *stream_id_json = json_object_get(payload, "stream_id");
@@ -3172,7 +3172,7 @@ static int prepare_send_entries(struct transfer_context *ctx,
 
 static int send_summary(const char *invocation_id,
                         const char *transfer_id,
-                        unsigned int server_id,
+                        uint32_t server_id,
                         const char *direction,
                         size_t files_total,
                         unsigned int files_transferred,
@@ -3184,11 +3184,11 @@ static int send_summary(const char *invocation_id,
                         unsigned long long started_ms)
 {
     unsigned long long now = g_plugin.host->now_ms(g_plugin.host->host_context);
-    json_t *summary = json_pack("{s:s,s:i,s:s,s:i,s:i,s:i,s:i,s:I,s:I,s:I,s:[]}",
+    json_t *summary = json_pack("{s:s,s:I,s:s,s:i,s:i,s:i,s:i,s:I,s:I,s:I,s:[]}",
                                 "transfer_id",
                                 transfer_id,
                                 "server_id",
-                                (int)server_id,
+                                (json_int_t)server_id,
                                 "direction",
                                 direction,
                                 "files_total",
@@ -3709,7 +3709,7 @@ static int add_transfer(struct transfer_context *ctx)
     return 0;
 }
 
-static int send_abort_frame(unsigned int server_id,
+static int send_abort_frame(uint32_t server_id,
                             const char *transfer_id,
                             const char *message)
 {
@@ -3737,7 +3737,7 @@ static void complete_transfer_error_unlinked(struct transfer_context *ctx,
     char error[MFT_MAX_ERROR_TEXT + 1];
     char *transfer_id = NULL;
     char *invocation_id = NULL;
-    unsigned int server_id;
+    uint32_t server_id;
     bool defer_free;
 
     if (!ctx)
@@ -3793,7 +3793,7 @@ static void complete_transfer_error_by_id(const char *transfer_id,
         complete_transfer_error_unlinked(ctx, message, notify_peer);
 }
 
-static void abort_transfers_for_peer(unsigned int server_id)
+static void abort_transfers_for_peer(uint32_t server_id)
 {
     struct transfer_context *ctx = g_transfers;
 
@@ -3858,7 +3858,7 @@ static void recompute_next_package_deadline(unsigned long long *next_deadline)
 }
 
 static void queue_pending_ack(struct pending_block_ack **head,
-                              unsigned int server_id,
+                              uint32_t server_id,
                               const char *transfer_id,
                               uint32_t stream_id,
                               size_t block_index,
@@ -4433,7 +4433,7 @@ static int queue_prepare_transfer(struct transfer_context *ctx)
 }
 
 static int start_send(const char *invocation_id,
-                      unsigned int server_id,
+                      uint32_t server_id,
                       const char *local_path,
                       const char *remote_path,
                       uint32_t timeout_ms)
@@ -4488,7 +4488,7 @@ fail:
 }
 
 static int start_recv(const char *invocation_id,
-                      unsigned int server_id,
+                      uint32_t server_id,
                       const char *remote_path,
                       const char *local_path,
                       uint32_t timeout_ms)
@@ -4606,7 +4606,7 @@ static char *copy_offer_transfer_id(json_t *transfer_id)
     return copy;
 }
 
-static void log_offer_rejection(unsigned int server_id,
+static void log_offer_rejection(uint32_t server_id,
                                 const char *stage,
                                 const char *error)
 {
@@ -4624,7 +4624,7 @@ static void log_offer_rejection(unsigned int server_id,
     g_plugin.host->log_error(g_plugin.host->host_context, message);
 }
 
-static void handle_offer(unsigned int server_id, json_t *payload)
+static void handle_offer(uint32_t server_id, json_t *payload)
 {
     json_t *transfer_id = json_object_get(payload, "transfer_id");
     json_t *remote_path = json_object_get(payload, "remote_path");
@@ -4805,7 +4805,7 @@ static void handle_offer(unsigned int server_id, json_t *payload)
     free(transfer_id_value);
 }
 
-static void handle_fetch_request(unsigned int server_id, json_t *payload)
+static void handle_fetch_request(uint32_t server_id, json_t *payload)
 {
     json_t *transfer_id = json_object_get(payload, "transfer_id");
     json_t *remote_path = json_object_get(payload, "remote_path");
@@ -4853,7 +4853,7 @@ fail:
     free_transfer(ctx);
 }
 
-static void handle_accept(unsigned int server_id, json_t *payload)
+static void handle_accept(uint32_t server_id, json_t *payload)
 {
     json_t *transfer_id = json_object_get(payload, "transfer_id");
     json_t *accept = json_object_get(payload, "accept");
@@ -4960,7 +4960,7 @@ static int parse_data_frame(const unsigned char *payload,
     return 0;
 }
 
-static void handle_data(unsigned int server_id,
+static void handle_data(uint32_t server_id,
                         const unsigned char *payload,
                         size_t len)
 {
@@ -5247,7 +5247,7 @@ static int queue_receive_finalize_locked(struct transfer_context *ctx)
     return rc;
 }
 
-static void handle_complete(unsigned int server_id, json_t *payload)
+static void handle_complete(uint32_t server_id, json_t *payload)
 {
     json_t *transfer_id = json_object_get(payload, "transfer_id");
     struct transfer_context *ctx;
@@ -5403,7 +5403,7 @@ static void handle_abort(json_t *payload)
 }
 
 static void on_frame(void *user_data,
-                     unsigned int server_id,
+                     uint32_t server_id,
                      const void *raw_payload,
                      uint32_t payload_len)
 {
@@ -5453,7 +5453,7 @@ static void on_frame(void *user_data,
     json_decref(json);
 }
 
-static int parse_server_id(json_t *args, unsigned int *out)
+static int parse_server_id(json_t *args, uint32_t *out)
 {
     json_t *value = json_object_get(args, "server_id");
     json_int_t raw;
@@ -5461,9 +5461,9 @@ static int parse_server_id(json_t *args, unsigned int *out)
     if (!json_is_integer(value))
         return -1;
     raw = json_integer_value(value);
-    if (raw <= 0 || raw > 4294967295LL)
+    if (raw <= 0 || raw > UINT32_MAX)
         return -1;
-    *out = (unsigned int)raw;
+    *out = (uint32_t)raw;
     return 0;
 }
 
@@ -5479,7 +5479,7 @@ static uint32_t args_timeout_ms(json_t *args)
 static int register_tools(void)
 {
     static const char *schema =
-        "{\"type\":\"object\",\"properties\":{\"server_id\":{\"type\":\"integer\",\"minimum\":1},"
+        "{\"type\":\"object\",\"properties\":{\"server_id\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":4294967295},"
         "\"local_path\":{\"type\":\"string\"},\"remote_path\":{\"type\":\"string\"},"
         "\"timeout_ms\":{\"type\":\"integer\",\"minimum\":1000,\"maximum\":600000,"
         "\"description\":\"Optional transfer timeout override in milliseconds.\"}},"
@@ -5585,7 +5585,7 @@ MFT_PLUGIN_EXPORT int MFT_PLUGIN_INVOKE(const char *invocation_id,
     json_t *args = json_loads(arguments_json, JSON_REJECT_DUPLICATES, &error);
     json_t *local_path;
     json_t *remote_path;
-    unsigned int server_id;
+    uint32_t server_id;
     uint32_t timeout_ms;
     bool receive;
     int rc;

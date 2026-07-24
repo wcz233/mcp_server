@@ -27,7 +27,7 @@ static int deadline_test_complete_error(void *host_context,
 }
 
 static int deadline_test_send_frame(void *host_context,
-                                    unsigned int server_id,
+                                    uint32_t server_id,
                                     const void *payload,
                                     uint32_t payload_len)
 {

@@ -2,6 +2,7 @@
 #include "tools/shell_policy.h"
 
 #include <jansson.h>
+#include <stdint.h>
 #include <string.h>
 
 #define MCP_SHELL_EXEC_HARD_TIMEOUT_MS 300000u
@@ -422,7 +423,7 @@ json_t *mcp_schema_shell_kill(void)
 json_t *mcp_schema_gateway_proxy(void)
 {
     return schema_with_properties(
-        json_pack("{s:{s:s,s:s,s:i},s:{s:s,s:s},s:{s:s,s:s},s:{s:s,s:s,s:i,s:i}}",
+        json_pack("{s:{s:s,s:s,s:i,s:I},s:{s:s,s:s},s:{s:s,s:s},s:{s:s,s:s,s:i,s:i}}",
                   "server_id",
                   "type",
                   "integer",
@@ -430,6 +431,8 @@ json_t *mcp_schema_gateway_proxy(void)
                   "Stable server id from server.list_servers.",
                   "minimum",
                   1,
+                  "maximum",
+                  (json_int_t)UINT32_MAX,
                   "tool_name",
                   "type",
                   "string",
