@@ -299,12 +299,42 @@ static int test_strict_type_rejection(void)
     return 0;
 }
 
+static int test_large_integer_fallbacks(void)
+{
+    static const json_int_t values[] = {
+        INT64_C(4294967297),
+        INT64_C(4294967552),
+        -INT64_C(4294967295),
+    };
+    size_t index;
+
+    for (index = 0; index < sizeof(values) / sizeof(values[0]); index++) {
+        json_t *root = valid_root();
+        struct mcp_shell_policy_snapshot *snapshot = NULL;
+
+        CHECK(root != NULL);
+        CHECK(json_object_set_new(json_object_get(root, "defaults"),
+                                  "timeout_ms",
+                                  json_integer(values[index])) == 0);
+        CHECK(parse_root(root, &snapshot) == 0);
+        CHECK(snapshot->defaults.timeout_ms.value == UINT64_C(3600000));
+        CHECK(snapshot->defaults.timeout_ms.source == MCP_SHELL_POLICY_SOURCE_HARD_FALLBACK);
+        CHECK(strcmp(mcp_shell_policy_snapshot_diagnostic(
+                         snapshot, MCP_SHELL_POLICY_FIELD_TIMEOUT_MS),
+                     "default_out_of_bounds") == 0);
+        json_decref(root);
+        mcp_shell_policy_snapshot_destroy(snapshot);
+    }
+    return 0;
+}
+
 int main(void)
 {
     if (test_field_directory() != 0 || test_valid_config_and_token_copy() != 0 ||
         test_hard_profile() != 0 || test_start_environment_snapshot() != 0 ||
         test_utf8_byte_length_fallback() != 0 ||
-        test_field_fallbacks() != 0 || test_strict_type_rejection() != 0)
+        test_field_fallbacks() != 0 || test_strict_type_rejection() != 0 ||
+        test_large_integer_fallbacks() != 0)
         return 1;
     return 0;
 }
