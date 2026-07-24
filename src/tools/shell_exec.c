@@ -3243,7 +3243,7 @@ static json_t *shell_job_status_json(const struct shell_job *job)
     if (!job)
         return NULL;
 
-    payload = json_pack("{s:s,s:s,s:I,s:I,s:s,s:I,s:I,s:I,s:I,s:I,s:I,s:I}",
+    payload = json_pack("{s:s,s:s,s:I,s:I,s:s,s:I,s:I,s:I,s:I,s:I,s:I}",
                         "job_id",
                         job->job_id,
                         "state",
@@ -3258,8 +3258,6 @@ static json_t *shell_job_status_json(const struct shell_job *job)
                         (json_int_t)job->timeout_ms,
                         "output_bytes",
                         (json_int_t)job->output_limit_bytes,
-                        "once_read_stdout_err_chunk_size",
-                        (json_int_t)job->chunk_size,
                         "deadline_ms",
                         (json_int_t)job->deadline_ms,
                         "stdout_bytes",

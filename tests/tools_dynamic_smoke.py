@@ -6,6 +6,7 @@ import time
 
 
 HIDDEN_SHELL_FIELDS = {
+    "once_read_stdout_err_chunk_size",
     "sandbox_revision",
     "sandbox_enabled",
     "shell_enabled",
@@ -107,7 +108,6 @@ def verify_tool(proc, request_id, tool_name):
         expected_snapshot = {
             "timeout_ms": 3600000,
             "output_bytes": 1048576,
-            "once_read_stdout_err_chunk_size": 65536,
         }
         assert {key: payload[key] for key in expected_snapshot} == expected_snapshot, payload
         waited = call_tool(

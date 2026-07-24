@@ -13,9 +13,9 @@ TOKEN = "s4-token-must-not-appear-2f841bd7"
 SNAPSHOT_FIELDS = (
     "timeout_ms",
     "output_bytes",
-    "once_read_stdout_err_chunk_size",
 )
 HIDDEN_JOB_FIELDS = {
+    "once_read_stdout_err_chunk_size",
     "sandbox_revision",
     "sandbox_enabled",
     "shell_enabled",
@@ -118,7 +118,6 @@ def assert_job_status(payload):
         "process_group_id",
         "timeout_ms",
         "output_bytes",
-        "once_read_stdout_err_chunk_size",
         "deadline_ms",
         "stdout_bytes",
         "stderr_bytes",
@@ -293,7 +292,6 @@ def main():
         old_snapshot = {
             "timeout_ms": 1000,
             "output_bytes": 512,
-            "once_read_stdout_err_chunk_size": 64,
         }
         assert_snapshot(old_started, old_snapshot)
 
@@ -313,7 +311,6 @@ def main():
         new_snapshot = {
             "timeout_ms": 100,
             "output_bytes": 256,
-            "once_read_stdout_err_chunk_size": 64,
         }
 
         old_poll = json_content(
@@ -442,7 +439,6 @@ def main():
         expected_snapshot = {
             "timeout_ms": 800,
             "output_bytes": 256,
-            "once_read_stdout_err_chunk_size": 64,
         }
         assert start_payload["state"] == "running", start_payload
         assert start_payload["pid"] > 0, start_payload
@@ -575,7 +571,6 @@ def main():
         zero_expected = {
             "timeout_ms": 1000,
             "output_bytes": 0,
-            "once_read_stdout_err_chunk_size": 64,
         }
         assert_snapshot(zero_started, zero_expected)
         zero_job_id = zero_started["job_id"]
