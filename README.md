@@ -190,8 +190,10 @@ mcp_stdio_proxy_adapter\build\Release\mcp_stdio_proxy_adapter.exe
 
 ## 运行 MCP Server
 
-`system.shell_exec` 始终注册。未启用 runtime control 时，server 无需 JSON 即可启动，
-使用编译期 hard profile，且 `shell_enabled` 的 hard default 为 `true`。
+`system.shell_exec` 始终注册。server 启动时优先读取 `MCP_SHELL_EXEC_CONFIG` 显式指定的
+JSON；未指定时依次尝试编译期源码路径和安装路径，均不可用才使用 hard profile。
+是否启用 runtime control 不影响已加载策略的执行，`shell_enabled` 的 hard default
+为 `true`。
 
 ### Runtime Sandbox Control
 
@@ -210,6 +212,79 @@ bearer token 只从 JSON v2 的 `control.token` 读取，不再读取
 未设置、空或 `0` 时 control 不可调用，且未指定 JSON 也能使用 hard profile 启动；
 一旦显式设置 `MCP_SHELL_EXEC_CONFIG`，配置错误仍会使启动失败。
 
+#### 开关的作用
+
+沙盒策略、运行时控制接口和 shell 执行是三个不同的开关：
+
+| 开关 | 作用 | 关闭后的行为 |
+| --- | --- | --- |
+| `MCP_SHELL_EXEC_CONFIG=<absolute path>` | 启动时加载 JSON v2 策略；文件中的 `defaults` 立即约束新执行 | 未设置时尝试编译期/安装路径，仍不可用则使用 hard profile |
+| `MCP_ENABLE_SANDBOX_CTL=1` | 允许用 `system.sandbox_ctl` 查询或修改当前进程的策略 | 未设置、空或 `0` 时控制接口不可调用，但已加载的 JSON 策略仍生效 |
+| `defaults.shell_enabled` / runtime `overrides.shell_enabled` | 允许或拒绝 `system.shell_exec` 和 Unix `system.shell_start` 创建新执行 | `false` 才是停止接受新 shell 执行的开关 |
+| runtime `sandbox_enabled` | 在 JSON 策略加 runtime overrides 与编译期 hard profile 之间切换 | `false` 使用 hard profile，通常更宽松；它不是“禁用 shell”或安全停机开关 |
+
+`sandbox_enabled` 初始为 `true`。需要紧急停止命令执行时应把 `shell_enabled`
+override 设为 `false`，不要把 `sandbox_enabled` 设为 `false`。
+
+#### `shell_exec.json` 参数
+
+JSON v2 使用严格结构：下面列出的对象和字段都必须存在，未知字段、重复 key、错误类型
+或空 token 会使显式配置加载失败。`defaults` 是启动默认值，也是没有 runtime override
+时的生效值。
+
+| 路径 | 模板值 | 控制内容 |
+| --- | --- | --- |
+| `version` | `2` | 配置格式版本；当前只接受整数 `2` |
+| `control.token` | `"123"` | `system.sandbox_ctl` bearer token，长度为 1..4096 bytes；模板值仅供示例，部署前必须替换 |
+| `defaults.shell_enabled` | `true` | 是否允许创建新的同步或异步 shell 执行 |
+| `defaults.command_length` | `65536` | `command` 的最大 UTF-8 byte 数，不含结尾 NUL |
+| `defaults.timeout_ms` | `300000` | 默认执行超时，也是请求参数 `timeout_ms` 当前允许的最大值 |
+| `defaults.output_bytes` | `65536` | stdout、stderr 各自最多保留的 byte 数；合流时只使用 stdout 限额，超出会标记 truncated |
+| `defaults.once_read_stdout_err_chunk_size` | `1024` | 每次从 stdout/stderr pipe 读取的最大 byte 数；只控制内部读取块，不出现在 shell job 响应中 |
+| `defaults.capture_stderr` | `true` | 是否捕获 stderr 并返回；为 `false` 时子进程 stderr 使用 server 的 stderr handle |
+| `defaults.merge_stderr_to_stdout` | `false` | 捕获 stderr 时是否把它合并进 stdout；`capture_stderr=false` 时该值强制按 `false` 生效 |
+
+`defaults.execution` 控制进程的启动方式、工作目录和环境：
+
+| 路径 | 模板值 | 控制内容 |
+| --- | --- | --- |
+| `defaults.execution.mode` | `"shell"` | `shell` 通过 `shell_path + shell_arg` 执行命令；`exec` 不经过 shell，Unix 下当前把 `command` 整体作为可执行文件路径且不拆分 argv |
+| `defaults.execution.shell_path` | `"/bin/sh"` | `mode=shell` 时启动的解释器；Windows 部署通常应改为 `cmd.exe` 或其绝对路径 |
+| `defaults.execution.shell_arg` | `"-c"` | 放在命令前传给解释器的单个参数；Windows `cmd.exe` 通常使用 `/C`，允许空字符串 |
+| `defaults.execution.working_directory` | `"/tmp/mcp-shell"` | 默认工作目录；不存在时只创建该目录本身，不递归创建父目录 |
+| `defaults.execution.inherit_env` | `false` | 是否继承 server 启动时捕获的环境快照 |
+| `defaults.execution.request_cwd_allowed` | `true` | 是否允许单次 `shell_exec`/`shell_start` 用 `cwd` 覆盖默认工作目录 |
+| `defaults.execution.request_env_allowed` | `true` | 是否允许单次执行用 `env` 增补或覆盖环境变量 |
+| `defaults.execution.kill_process_group_on_timeout` | `true` | Unix 超时时是否终止整个新进程组；Windows 当前报告 `unsupported` |
+| `defaults.execution.run_as_user` | `""` | Unix 执行前切换到的用户名；空字符串表示不切换，能否切换取决于 server 启动账号权限 |
+| `defaults.execution.run_as_group` | `""` | Unix 执行前切换到的组名；空字符串表示不切换 |
+| `defaults.execution.env` | `PATH`/`HOME`/`LANG` | 固定环境变量层；覆盖继承环境中的同名项，之后还可由请求 `env` 覆盖 |
+
+`defaults.limits` 在 Unix 上对应子进程的 rlimit。数值 `0` 是实际限制值，不表示
+“无限制”；如需放宽应在 hard max 范围内填写明确值。Windows 当前不支持这五项限制。
+
+| 路径 | 模板值 | Unix 控制内容 |
+| --- | --- | --- |
+| `defaults.limits.cpu_seconds` | `3600` | `RLIMIT_CPU`，CPU 时间秒数 |
+| `defaults.limits.memory_bytes` | `2147483648` | `RLIMIT_AS`，进程虚拟地址空间 byte 数 |
+| `defaults.limits.file_size_bytes` | `2147483648` | `RLIMIT_FSIZE`，可创建文件的最大 byte 数 |
+| `defaults.limits.open_files` | `64` | `RLIMIT_NOFILE`，打开文件描述符数量 |
+| `defaults.limits.processes` | `16` | `RLIMIT_NPROC`，目标用户可创建的进程数量 |
+| `defaults.isolation.require_non_root` | `false` | Unix 在身份切换后拒绝仍以 root 执行；Windows 状态报告为 `reject_only` |
+
+`bounds` 限定 JSON default 和 runtime override 可取的范围；超出编译期 hard 范围、
+边界顺序错误或 default 不在边界内时，该字段回退到 hard default/bounds，并在
+`system.sandbox_ctl get` 的 `diagnostics` 中报告原因。
+
+| 路径 | 控制内容 |
+| --- | --- |
+| `bounds.command_length`、`bounds.timeout_ms`、`bounds.output_bytes`、`bounds.once_read_stdout_err_chunk_size` | 对应数值字段的 `min`/`max`；hard 范围依次为 1..65536、1..3600000、0..1048576、64..65536 |
+| `bounds.execution.mode.allowed` | runtime 可选择的执行模式集合，只接受 `shell` 和/或 `exec`，且必须包含 default |
+| `bounds.execution.shell_path`、`bounds.execution.shell_arg`、`bounds.execution.working_directory` | 对应 UTF-8 字符串的 `min_bytes`/`max_bytes`；`working_directory` 的范围也约束请求 `cwd` |
+| `bounds.execution.allowed_env` | 最终环境的 `max_items` 与每个 `NAME=VALUE` 的 `item_max_bytes`；名称虽为 `allowed_env`，不是变量名 allowlist |
+| `bounds.execution.run_as_user`、`bounds.execution.run_as_group` | 身份字符串的 `min_bytes`，可选 `max_bytes`；未写 `max_bytes` 时 hard max 为 255 |
+| `bounds.limits.*` | 对应 rlimit 字段的 `min`/`max`，runtime 更新只能落在该范围内 |
+
 配置文件包含明文 bearer token。Unix 上应由运行 server 的账号持有并设置为 `0600`；
 Windows 上应移除继承权限，只给运行服务的账号授予读取权限。不要把示例 token 用于
 生产，也不要把 token 放入命令行、日志或环境变量。token 只适合可信 stdio/pipe、
@@ -223,19 +298,67 @@ default/bounds，`get` 会返回字段级 diagnostic；其他合法字段继续�
 `sandbox_enabled=false` 会使用 hard profile，但保留 overrides，重新开启后恢复；它
 不是强隔离开关，也不会提升 mcp_server 的 OS 权限。
 
-使用前先读取状态，再通过 revision 执行 compare-and-swap 更新或重置：
+启动时同时指定配置和 control gate。Linux 示例：
+
+```bash
+MCP_SHELL_EXEC_CONFIG="$PWD/config/tools/shell_exec.json" \
+MCP_ENABLE_SANDBOX_CTL=1 \
+./build/src/mcp_server
+```
+
+Windows PowerShell 示例：
+
+```powershell
+$env:MCP_SHELL_EXEC_CONFIG = (Resolve-Path "config\tools\shell_exec.json").Path
+$env:MCP_ENABLE_SANDBOX_CTL = "1"
+.\build\src\Release\mcp_server.exe
+```
+
+使用 control 时，先读取状态，再使用返回的 `revision` 执行 compare-and-swap 更新。
+以下 JSON 都是 `system.sandbox_ctl` 的 arguments。读取状态：
 
 ```json
 {"action":"get","token":"<token>"}
 ```
 
-```json
-{"action":"update","token":"<token>","expected_revision":0,"overrides":{"shell_enabled":true,"timeout_ms":1000}}
-```
+停止接受新命令：
 
 ```json
-{"action":"reset","token":"<token>","expected_revision":1}
+{"action":"update","token":"<token>","expected_revision":0,"overrides":{"shell_enabled":false}}
 ```
+
+重新允许命令，并把默认/最大超时改为 1000 ms：
+
+```json
+{"action":"update","token":"<token>","expected_revision":1,"overrides":{"shell_enabled":true,"timeout_ms":1000}}
+```
+
+仅在明确需要绕过 JSON 策略时切到 hard profile；overrides 会保留但暂不生效：
+
+```json
+{"action":"update","token":"<token>","expected_revision":2,"sandbox_enabled":false}
+```
+
+重新启用 JSON 策略和已保存的 overrides：
+
+```json
+{"action":"update","token":"<token>","expected_revision":3,"sandbox_enabled":true}
+```
+
+清空全部 overrides、把 `sandbox_enabled` 恢复为 `true`，并回到 JSON defaults：
+
+```json
+{"action":"reset","token":"<token>","expected_revision":4}
+```
+
+单次执行可在策略允许的范围内传入 `timeout_ms`、`cwd` 和 `env`：
+
+```json
+{"command":"pwd","timeout_ms":1000,"cwd":"/tmp/mcp-shell","env":{"LANG":"C"}}
+```
+
+以上对象是 `system.shell_exec` 的 arguments；Windows 命令和路径应改为目标平台语法。
+runtime update 中把某个 override 设为 `null` 可只删除该 override，恢复对应 JSON default。
 
 更新和 reset 只影响之后的新 `system.shell_exec` 或 Unix `system.shell_start` 执行，
 不会终止既有 job。Unix 支持可表示的 RLIMIT_CPU/AS/FSIZE/NOFILE/NPROC、身份切换和
