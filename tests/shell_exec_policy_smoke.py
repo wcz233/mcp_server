@@ -11,19 +11,27 @@ TOKEN = "s3-token-must-not-appear-49a6f31d"
 PARENT_SECRET = "s3-parent-secret-must-not-appear-867e"
 DEFAULT_SECRET = "s3-default-secret-must-not-appear-302b"
 REQUEST_SECRET = "s3-request-secret-must-not-appear-745c"
-SHELL_EXEC_RESULT_FIELDS = {
-    "stdout",
-    "stderr",
-    "exit_code",
-    "timed_out",
-    "truncated",
-    "stdout_truncated",
-    "stderr_truncated",
-    "signal",
+SHELL_EXEC_RESULT_FIELDS = {"stdout", "stderr", "exit_code"}
+SHELL_EXEC_POLICY_FIELDS = {
     "sandbox_revision",
     "sandbox_enabled",
     "shell_enabled",
 }
+SHELL_EXEC_BOOLEAN_DIAGNOSTICS = {
+    "timed_out",
+    "truncated",
+    "stdout_truncated",
+    "stderr_truncated",
+}
+
+
+def assert_shell_result_contract(payload):
+    assert SHELL_EXEC_POLICY_FIELDS.isdisjoint(payload), payload
+    for field in SHELL_EXEC_BOOLEAN_DIAGNOSTICS:
+        if field in payload:
+            assert payload[field] is True, payload
+    if "signal" in payload:
+        assert type(payload["signal"]) is int and payload["signal"] != 0, payload
 
 
 def shell_command(command_windows, command_unix):
@@ -212,7 +220,9 @@ class Client:
         )
 
     def shell(self, arguments, expect_error=False):
-        return self.json_call("system.shell_exec", arguments, expect_error)[1]
+        payload = self.json_call("system.shell_exec", arguments, expect_error)[1]
+        assert_shell_result_contract(payload)
+        return payload
 
     def close(self):
         if self.proc.stdin:
@@ -269,7 +279,6 @@ def verify_effective_policy(client, temp_path):
         assert state["capabilities"]["limits"]["memory_bytes"] == "enforced", state
     payload = client.shell({"command": shell_command("echo smoke", "printf smoke")})
     assert payload["stdout"].strip() == "smoke", payload
-    assert payload["sandbox_revision"] == state["revision"], payload
 
     state = client.update(state, overrides={"command_length": 8})
     marker = temp_path / "strict-request.marker"
@@ -293,7 +302,6 @@ def verify_effective_policy(client, temp_path):
     assert state["effective"]["command_length"] == 65536, state
     payload = client.shell({"command": shell_command("echo 123456789", "printf 123456789")})
     assert payload["stdout"].strip() == "123456789", payload
-    assert payload["sandbox_enabled"] is False, payload
 
     state = client.update(state, sandbox_enabled=True)
     assert state["overrides"]["command_length"] == 8, state
@@ -302,20 +310,12 @@ def verify_effective_policy(client, temp_path):
     return state
 
 
-def assert_compact_shell_result(payload, command, expected_stdout, revision):
+def assert_compact_shell_result(payload, command, expected_stdout):
     assert set(payload) == SHELL_EXEC_RESULT_FIELDS, payload
     assert command not in (value for value in payload.values() if isinstance(value, str)), payload
     assert payload["stdout"].strip() == expected_stdout, payload
     assert payload["stderr"] == "", payload
     assert payload["exit_code"] == 0, payload
-    assert payload["timed_out"] is False, payload
-    assert payload["truncated"] is False, payload
-    assert payload["stdout_truncated"] is False, payload
-    assert payload["stderr_truncated"] is False, payload
-    assert payload["signal"] == 0, payload
-    assert payload["sandbox_revision"] == revision, payload
-    assert payload["sandbox_enabled"] is True, payload
-    assert payload["shell_enabled"] is True, payload
 
 
 def verify_compact_result_contract(client, state, temp_path):
@@ -343,7 +343,7 @@ def verify_compact_result_contract(client, state, temp_path):
     if os.name == "nt":
         state = client.update(state, overrides={"execution": {"shell_arg": "/C exit"}})
     payload = client.shell({"command": one_byte_command})
-    assert_compact_shell_result(payload, one_byte_command, "", state["revision"])
+    assert_compact_shell_result(payload, one_byte_command, "")
     if os.name == "nt":
         state = client.update(state, overrides={"execution": {"shell_arg": default_shell_arg}})
 
@@ -352,11 +352,11 @@ def verify_compact_result_contract(client, state, temp_path):
         (max_command, "stage3-max"),
     ):
         payload = client.shell({"command": command})
-        assert_compact_shell_result(payload, command, expected_stdout, state["revision"])
+        assert_compact_shell_result(payload, command, expected_stdout)
 
     marker = temp_path / "stage3-once.marker"
     payload = client.shell({"command": once_command})
-    assert_compact_shell_result(payload, once_command, "", state["revision"])
+    assert_compact_shell_result(payload, once_command, "")
     assert marker.read_text(encoding="utf-8") == marker_content, marker.read_text(encoding="utf-8")
 
     return client.update(
@@ -475,12 +475,12 @@ def verify_output_and_shell_arg(client, state, temp_path):
     )
     payload = client.shell({"command": both_streams})
     assert len(payload["stdout"]) == 5 and payload["stderr"] == "", payload
-    assert payload["stdout_truncated"] is True and payload["stderr_truncated"] is False, payload
+    assert payload["stdout_truncated"] is True and "stderr_truncated" not in payload, payload
 
     state = client.update(state, overrides={"capture_stderr": False, "merge_stderr_to_stdout": True})
     assert state["effective"]["merge_stderr_to_stdout"] is False, state
     payload = client.shell({"command": shell_command("echo ignored 1>&2", "printf ignored >&2")})
-    assert payload["stderr"] == "" and payload["stderr_truncated"] is False, payload
+    assert payload["stderr"] == "" and "stderr_truncated" not in payload, payload
 
     if os.name == "nt":
         system_root = os.environ.get("SystemRoot", r"C:\Windows")

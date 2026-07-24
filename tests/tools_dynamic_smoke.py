@@ -5,6 +5,18 @@ import sys
 import time
 
 
+HIDDEN_SHELL_FIELDS = {
+    "sandbox_revision",
+    "sandbox_enabled",
+    "shell_enabled",
+    "rollback",
+}
+
+
+def assert_shell_metadata_omitted(payload):
+    assert HIDDEN_SHELL_FIELDS.isdisjoint(payload), payload
+
+
 def send(proc, payload):
     proc.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
     proc.stdin.flush()
@@ -72,8 +84,7 @@ def verify_tool(proc, request_id, tool_name):
         assert result["isError"] is False, result
         payload = assert_json_text(result)
         assert payload["stdout"].strip() == "unsafe", payload
-        assert payload["sandbox_enabled"] is False, payload
-        assert payload["shell_enabled"] is True, payload
+        assert set(payload) == {"stdout", "stderr", "exit_code"}, payload
         return
 
     if tool_name == "system.sandbox_ctl":
@@ -92,10 +103,8 @@ def verify_tool(proc, request_id, tool_name):
 
         assert result["isError"] is False, result
         payload = assert_json_text(result)
+        assert_shell_metadata_omitted(payload)
         expected_snapshot = {
-            "sandbox_revision": 0,
-            "sandbox_enabled": False,
-            "shell_enabled": True,
             "timeout_ms": 3600000,
             "output_bytes": 1048576,
             "once_read_stdout_err_chunk_size": 65536,
@@ -109,6 +118,7 @@ def verify_tool(proc, request_id, tool_name):
         )
         assert waited["isError"] is False, waited
         waited_payload = assert_json_text(waited)
+        assert_shell_metadata_omitted(waited_payload)
         assert {key: waited_payload[key] for key in expected_snapshot} == expected_snapshot, waited_payload
         deadline = time.monotonic() + 3
         poll_id = request_id + 2001
@@ -118,6 +128,7 @@ def verify_tool(proc, request_id, tool_name):
             poll_id += 1
             assert waited["isError"] is False, waited
             waited_payload = assert_json_text(waited)
+            assert_shell_metadata_omitted(waited_payload)
         assert waited_payload["state"] == "exited", waited_payload
         assert {key: waited_payload[key] for key in expected_snapshot} == expected_snapshot, waited_payload
         return
@@ -272,6 +283,10 @@ def main():
         assert start_properties["timeout_ms"]["maximum"] == 300000, start_properties
         assert start_properties["output_limit_bytes"]["minimum"] == 256, start_properties
         assert start_properties["output_limit_bytes"]["maximum"] == 2147483648, start_properties
+        shell_kill = next(tool for tool in tools if tool["name"] == "system.shell_kill")
+        kill_description = shell_kill["description"]
+        assert "job_id returned by system.shell_start" in kill_description, kill_description
+        assert "signal (default 15)" in kill_description, kill_description
         proxy_tool = next(tool for tool in tools if tool["name"] == "gateway.proxy_tool")
         proxy_server_id = proxy_tool["inputSchema"]["properties"]["server_id"]
         assert proxy_server_id["minimum"] == 1, proxy_server_id

@@ -11,13 +11,16 @@ from pathlib import Path
 
 TOKEN = "s4-token-must-not-appear-2f841bd7"
 SNAPSHOT_FIELDS = (
-    "sandbox_revision",
-    "sandbox_enabled",
-    "shell_enabled",
     "timeout_ms",
     "output_bytes",
     "once_read_stdout_err_chunk_size",
 )
+HIDDEN_JOB_FIELDS = {
+    "sandbox_revision",
+    "sandbox_enabled",
+    "shell_enabled",
+    "rollback",
+}
 
 
 def valid_config(working_directory):
@@ -120,14 +123,18 @@ def assert_job_status(payload):
         "stdout_bytes",
         "stderr_bytes",
         "exit_code",
-        "signal",
     )
     assert all(type(payload[field]) is int for field in integer_fields), payload
     assert payload["pid"] > 0, payload
     assert payload["process_group_id"] > 0, payload
     for field in integer_fields[2:8]:
         assert payload[field] >= 0, payload
-    assert payload["signal"] >= 0, payload
+    assert HIDDEN_JOB_FIELDS.isdisjoint(payload), payload
+    for field in ("stdout_truncated", "stderr_truncated"):
+        if field in payload:
+            assert payload[field] is True, payload
+    if "signal" in payload:
+        assert type(payload["signal"]) is int and payload["signal"] != 0, payload
 
     started_at = datetime.fromisoformat(payload["started_at"].replace("Z", "+00:00"))
     since_epoch = started_at - datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -255,6 +262,9 @@ def main():
         assert "offset" not in tail_properties, tail_properties
         assert "stdout_offset" in tail_properties, tail_properties
         assert "stderr_offset" in tail_properties, tail_properties
+        kill_description = shell_tools["system.shell_kill"]["description"]
+        assert "job_id returned by system.shell_start" in kill_description, kill_description
+        assert "signal (default 15)" in kill_description, kill_description
 
         tools = call_tool(proc, 3, "system.shell_list", {})
         assert tools["isError"] is False, tools
@@ -281,9 +291,6 @@ def main():
         )
         old_job_id = old_started["job_id"]
         old_snapshot = {
-            "sandbox_revision": state["revision"],
-            "sandbox_enabled": True,
-            "shell_enabled": True,
             "timeout_ms": 1000,
             "output_bytes": 512,
             "once_read_stdout_err_chunk_size": 64,
@@ -304,9 +311,6 @@ def main():
             )
         )
         new_snapshot = {
-            "sandbox_revision": state["revision"],
-            "sandbox_enabled": True,
-            "shell_enabled": True,
             "timeout_ms": 100,
             "output_bytes": 256,
             "once_read_stdout_err_chunk_size": 64,
@@ -395,7 +399,7 @@ def main():
             call_tool(proc, 113, "system.shell_tail", {"job_id": old_job_id})
         )
         assert old_tail["stdout"] == "o" * 300, old_tail
-        assert old_tail["stdout_truncated"] is False, old_tail
+        assert "stdout_truncated" not in old_tail, old_tail
         assert_snapshot(old_tail, old_snapshot)
         jobs = json_content(call_tool(proc, 114, "system.shell_list", {}))["jobs"]
         assert_snapshot(next(job for job in jobs if job["job_id"] == old_job_id), old_snapshot)
@@ -436,9 +440,6 @@ def main():
         start_payload = json_content(started)
         job_id = start_payload["job_id"]
         expected_snapshot = {
-            "sandbox_revision": state["revision"],
-            "sandbox_enabled": True,
-            "shell_enabled": True,
             "timeout_ms": 800,
             "output_bytes": 256,
             "once_read_stdout_err_chunk_size": 64,
@@ -446,7 +447,6 @@ def main():
         assert start_payload["state"] == "running", start_payload
         assert start_payload["pid"] > 0, start_payload
         assert start_payload["process_group_id"] == start_payload["pid"], start_payload
-        assert start_payload["rollback"]["tool_name"] == "system.shell_kill", start_payload
         assert_command_omitted(start_payload, tracked_command)
         assert_snapshot(start_payload, expected_snapshot)
 
@@ -573,9 +573,6 @@ def main():
             call_tool(proc, 22, "system.shell_start", {"command": "printf discarded"})
         )
         zero_expected = {
-            "sandbox_revision": state["revision"],
-            "sandbox_enabled": True,
-            "shell_enabled": True,
             "timeout_ms": 1000,
             "output_bytes": 0,
             "once_read_stdout_err_chunk_size": 64,

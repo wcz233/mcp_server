@@ -80,8 +80,7 @@ def main():
         assert shell["result"]["isError"] is False
         shell_payload = json.loads(shell["result"]["content"][0]["text"])
         assert shell_payload["stdout"].strip() == "unsafe", shell_payload
-        assert shell_payload["sandbox_enabled"] is False, shell_payload
-        assert shell_payload["shell_enabled"] is True, shell_payload
+        assert set(shell_payload) == {"stdout", "stderr", "exit_code"}, shell_payload
 
         send(
             proc,

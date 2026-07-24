@@ -9,6 +9,18 @@ import time
 
 
 TOKEN = "s2-token-must-not-appear-7f51b36e"
+HIDDEN_SHELL_FIELDS = {
+    "sandbox_revision",
+    "sandbox_enabled",
+    "shell_enabled",
+    "rollback",
+}
+SHELL_BOOLEAN_DIAGNOSTICS = {
+    "timed_out",
+    "truncated",
+    "stdout_truncated",
+    "stderr_truncated",
+}
 
 V2_DEFAULT_PATHS = {
     ("shell_enabled",),
@@ -260,6 +272,15 @@ def shell_command(command_windows, command_unix):
     return command_windows if os.name == "nt" else command_unix
 
 
+def assert_shell_result_contract(payload):
+    assert HIDDEN_SHELL_FIELDS.isdisjoint(payload), payload
+    for field in SHELL_BOOLEAN_DIAGNOSTICS:
+        if field in payload:
+            assert payload[field] is True, payload
+    if "signal" in payload:
+        assert type(payload["signal"]) is int and payload["signal"] != 0, payload
+
+
 def shell_result(client, arguments):
     response = client.call("system.shell_exec", arguments)
     assert "result" in response, response
@@ -272,7 +293,9 @@ def shell_result(client, arguments):
 def successful_shell_payload(client, arguments):
     result, text = shell_result(client, arguments)
     assert result["isError"] is False, result
-    return json.loads(text)
+    payload = json.loads(text)
+    assert_shell_result_contract(payload)
+    return payload
 
 
 def successful_job_payload(client, name, arguments):
@@ -280,7 +303,13 @@ def successful_job_payload(client, name, arguments):
     assert "result" in response, response
     result = response["result"]
     assert result["isError"] is False, result
-    return json.loads(result["content"][0]["text"])
+    payload = json.loads(result["content"][0]["text"])
+    jobs = payload.get("jobs", []) if isinstance(payload, dict) else []
+    if isinstance(payload, dict) and "job_id" in payload:
+        jobs = [payload]
+    for job in jobs:
+        assert_shell_result_contract(job)
+    return payload
 
 
 def wait_for_job_state(client, job_id, wanted, deadline_seconds=5.0):
@@ -960,9 +989,7 @@ def verify_control_contract(exe, config_path, config):
     assert result["isError"] is False, result
     payload = json.loads(text)
     assert payload["stdout"].strip() == "runtime-enabled", payload
-    assert payload["sandbox_revision"] == state["revision"], payload
-    assert payload["sandbox_enabled"] is True, payload
-    assert payload["shell_enabled"] is True, payload
+    assert_shell_result_contract(payload)
 
     state = client.control(
         update_arguments(
@@ -1303,9 +1330,7 @@ def verify_synchronous_bypass(exe, config_path, config):
     assert effective["isolation"]["require_non_root"] is False, effective
 
     payload = successful_shell_payload(client, {"command": long_command})
-    assert payload["sandbox_revision"] == state["revision"], payload
-    assert payload["sandbox_enabled"] is False, payload
-    assert payload["shell_enabled"] is True, payload
+    assert payload["exit_code"] == 0, payload
 
     hard_marker = config_path.parent / "hard-command.marker"
     hard_marker.unlink(missing_ok=True)
@@ -1400,7 +1425,7 @@ def verify_synchronous_bypass(exe, config_path, config):
     state = client.control(update_arguments(state, sandbox_enabled=False))
     assert state["overrides"] == saved_overrides, state
     bypass_output = successful_shell_payload(client, {"command": output_command})
-    assert len(bypass_output["stdout"].strip()) == 300 and bypass_output["truncated"] is False, bypass_output
+    assert len(bypass_output["stdout"].strip()) == 300 and "truncated" not in bypass_output, bypass_output
     bypass_cwd = successful_shell_payload(client, {"command": cwd_command})
     assert Path(bypass_cwd["stdout"].strip()).resolve() == Path.cwd().resolve(), bypass_cwd
     bypass_env = successful_shell_payload(client, {"command": env_command})
@@ -1492,8 +1517,7 @@ def verify_async_effective_policy(exe, config_path, config):
         "system.shell_start",
         {"command": "printf 'x%.0s' $(seq 1 300)", "output_limit_bytes": 256},
     )
-    assert started["sandbox_revision"] == state["revision"], started
-    assert started["sandbox_enabled"] is True and started["shell_enabled"] is True, started
+    assert started["timeout_ms"] == 100 and started["output_bytes"] == 256, started
     waited = successful_job_payload(
         client, "system.shell_wait", {"job_id": started["job_id"], "timeout_ms": 3000}
     )
@@ -1501,8 +1525,7 @@ def verify_async_effective_policy(exe, config_path, config):
     tailed = successful_job_payload(client, "system.shell_tail", {"job_id": started["job_id"]})
     listed = successful_job_payload(client, "system.shell_list", {})
     for payload in (waited, tailed, next(job for job in listed["jobs"] if job["job_id"] == started["job_id"])):
-        assert payload["sandbox_revision"] == state["revision"], payload
-        assert payload["sandbox_enabled"] is True and payload["shell_enabled"] is True, payload
+        assert payload["timeout_ms"] == 100 and payload["output_bytes"] == 256, payload
     assert tailed["stdout"] == "x" * 256 and tailed["stdout_truncated"] is True, tailed
 
     marker = config_path.parent / "async-timeout.marker"
@@ -1548,7 +1571,7 @@ def verify_async_job_snapshot_boundary(exe, config_path, config):
         "system.shell_start",
         {"command": "sh -c 'printf first; sleep 0.4; printf second'"},
     )
-    assert started_a["sandbox_revision"] == revision_a, started_a
+    assert started_a["timeout_ms"] == 1000 and started_a["output_bytes"] == 1024, started_a
 
     state = client.control(
         update_arguments(
@@ -1570,12 +1593,11 @@ def verify_async_job_snapshot_boundary(exe, config_path, config):
     )
     listed_a = successful_job_payload(client, "system.shell_list", {})
     for payload in (poll_a, tail_a, wait_a, next(job for job in listed_a["jobs"] if job["job_id"] == started_a["job_id"])):
-        assert payload["sandbox_revision"] == revision_a, payload
-        assert payload["sandbox_enabled"] is True and payload["shell_enabled"] is True, payload
+        assert payload["timeout_ms"] == 1000 and payload["output_bytes"] == 1024, payload
     wait_for_job_state(client, started_a["job_id"], "exited")
     final_a = successful_job_payload(client, "system.shell_tail", {"job_id": started_a["job_id"]})
     assert final_a["state"] == "exited" and final_a["stdout"] == "firstsecond", final_a
-    assert final_a["stdout_truncated"] is False, final_a
+    assert "stdout_truncated" not in final_a, final_a
 
     marker_b = config_path.parent / "async-job-b.marker"
     marker_b.unlink(missing_ok=True)
@@ -1584,7 +1606,7 @@ def verify_async_job_snapshot_boundary(exe, config_path, config):
         "system.shell_start",
         {"command": f"sh -c 'sleep 0.2; touch {marker_b}'"},
     )
-    assert started_b["sandbox_revision"] == revision_b, started_b
+    assert started_b["timeout_ms"] == 50 and started_b["output_bytes"] == 256, started_b
     wait_b = successful_job_payload(
         client, "system.shell_wait", {"job_id": started_b["job_id"], "timeout_ms": 3000}
     )
@@ -1604,9 +1626,12 @@ def verify_async_job_snapshot_boundary(exe, config_path, config):
     )
     assert not marker_c.exists(), marker_c
     marker_c.unlink(missing_ok=True)
-    for job_id, revision in ((started_a["job_id"], revision_a), (started_b["job_id"], revision_b)):
+    for job_id, timeout_ms, output_bytes in (
+        (started_a["job_id"], 1000, 1024),
+        (started_b["job_id"], 50, 256),
+    ):
         payload = successful_job_payload(client, "system.shell_poll", {"job_id": job_id})
-        assert payload["sandbox_revision"] == revision, payload
+        assert payload["timeout_ms"] == timeout_ms and payload["output_bytes"] == output_bytes, payload
 
     reset_state(client, state)
     client.close()

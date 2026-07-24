@@ -838,7 +838,7 @@ def main():
                 "system.shell_exec",
                 {"command": blocking_command(), "timeout_ms": 5000},
             )
-            assert blocked["exit_code"] == 0 and blocked["timed_out"] is False, blocked
+            assert blocked["exit_code"] == 0 and "timed_out" not in blocked, blocked
         payload = call_tool(sock, 21, "server.list_servers", {"wait_ms": 100})
         peer = peer_entry(payload, fake_tcp_online)
         assert peer and peer["state"] == "online" and peer["tcp_connected"] is True, payload

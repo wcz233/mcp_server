@@ -446,7 +446,7 @@ def main():
             value for value in completed_payload.values() if isinstance(value, str)
         ), completed_payload
         assert completed_payload["stdout"].strip() == "proxy-ok", completed_payload
-        assert completed_payload["timed_out"] is False, completed_payload
+        assert "timed_out" not in completed_payload, completed_payload
 
         request_graceful_shutdown(proc_b)
         proc_b.wait(timeout=5)

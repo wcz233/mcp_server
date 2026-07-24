@@ -380,7 +380,7 @@ int mcp_register_builtin_tools(struct mcp_server *server, struct mcp_tool_regist
 
     if (register_tool(registry,
                       "system.shell_kill",
-                      "Terminate an asynchronous shell job by process group when supported; the result does not repeat the command.",
+                      "Terminate a running asynchronous shell job using the job_id returned by system.shell_start and an optional signal (default 15); the result does not repeat the command.",
                       mcp_schema_shell_kill(),
                       "builtin",
                       "L4",

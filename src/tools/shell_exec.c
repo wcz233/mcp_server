@@ -146,9 +146,6 @@ struct shell_job {
     bool stderr_open;
     bool process_reaped;
     bool kill_process_group;
-    json_int_t sandbox_revision;
-    bool sandbox_enabled;
-    bool shell_enabled;
 #ifndef _WIN32
     pid_t pid;
     pid_t process_group_id;
@@ -3246,7 +3243,7 @@ static json_t *shell_job_status_json(const struct shell_job *job)
     if (!job)
         return NULL;
 
-    payload = json_pack("{s:s,s:s,s:I,s:I,s:s,s:I,s:I,s:I,s:I,s:I,s:I,s:b,s:b,s:I,s:I,s:I,s:b,s:b}",
+    payload = json_pack("{s:s,s:s,s:I,s:I,s:s,s:I,s:I,s:I,s:I,s:I,s:I,s:I}",
                         "job_id",
                         job->job_id,
                         "state",
@@ -3269,39 +3266,30 @@ static json_t *shell_job_status_json(const struct shell_job *job)
                         (json_int_t)job->stdout_buf.len,
                         "stderr_bytes",
                         (json_int_t)job->stderr_buf.len,
-                        "stdout_truncated",
-                        job->stdout_buf.truncated,
-                        "stderr_truncated",
-                        job->stderr_buf.truncated,
                         "exit_code",
-                        (json_int_t)job->exit_code,
-                        "signal",
-                        (json_int_t)job->signal_number,
-                        "sandbox_revision",
-                        job->sandbox_revision,
-                        "sandbox_enabled",
-                        job->sandbox_enabled,
-                        "shell_enabled",
-                        job->shell_enabled);
+                        (json_int_t)job->exit_code);
     if (!payload)
         return NULL;
 
+    if (job->stdout_buf.truncated &&
+        json_object_set_new(payload, "stdout_truncated", json_true()) != 0)
+        goto fail;
+    if (job->stderr_buf.truncated &&
+        json_object_set_new(payload, "stderr_truncated", json_true()) != 0)
+        goto fail;
+    if (job->signal_number != 0 &&
+        json_object_set_new(payload, "signal", json_integer(job->signal_number)) != 0)
+        goto fail;
     if (job->label)
         json_object_set_new(payload, "label", json_string(job->label));
     if (job->finished_at[0])
         json_object_set_new(payload, "finished_at", json_string(job->finished_at));
-    if (job->state == SHELL_JOB_RUNNING) {
-        json_t *rollback = json_pack("{s:s,s:{s:s}}",
-                                     "tool_name",
-                                     "system.shell_kill",
-                                     "args",
-                                     "job_id",
-                                     job->job_id);
-        if (rollback)
-            json_object_set_new(payload, "rollback", rollback);
-    }
 
     return payload;
+
+fail:
+    json_decref(payload);
+    return NULL;
 }
 
 static json_t *shell_job_result(const struct shell_job *job, bool is_error)
@@ -3702,8 +3690,7 @@ void mcp_shell_jobs_destroy(struct mcp_shell_job_store *store)
     free(store);
 }
 
-static json_t *shell_exec_build_result(const struct shell_exec_config *cfg,
-                                       const struct shell_exec_outcome *outcome,
+static json_t *shell_exec_build_result(const struct shell_exec_outcome *outcome,
                                        bool is_error)
 {
     json_t *payload = json_object();
@@ -3731,26 +3718,20 @@ static json_t *shell_exec_build_result(const struct shell_exec_config *cfg,
     stderr_value = NULL;
     if (json_object_set_new(payload, "exit_code", json_integer(outcome->exit_code)) != 0)
         goto fail;
-    if (json_object_set_new(payload, "timed_out", json_boolean(outcome->timed_out)) != 0)
+    if (outcome->timed_out &&
+        json_object_set_new(payload, "timed_out", json_true()) != 0)
         goto fail;
-    if (json_object_set_new(payload, "truncated",
-                            json_boolean(outcome->stdout_buf.truncated || outcome->stderr_buf.truncated)) != 0)
+    if ((outcome->stdout_buf.truncated || outcome->stderr_buf.truncated) &&
+        json_object_set_new(payload, "truncated", json_true()) != 0)
         goto fail;
-    if (json_object_set_new(payload,
-                            "stdout_truncated",
-                            json_boolean(outcome->stdout_buf.truncated)) != 0)
+    if (outcome->stdout_buf.truncated &&
+        json_object_set_new(payload, "stdout_truncated", json_true()) != 0)
         goto fail;
-    if (json_object_set_new(payload,
-                            "stderr_truncated",
-                            json_boolean(outcome->stderr_buf.truncated)) != 0)
+    if (outcome->stderr_buf.truncated &&
+        json_object_set_new(payload, "stderr_truncated", json_true()) != 0)
         goto fail;
-    if (json_object_set_new(payload, "signal", json_integer(outcome->signal_number)) != 0)
-        goto fail;
-    if (json_object_set_new(payload, "sandbox_revision", json_integer(cfg->sandbox_revision)) != 0)
-        goto fail;
-    if (json_object_set_new(payload, "sandbox_enabled", json_boolean(cfg->sandbox_enabled)) != 0)
-        goto fail;
-    if (json_object_set_new(payload, "shell_enabled", json_boolean(cfg->shell_enabled)) != 0)
+    if (outcome->signal_number != 0 &&
+        json_object_set_new(payload, "signal", json_integer(outcome->signal_number)) != 0)
         goto fail;
 
     result = mcp_tool_result_json_text(payload, is_error);
@@ -3867,8 +3848,7 @@ int mcp_tool_system_shell_exec(struct mcp_server *server,
         goto cleanup;
     }
 #endif
-    *out_result = shell_exec_build_result(&cfg,
-                                          &outcome,
+    *out_result = shell_exec_build_result(&outcome,
                                           outcome.timed_out || outcome.exit_code != 0 ||
                                               outcome.signal_number != 0);
     rc = 0;
@@ -4034,9 +4014,6 @@ int mcp_tool_system_shell_start(struct mcp_server *server,
     job->timeout_ms = request.timeout_ms;
     job->output_limit_bytes = output_limit_bytes;
     job->chunk_size = cfg.chunk_size;
-    job->sandbox_revision = cfg.sandbox_revision;
-    job->sandbox_enabled = cfg.sandbox_enabled;
-    job->shell_enabled = cfg.shell_enabled;
     job->started_ms = mcp_now_ms();
     job->deadline_ms = job->started_ms + job->timeout_ms;
     job->exit_code = -1;
