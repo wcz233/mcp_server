@@ -244,45 +244,101 @@ block，但五项 rlimit 与非空身份切换不支持，`require_non_root` 是
 `system.shell_start` 未实现。状态接口会如实报告 `enforced`、`unsupported`、
 `reject_only` 或 `ignored`。
 
+## 部署与开机自启
+
+### 部署约定
+
+构建目录只用于生成候选产物，长期运行的服务应指向独立且稳定的部署目录。
+一次部署至少包含目标平台的 `mcp_server` 和与该版本匹配的
+`config/tools/shell_exec.json`，并遵循下面的顺序：
+
+1. 记录 Git commit 和工作区状态，在目标平台完成构建与测试。
+2. 确认目标主机架构；交叉编译 ABI 不确定时，优先在目标机临时目录原生构建。
+3. 传输后核对文件大小和 SHA-256，不以传输调用返回成功代替完整性检查。
+4. 在覆盖前备份当前二进制和配置；Windows 必须先停止服务以释放可执行文件锁，
+   Linux 可先写入同目录临时文件再原子重命名。
+5. 重启后同时验证服务状态、实际进程路径、部署文件哈希和 MCP 工具面；任一失败都
+   使用同一部署批次的备份回退。
+
+仓库中的 `config/tools/shell_exec.json` 是带公开示例 token 的基线模板。若启用
+`MCP_ENABLE_SANDBOX_CTL=1`，应先在仓库外生成经批准的部署配置并替换 token；此时
+目标端哈希应与该部署配置比较，而不是与仓库模板比较。不要只更新二进制而遗漏配置
+结构或 policy 变更。
+
 ### Linux
 
-把 `MCP_TCP_HOST` 改成 Codex 所在机器能访问到的地址：
+临时运行时，把 `MCP_TCP_HOST` 改成客户端可访问的目标机地址：
 
 ```bash
+cd /path/to/mcp_server
 MCP_ENABLE_STDIO=0 \
 MCP_ENABLE_TCP=1 \
-MCP_TCP_HOST=192.168.222.128 \
+MCP_TCP_HOST=192.168.16.136 \
 MCP_TCP_PORT=18767 \
-MCP_SHELL_EXEC_CONFIG=/etc/mcp_server/shell_exec.json \
-MCP_ENABLE_SANDBOX_CTL=1 \
-./mcp_server/build/src/mcp_server
+MCP_SHELL_EXEC_CONFIG="$PWD/config/tools/shell_exec.json" \
+./build/src/mcp_server
 ```
 
-开机自启脚本:
+已有 systemd 服务的升级示例。`APPROVED_CONFIG` 可以指向仓库模板，也可以指向保存在
+仓库外、已替换 token 的部署配置：
 
-```shell
-sudo vim /etc/systemd/system/mcp_server.service
+```bash
+cd /path/to/mcp_server
+cmake -S . -B build -C config/linux_defconfig.cmake -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+(cd build && ctest --output-on-failure)
+
+DEPLOY_ID="$(git rev-parse --short=12 HEAD)-$(date +%Y%m%d-%H%M%S)"
+BUILD_BIN="$PWD/build/src/mcp_server"
+APPROVED_CONFIG="$PWD/config/tools/shell_exec.json"
+TARGET_ROOT=/opt/mcp_server
+TARGET_BIN="$TARGET_ROOT/mcp_server"
+TARGET_CONFIG="$TARGET_ROOT/config/tools/shell_exec.json"
+
+file "$BUILD_BIN"
+sha256sum "$BUILD_BIN" "$APPROVED_CONFIG"
+sudo install -d -m 0755 "$TARGET_ROOT/config/tools"
+if sudo test -f "$TARGET_BIN"; then
+  sudo cp -p "$TARGET_BIN" "$TARGET_BIN.bak-$DEPLOY_ID"
+fi
+if sudo test -f "$TARGET_CONFIG"; then
+  sudo cp -p "$TARGET_CONFIG" "$TARGET_CONFIG.bak-$DEPLOY_ID"
+fi
+sudo install -m 0755 "$BUILD_BIN" "$TARGET_BIN.new-$DEPLOY_ID"
+sudo install -m 0600 "$APPROVED_CONFIG" "$TARGET_CONFIG.new-$DEPLOY_ID"
+sha256sum "$BUILD_BIN" "$APPROVED_CONFIG"
+sudo sha256sum "$TARGET_BIN.new-$DEPLOY_ID" "$TARGET_CONFIG.new-$DEPLOY_ID"
+sudo mv "$TARGET_BIN.new-$DEPLOY_ID" "$TARGET_BIN"
+sudo mv "$TARGET_CONFIG.new-$DEPLOY_ID" "$TARGET_CONFIG"
+sudo systemctl restart mcp_server.service
 ```
 
-```shell
+首次部署时执行到两个 `mv`，跳过尚不存在的服务重启，再创建下面的 unit 并执行
+`enable --now`。
+
+创建 `/etc/systemd/system/mcp_server.service`。仅在配置文件中的示例 token 已被替换后，
+才取消 `MCP_ENABLE_SANDBOX_CTL` 行的注释：
+
+```systemd
 [Unit]
 Description=MCP Server
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
 Environment=MCP_ENABLE_STDIO=0
 Environment=MCP_ENABLE_TCP=1
-Environment=MCP_TCP_HOST=192.168.16.135
+Environment=MCP_TCP_HOST=192.168.16.136
 Environment=MCP_TCP_PORT=18767
-Environment=MCP_SHELL_EXEC_CONFIG=/etc/mcp_server/shell_exec.json
-Environment=MCP_ENABLE_SANDBOX_CTL=1
+Environment=MCP_SHELL_EXEC_CONFIG=/opt/mcp_server/config/tools/shell_exec.json
+# Environment=MCP_ENABLE_SANDBOX_CTL=1
 ExecStart=/opt/mcp_server/mcp_server
-WorkingDirectory=/root/
+WorkingDirectory=/opt/mcp_server
 Restart=always
 RestartSec=3
 
-# 如果你想指定用户运行，取消下面注释并改成实际用户名
+# 如需降权运行，取消注释并改成实际账号，同时调整部署目录权限。
 # User=alinx
 # Group=alinx
 
@@ -290,25 +346,30 @@ RestartSec=3
 WantedBy=multi-user.target
 ```
 
-```shell
-sudo systemctl enable mcp_server.service
-sudo systemctl restart mcp_server.service
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now mcp_server.service
+sudo systemctl is-active mcp_server.service
+sudo systemctl show mcp_server.service \
+  -p MainPID -p ExecMainStartTimestamp -p ExecMainStatus --no-pager
+sudo sha256sum /opt/mcp_server/mcp_server \
+  /opt/mcp_server/config/tools/shell_exec.json
 ```
 
-建议在服务启动后立即验证：
+若升级后验证失败，使用同一个 `DEPLOY_ID` 回退，不要混用不同批次的二进制和配置：
 
-```shell
-tools_list | grep -E 'server.send|server.recv'
+```bash
+sudo systemctl stop mcp_server.service
+sudo cp -p "/opt/mcp_server/mcp_server.bak-$DEPLOY_ID" \
+  /opt/mcp_server/mcp_server
+sudo cp -p "/opt/mcp_server/config/tools/shell_exec.json.bak-$DEPLOY_ID" \
+  /opt/mcp_server/config/tools/shell_exec.json
+sudo systemctl start mcp_server.service
 ```
-
-若没有看到这两个工具，优先检查：
-
-1. `ExecStart` 指向的是否是实际部署并正在运行的那份二进制。
-2. 当前服务对应的构建模式是否真为 `MCP_FILE_TRANSFER_PLUGIN=y`；若仍是 `m`，则需要额外加载 `mcp_file_transfer_plugin.so`。
 
 ### Windows
 
-PowerShell：
+临时运行示例：
 
 ```powershell
 $env:MCP_ENABLE_STDIO = "0"
@@ -316,32 +377,53 @@ $env:MCP_ENABLE_TCP = "1"
 $env:MCP_TCP_HOST = "192.168.16.2"
 $env:MCP_TCP_PORT = "18767"
 $env:MCP_SHELL_EXEC_CONFIG = (Resolve-Path "config\tools\shell_exec.json").Path
-$env:MCP_ENABLE_SANDBOX_CTL = "1"
 .\build\src\Release\mcp_server.exe
 ```
 
-CMD:
+如果只允许本机访问，可以把 `MCP_TCP_HOST` 设为 `127.0.0.1`。已有 Windows 服务的
+升级示例使用独立部署目录 `D:\tools\mcp_interconnect_system`：
 
-```cmd
-set MCP_ENABLE_STDIO=0
-set MCP_ENABLE_TCP=1
-set MCP_TCP_HOST=192.168.16.2
-set MCP_TCP_PORT=18767
-set MCP_SHELL_EXEC_CONFIG=D:\Project\2025-12-02\mcp\mcp_server\config\tools\shell_exec.json
-set MCP_ENABLE_SANDBOX_CTL=1
-.\build\src\Release\mcp_server.exe
+```powershell
+$Repo = "D:\Project\2025-12-02\mcp\mcp_server"
+$TargetRoot = "D:\tools\mcp_interconnect_system"
+$DeployId = "$(git -C $Repo rev-parse --short=12 HEAD)-$(Get-Date -Format yyyyMMdd-HHmmss)"
+$SourceBin = Join-Path $Repo "build\src\Release\mcp_server.exe"
+$ApprovedConfig = Join-Path $Repo "config\tools\shell_exec.json"
+$TargetBin = Join-Path $TargetRoot "mcp_server.exe"
+$TargetConfig = Join-Path $TargetRoot "config\tools\shell_exec.json"
+
+cmake -S $Repo -B (Join-Path $Repo "build") -C (Join-Path $Repo "config\windows_defconfig.cmake")
+cmake --build (Join-Path $Repo "build") --config Release --parallel
+Push-Location (Join-Path $Repo "build")
+ctest -C Release --output-on-failure
+$TestExitCode = $LASTEXITCODE
+Pop-Location
+if ($TestExitCode -ne 0) { exit $TestExitCode }
+
+New-Item -ItemType Directory -Force -Path (Split-Path $TargetConfig) | Out-Null
+if (Test-Path $TargetBin) {
+    Copy-Item $TargetBin "$TargetBin.bak-$DeployId"
+}
+if (Test-Path $TargetConfig) {
+    Copy-Item $TargetConfig "$TargetConfig.bak-$DeployId"
+}
+Stop-Service mcp_server
+Copy-Item $SourceBin $TargetBin -Force
+Copy-Item $ApprovedConfig $TargetConfig -Force
+Start-Service mcp_server
+
+Get-Service mcp_server
+Get-CimInstance Win32_Process -Filter "Name='mcp_server.exe'" |
+    Select-Object ProcessId, ExecutablePath
+Get-FileHash -Algorithm SHA256 $SourceBin, $TargetBin, $ApprovedConfig, $TargetConfig
+Test-NetConnection -ComputerName 192.168.16.2 -Port 18767
 ```
 
-如果只允许本机访问，可以把 `MCP_TCP_HOST` 设为 `127.0.0.1`。
+首次部署时先创建目录并复制两个目标文件，跳过备份和 `Stop-Service`/`Start-Service`，
+再按下面步骤创建 NSSM 服务。
 
-开机自启服务：
-下载 nssm- the Non-Sucking Service Manager，并加入 path:
-
-```web-idl
-https://nssm.cc/release/nssm-2.24.zip
-```
-
-创建 start_mcp_server.bat :
+创建部署目录下的 `start_mcp_server.bat`。使用 `%~dp0` 可以避免服务继续依赖源码或
+构建目录：
 
 ```bat
 @echo off
@@ -349,47 +431,46 @@ set MCP_ENABLE_STDIO=0
 set MCP_ENABLE_TCP=1
 set MCP_TCP_HOST=192.168.16.2
 set MCP_TCP_PORT=18767
-set MCP_SHELL_EXEC_CONFIG=D:\Project\2025-12-02\mcp\mcp_server\config\tools\shell_exec.json
-set MCP_ENABLE_SANDBOX_CTL=1
+set "MCP_SHELL_EXEC_CONFIG=%~dp0config\tools\shell_exec.json"
+rem 仅在 JSON token 已替换后启用：set MCP_ENABLE_SANDBOX_CTL=1
 
-cd /d D:\Project\2025-12-02\mcp\mcp_server
-.\build\src\Release\mcp_server.exe
+cd /d "%~dp0"
+.\mcp_server.exe
 ```
 
-```cmd
-nssm install mcp_server
+下载 [NSSM](https://nssm.cc/release/nssm-2.24.zip) 并加入 `PATH`，然后使用 PowerShell
+创建自动启动服务：
+
+```powershell
+nssm install mcp_server "$env:SystemRoot\System32\cmd.exe" '/c "D:\tools\mcp_interconnect_system\start_mcp_server.bat"'
+nssm set mcp_server AppDirectory "D:\tools\mcp_interconnect_system"
+nssm set mcp_server Start SERVICE_AUTO_START
+nssm set mcp_server AppExit Default Restart
+nssm start mcp_server
+Get-Service mcp_server
 ```
 
-在弹出来的图形界面中:
+Windows 回退同样必须先停止服务以释放文件锁：
 
-```cmd
-Path
-C:\Windows\System32\cmd.exe
-
-Startup directory
-D:\Project\2025-12-02\mcp\mcp_server
-
-Arguments
-/c "D:\Project\2025-12-02\mcp\start_mcp_server.bat"
-
-Service name
-mcp_server
-```
-配置好 nssm 之后，打开一个 cmd 配置开机自启:
-
-```cmd
-#开机自启
-sc config mcp_server start= auto
-#sc config mcp_server start= delayed-auto
-#立即启动
-net start mcp_server
-#查看当前状态
-sc query mcp_server
-#从开机自启改为手动启动
-sc config mcp_server start= demand
+```powershell
+Stop-Service mcp_server
+Copy-Item "$TargetBin.bak-$DeployId" $TargetBin -Force
+Copy-Item "$TargetConfig.bak-$DeployId" $TargetConfig -Force
+Start-Service mcp_server
 ```
 
+### 重启后的 MCP 验证
 
+服务重启会关闭既有 TCP/MCP 连接。`server_id` 是会话内临时标识，远端服务重启后应
+重新执行 `server.list_servers`，并用 `address`、`system_status.hostname` 和
+`system_status.machine` 锁定目标，再调用 `system.get_status` 或
+`registry.list_tools`。不要把旧连接上的 `Transport closed` 单独判定为部署失败。
+
+在 MCP 客户端重新连接后调用 `tools/list`，至少确认 `system.ping`、
+`system.get_status`、`system.shell_exec` 和 `registry.list_tools`。若构建输出显示
+`MCP_FILE_TRANSFER_PLUGIN=y`，还应确认 `server.send` 和 `server.recv`；若为 `m`，则需
+先加载对应模块。最终以服务状态、目标文件哈希和重连后的工具调用共同作为部署成功
+证据。
 
 ## 配置 Codex
 
@@ -492,5 +573,6 @@ TCP 协议使用 4 字节大端长度头加 JSON body。`mcp_stdio_proxy_adapter
 负责把 Codex stdio JSON-RPC 转换成该 TCP framed 协议。
 
 `server.list_servers` 工具会主动触发一次发现广播，短暂等待响应后返回 JSON
-文本，结构包含 `total` 和 `servers`；每个 server 记录 `address`、`ip`、`port`
-和 `system_status`。
+文本，结构包含 `total` 和 `servers`；每个 server 记录会话内临时 `server_id`、
+`address`、`port`、连接状态和精简的 `system_status`。IP 从 `address` 提取，当前紧凑
+结果没有独立的顶层 `ip` 字段。
