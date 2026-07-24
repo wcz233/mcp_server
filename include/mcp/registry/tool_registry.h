@@ -2,6 +2,7 @@
 #define MCP_REGISTRY_TOOL_REGISTRY_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include <jansson.h>
 
@@ -23,6 +24,6 @@ const struct mcp_tool_descriptor *mcp_tool_registry_find(struct mcp_tool_registr
 json_t *mcp_tool_registry_public_list(struct mcp_tool_registry *registry);
 json_t *mcp_tool_registry_internal_list(struct mcp_tool_registry *registry);
 size_t mcp_tool_registry_count(struct mcp_tool_registry *registry);
-unsigned long mcp_tool_registry_version(struct mcp_tool_registry *registry);
+uint64_t mcp_tool_registry_version(struct mcp_tool_registry *registry);
 
 #endif

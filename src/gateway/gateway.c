@@ -1,5 +1,6 @@
 #include "mcp/gateway/gateway.h"
 
+#include "common/json_counter.h"
 #include "core/server_internal.h"
 #include "discovery/server_discovery.h"
 #include "mcp/registry/tool_registry.h"
@@ -14,10 +15,10 @@
 
 struct mcp_gateway {
     struct mcp_tool_registry *registry;
-    unsigned long calls_total;
-    unsigned long local_calls;
-    unsigned long remote_calls;
-    unsigned long rejected_calls;
+    uint64_t calls_total;
+    uint64_t local_calls;
+    uint64_t remote_calls;
+    uint64_t rejected_calls;
 };
 
 static bool json_integer_in_uint32_range(json_t *value, uint32_t *out)
@@ -101,7 +102,7 @@ static int gateway_proxy_tool_call(struct mcp_gateway *gateway,
         !json_is_object(tool_args) ||
         !json_optional_integer_in_uint32_range(proxy_timeout_value, &proxy_timeout_ms) ||
         (proxy_timeout_value && proxy_timeout_ms == 0)) {
-        gateway->rejected_calls++;
+        mcp_json_counter_increment(&gateway->rejected_calls);
         *out_result = mcp_tool_result_text(
             "gateway.proxy_tool requires server_id > 0, tool_name, object args, and optional proxy_timeout_ms > 0.",
             true);
@@ -125,12 +126,12 @@ static int gateway_proxy_tool_call(struct mcp_gateway *gateway,
         json_decref(tool_args);
 
     if (rc != 0) {
-        gateway->rejected_calls++;
+        mcp_json_counter_increment(&gateway->rejected_calls);
         *out_result = mcp_tool_result_text("Remote server is not available for proxy calls.", true);
         return MCP_GATEWAY_TOOL_ERROR;
     }
 
-    gateway->remote_calls++;
+    mcp_json_counter_increment(&gateway->remote_calls);
     return MCP_GATEWAY_PENDING;
 }
 
@@ -169,10 +170,10 @@ int mcp_gateway_call(struct mcp_gateway *gateway,
 
     *out_result = NULL;
     *out_error = NULL;
-    gateway->calls_total++;
+    mcp_json_counter_increment(&gateway->calls_total);
 
     if (!snapshot_contains_tool(session_snapshot, tool_name)) {
-        gateway->rejected_calls++;
+        mcp_json_counter_increment(&gateway->rejected_calls);
         *out_result = mcp_tool_result_text(
             "Tool is not visible in current session snapshot. Call tools/list to refresh this session.",
             true);
@@ -188,7 +189,7 @@ int mcp_gateway_call(struct mcp_gateway *gateway,
 
     descriptor = mcp_tool_registry_find(gateway->registry, tool_name);
     if (!descriptor) {
-        gateway->rejected_calls++;
+        mcp_json_counter_increment(&gateway->rejected_calls);
         *out_result = mcp_tool_result_text("Tool is not loaded or has been disabled.", true);
         return MCP_GATEWAY_TOOL_ERROR;
     }
@@ -202,19 +203,19 @@ int mcp_gateway_call(struct mcp_gateway *gateway,
                                        arguments,
                                        out_result);
         if (rc == MCP_PLUGIN_CALL_PENDING) {
-            gateway->local_calls++;
+            mcp_json_counter_increment(&gateway->local_calls);
             return MCP_GATEWAY_PENDING;
         }
         if (rc == MCP_PLUGIN_CALL_OK) {
-            gateway->local_calls++;
+            mcp_json_counter_increment(&gateway->local_calls);
             return MCP_GATEWAY_OK;
         }
-        gateway->rejected_calls++;
+        mcp_json_counter_increment(&gateway->rejected_calls);
         return MCP_GATEWAY_TOOL_ERROR;
     }
 
     if (descriptor->route != MCP_TOOL_ROUTE_LOCAL_BUILTIN || !descriptor->handler) {
-        gateway->rejected_calls++;
+        mcp_json_counter_increment(&gateway->rejected_calls);
         *out_result = mcp_tool_result_text(
             "This route is declared but not implemented in the initial server build.",
             true);
@@ -227,13 +228,13 @@ int mcp_gateway_call(struct mcp_gateway *gateway,
     invocation.descriptor = descriptor;
 
     if (descriptor->handler(server, &invocation, out_result) != 0) {
-        gateway->rejected_calls++;
+        mcp_json_counter_increment(&gateway->rejected_calls);
         if (!*out_result)
             *out_result = mcp_tool_result_text("Tool execution failed.", true);
         return MCP_GATEWAY_TOOL_ERROR;
     }
 
-    gateway->local_calls++;
+    mcp_json_counter_increment(&gateway->local_calls);
     return MCP_GATEWAY_OK;
 }
 

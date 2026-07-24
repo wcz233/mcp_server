@@ -227,6 +227,40 @@ add_test(
     COMMAND mcp_file_transfer_protocol_bounds_test
 )
 
+add_executable(mcp_json_counter_test
+    json_counter_test.c
+    "${PROJECT_SOURCE_DIR}/src/registry/tool_registry.c"
+)
+
+target_include_directories(mcp_json_counter_test
+    PRIVATE
+        "${PROJECT_SOURCE_DIR}/include"
+        "${PROJECT_SOURCE_DIR}/src"
+)
+
+target_compile_definitions(mcp_json_counter_test
+    PRIVATE
+        $<$<PLATFORM_ID:Linux>:_POSIX_C_SOURCE=200809L>
+)
+
+target_link_libraries(mcp_json_counter_test
+    PRIVATE
+        MCP::jansson
+        MCP::libuv
+)
+
+if(MSVC)
+    target_compile_definitions(mcp_json_counter_test PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(mcp_json_counter_test PRIVATE /W4)
+else()
+    target_compile_options(mcp_json_counter_test PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_test(
+    NAME mcp_json_counter
+    COMMAND mcp_json_counter_test
+)
+
 if(NOT "${MCP_TOOL_PLUGIN_MANAGER}" STREQUAL "n")
     add_library(mcp_busy_shutdown_plugin MODULE
         busy_shutdown_plugin.c

@@ -140,7 +140,8 @@ def verify_tool(proc, request_id, tool_name):
         assert result["isError"] is False, result
         payload = assert_json_text(result)
         assert payload["stdio_transport"] == "enabled", payload
-        assert "remote_calls" in payload, payload
+        for field in ("calls_total", "local_calls", "remote_calls", "rejected_calls"):
+            assert type(payload[field]) is int and 0 <= payload[field] <= 9223372036854775807, payload
         assert "pipe_transport" in payload, payload
         assert "tcp_transport" in payload, payload
         return

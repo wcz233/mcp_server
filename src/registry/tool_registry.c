@@ -1,5 +1,6 @@
 #include "mcp/registry/tool_registry.h"
 
+#include "common/json_counter.h"
 #include "common/platform.h"
 
 #include <jansson.h>
@@ -14,7 +15,7 @@ struct mcp_tool_registry {
     struct mcp_registered_tool *tools;
     size_t count;
     size_t capacity;
-    unsigned long version;
+    uint64_t version;
 };
 
 static void descriptor_cleanup(struct mcp_tool_descriptor *descriptor)
@@ -128,7 +129,7 @@ int mcp_tool_registry_register(struct mcp_tool_registry *registry,
         return -1;
 
     registry->count++;
-    registry->version++;
+    mcp_json_counter_increment(&registry->version);
     return 0;
 }
 
@@ -152,7 +153,7 @@ int mcp_tool_registry_unregister(struct mcp_tool_registry *registry, const char 
                     (registry->count - i - 1) * sizeof(registry->tools[i]));
         }
         registry->count--;
-        registry->version++;
+        mcp_json_counter_increment(&registry->version);
         return 0;
     }
 
@@ -176,7 +177,7 @@ int mcp_tool_registry_set_enabled(struct mcp_tool_registry *registry,
 
         if (descriptor->enabled != enabled) {
             descriptor->enabled = enabled;
-            registry->version++;
+            mcp_json_counter_increment(&registry->version);
         }
         return 0;
     }
@@ -252,7 +253,9 @@ json_t *mcp_tool_registry_public_list(struct mcp_tool_registry *registry)
     }
 
     json_object_set_new(result, "tools", tools);
-    json_object_set_new(result, "registryVersion", json_integer(registry ? registry->version : 0));
+    json_object_set_new(result,
+                        "registryVersion",
+                        json_integer((json_int_t)(registry ? registry->version : 0)));
     return result;
 }
 
@@ -272,7 +275,9 @@ json_t *mcp_tool_registry_internal_list(struct mcp_tool_registry *registry)
     }
 
     json_object_set_new(result, "tools", tools);
-    json_object_set_new(result, "registryVersion", json_integer(registry ? registry->version : 0));
+    json_object_set_new(result,
+                        "registryVersion",
+                        json_integer((json_int_t)(registry ? registry->version : 0)));
     return result;
 }
 
@@ -281,7 +286,7 @@ size_t mcp_tool_registry_count(struct mcp_tool_registry *registry)
     return registry ? registry->count : 0;
 }
 
-unsigned long mcp_tool_registry_version(struct mcp_tool_registry *registry)
+uint64_t mcp_tool_registry_version(struct mcp_tool_registry *registry)
 {
     return registry ? registry->version : 0;
 }
