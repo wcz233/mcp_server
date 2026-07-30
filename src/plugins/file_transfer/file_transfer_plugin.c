@@ -315,6 +315,7 @@ struct pending_negotiation {
 
 struct hello_outstanding {
     uint32_t server_id;
+    unsigned long long deadline_ms;
     struct hello_outstanding *next;
 };
 
@@ -2090,14 +2091,23 @@ static int send_hello_frame(uint32_t server_id)
     return rc;
 }
 
-static int mark_hello_outstanding(uint32_t server_id)
+static int mark_hello_outstanding(uint32_t server_id, unsigned long long now)
 {
     struct hello_outstanding *current;
     struct hello_outstanding *entry;
+    unsigned long long deadline =
+        now > (unsigned long long)-1 - MFT_NEGOTIATION_TIMEOUT_MS ?
+            (unsigned long long)-1 :
+            now + MFT_NEGOTIATION_TIMEOUT_MS;
 
     mft_lock();
     for (current = g_hello_outstanding; current; current = current->next) {
         if (current->server_id == server_id) {
+            if (now >= current->deadline_ms) {
+                current->deadline_ms = deadline;
+                mft_unlock();
+                return 0;
+            }
             mft_unlock();
             return 1;
         }
@@ -2108,6 +2118,7 @@ static int mark_hello_outstanding(uint32_t server_id)
         return -1;
     }
     entry->server_id = server_id;
+    entry->deadline_ms = deadline;
     entry->next = g_hello_outstanding;
     g_hello_outstanding = entry;
     mft_unlock();
@@ -2148,7 +2159,8 @@ static void free_hello_outstanding(struct hello_outstanding *entry)
 
 static int send_hello_request(uint32_t server_id)
 {
-    int marked = mark_hello_outstanding(server_id);
+    unsigned long long now = g_plugin.host->now_ms(g_plugin.host->host_context);
+    int marked = mark_hello_outstanding(server_id, now);
 
     if (marked > 0)
         return 0;

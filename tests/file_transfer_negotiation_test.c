@@ -258,6 +258,30 @@ static int test_hello_convergence(struct negotiation_test_context *context,
     return context->hello_frames == 2 ? 0 : -1;
 }
 
+static int test_hello_retry_after_timeout(struct negotiation_test_context *context)
+{
+    int rc = -1;
+
+    context->now_ms = 1000;
+    context->hello_frames = 0;
+    if (send_hello_request(7) != 0 || context->hello_frames != 1)
+        goto cleanup;
+
+    context->now_ms = 1000 + MFT_NEGOTIATION_TIMEOUT_MS - 1;
+    if (send_hello_request(7) != 0 || context->hello_frames != 1)
+        goto cleanup;
+
+    context->now_ms = 1000 + MFT_NEGOTIATION_TIMEOUT_MS;
+    if (send_hello_request(7) != 0 || context->hello_frames != 2)
+        goto cleanup;
+    rc = 0;
+
+cleanup:
+    clear_hello_outstanding(7);
+    context->now_ms = 1000;
+    return rc;
+}
+
 int main(void)
 {
     struct negotiation_test_context context = {0};
@@ -285,7 +309,8 @@ int main(void)
                       MFT_CAP_CHUNK_WINDOW,
                       MFT_CAP_CRC32,
                       MFT_CAP_DATA_CHANNEL);
-    if (!hello || test_hello_convergence(&context, hello) != 0)
+    if (!hello || test_hello_convergence(&context, hello) != 0 ||
+        test_hello_retry_after_timeout(&context) != 0)
         goto cleanup;
     json_decref(hello);
     hello = NULL;
