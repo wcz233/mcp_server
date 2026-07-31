@@ -635,6 +635,20 @@ static void send_interface_broadcasts(struct mcp_server_discovery *discovery, js
     uv_free_interface_addresses(interfaces, count);
 }
 
+static void send_configured_peers(struct mcp_server_discovery *discovery, json_t *packet)
+{
+    size_t count = mcp_server_network_discovery_peer_count(discovery->server);
+    size_t index;
+
+    for (index = 0; index < count; index++) {
+        const char *ip = NULL;
+        unsigned int port = 0;
+
+        if (mcp_server_network_discovery_peer_at(discovery->server, index, &ip, &port))
+            send_packet_to_host(discovery, packet, ip, port);
+    }
+}
+
 static void discovery_send_announce(struct mcp_server_discovery *discovery, bool reply)
 {
     json_t *packet;
@@ -646,8 +660,12 @@ static void discovery_send_announce(struct mcp_server_discovery *discovery, bool
     if (!packet)
         return;
 
-    send_interface_broadcasts(discovery, packet);
-    send_explicit_hosts(discovery, packet);
+    if (mcp_server_network_access_enabled(discovery->server))
+        send_configured_peers(discovery, packet);
+    else {
+        send_interface_broadcasts(discovery, packet);
+        send_explicit_hosts(discovery, packet);
+    }
     json_decref(packet);
 }
 
@@ -662,8 +680,12 @@ static void discovery_send_offline(struct mcp_server_discovery *discovery)
     if (!packet)
         return;
 
-    send_interface_broadcasts(discovery, packet);
-    send_explicit_hosts(discovery, packet);
+    if (mcp_server_network_access_enabled(discovery->server))
+        send_configured_peers(discovery, packet);
+    else {
+        send_interface_broadcasts(discovery, packet);
+        send_explicit_hosts(discovery, packet);
+    }
     json_decref(packet);
 }
 
@@ -972,7 +994,10 @@ static void peer_connect(struct mcp_server_discovery *discovery,
     struct sockaddr_storage addr;
 
     slot = data_channel ? &peer->data_conn : &peer->conn;
-    if (peer->state == DISCOVERY_PEER_OFFLINE || *slot || discovery->closing)
+    if (peer->state == DISCOVERY_PEER_OFFLINE ||
+        *slot ||
+        discovery->closing ||
+        !mcp_server_network_ip_allowed(discovery->server, peer->ip))
         return;
     if (sockaddr_from_host_port(peer->ip, peer->port, &addr) != 0)
         return;
@@ -1888,6 +1913,9 @@ static struct discovery_peer *upsert_peer(struct mcp_server_discovery *discovery
     char *id = NULL;
     uint32_t server_id;
 
+    if (!mcp_server_network_ip_allowed(discovery->server, ip))
+        return NULL;
+
     if (!peer) {
         if (!make_peer_id(ip, port, &id))
             return NULL;
@@ -2081,6 +2109,10 @@ static void discovery_on_datagram(uv_udp_t *handle,
         free(buf->base);
         return;
     }
+    if (!mcp_server_network_address_allowed(discovery->server, addr)) {
+        free(buf->base);
+        return;
+    }
 
     root = json_loadb(buf->base, (size_t)nread, JSON_REJECT_DUPLICATES, &error);
     free(buf->base);
@@ -2117,7 +2149,7 @@ static void discovery_on_datagram(uv_udp_t *handle,
         peer_ip_value = peer_ip;
 
     offline = json_is_string(event) && strcmp(json_string_value(event), "offline") == 0;
-    if (peer_ip_value) {
+    if (peer_ip_value && mcp_server_network_ip_allowed(discovery->server, peer_ip_value)) {
         unsigned int port = (unsigned int)json_integer_value(tcp_port);
 
         if (offline) {

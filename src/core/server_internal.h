@@ -9,6 +9,7 @@
 #include "mcp/registry/tool_registry.h"
 #include "discovery/server_discovery.h"
 #include "listener/framed_listener.h"
+#include "network/network_access_policy.h"
 #include "plugin/plugin_manager.h"
 #include "transport/peer_transport.h"
 #include "transport/stdio_transport.h"
@@ -56,6 +57,7 @@ struct mcp_server {
     struct mcp_plugin_manager *plugin_manager;
     struct mcp_peer_transport *peer_transport;
     struct mcp_server_discovery *discovery;
+    struct mcp_network_access_policy *network_access_policy;
     struct mcp_shell_policy_snapshot *shell_policy_snapshot;
     struct mcp_shell_sandbox_control *sandbox_control;
     struct mcp_shell_job_store *shell_jobs;
@@ -80,5 +82,14 @@ void mcp_server_complete_async_ok(struct mcp_server *server,
 int mcp_server_start_discovery(struct mcp_server *server,
                                const struct mcp_server_discovery_config *config);
 bool mcp_server_discovery_enabled(const struct mcp_server *server);
+bool mcp_server_network_access_enabled(const struct mcp_server *server);
+bool mcp_server_network_address_allowed(const struct mcp_server *server,
+                                        const struct sockaddr *addr);
+bool mcp_server_network_ip_allowed(const struct mcp_server *server, const char *ip);
+size_t mcp_server_network_discovery_peer_count(const struct mcp_server *server);
+bool mcp_server_network_discovery_peer_at(const struct mcp_server *server,
+                                          size_t index,
+                                          const char **ip,
+                                          unsigned int *discovery_port);
 
 #endif

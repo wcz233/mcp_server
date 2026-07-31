@@ -1,5 +1,33 @@
 find_package(Python3 COMPONENTS Interpreter)
 
+add_executable(mcp_network_access_policy_test
+    network_access_policy_test.c
+    "${PROJECT_SOURCE_DIR}/src/network/network_access_policy.c"
+)
+
+target_include_directories(mcp_network_access_policy_test
+    PRIVATE
+        "${PROJECT_SOURCE_DIR}/src"
+)
+
+target_link_libraries(mcp_network_access_policy_test
+    PRIVATE
+        MCP::jansson
+        MCP::libuv
+)
+
+if(MSVC)
+    target_compile_definitions(mcp_network_access_policy_test PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(mcp_network_access_policy_test PRIVATE /W4)
+else()
+    target_compile_options(mcp_network_access_policy_test PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_test(
+    NAME mcp_network_access_policy
+    COMMAND mcp_network_access_policy_test
+)
+
 add_executable(mcp_shell_policy_test
     shell_policy_test.c
     "${PROJECT_SOURCE_DIR}/src/tools/shell_policy.c"
@@ -342,6 +370,11 @@ if(Python3_Interpreter_FOUND)
     add_test(
         NAME mcp_tcp_framed_smoke
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tcp_framed_smoke.py" "$<TARGET_FILE:mcp_server>" 18767
+    )
+
+    add_test(
+        NAME mcp_network_access_smoke
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/network_access_smoke.py" "$<TARGET_FILE:mcp_server>" 18790 18791 18792 18793 18794
     )
 
     add_test(

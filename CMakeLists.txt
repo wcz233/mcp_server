@@ -38,3 +38,7 @@ install(TARGETS mcp_server
 install(FILES "${PROJECT_SOURCE_DIR}/config/tools/shell_exec.json"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/mcp_server/config/tools"
 )
+
+install(FILES "${PROJECT_SOURCE_DIR}/config/network/network_access.json"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/mcp_server/config/network"
+)

@@ -760,6 +760,8 @@ static void udp_on_datagram(void *arg,
 
     if (server->shutting_down)
         return;
+    if (!mcp_server_network_address_allowed(server, peer))
+        return;
 
     if (peer->sa_family == AF_INET)
         peer_len = sizeof(struct sockaddr_in);
@@ -794,6 +796,11 @@ static void udp_on_error(void *arg, int status)
     (void)status;
 }
 #endif
+
+static bool framed_on_accept(void *arg, const struct sockaddr *peer)
+{
+    return mcp_server_network_address_allowed(arg, peer);
+}
 
 static bool framed_maybe_dispatch_binary(struct mcp_server *server,
                                          struct mcp_framed_connection *conn,
@@ -901,7 +908,8 @@ int mcp_server_init(struct mcp_server **out, uv_loop_t *loop, struct mcp_server_
     server->stdio_session.state = MCP_SESSION_NOT_INITIALIZED;
     mcp_in_flight_init(&server->in_flight);
 
-    if (mcp_shell_policy_snapshot_create_from_environment(&server->shell_policy_snapshot) != 0 ||
+    if (mcp_network_access_policy_create_from_environment(&server->network_access_policy) != 0 ||
+        mcp_shell_policy_snapshot_create_from_environment(&server->shell_policy_snapshot) != 0 ||
         mcp_shell_sandbox_control_create(&server->sandbox_control,
                                          server->shell_policy_snapshot) != 0) {
         mcp_server_destroy(server);
@@ -993,6 +1001,7 @@ void mcp_server_destroy(struct mcp_server *server)
     mcp_framed_listener_destroy(server->pipe_listener);
     mcp_framed_listener_destroy(server->tcp_listener);
     mcp_stdio_transport_destroy(server->stdio);
+    mcp_network_access_policy_destroy(server->network_access_policy);
     free(server->tcp_host);
     free(server);
 }
@@ -1082,6 +1091,7 @@ int mcp_server_start_tcp(struct mcp_server *server, const char *host, unsigned i
     if (mcp_framed_listener_start_tcp(server->tcp_listener,
                                       host,
                                       port,
+                                      framed_on_accept,
                                       framed_on_message,
                                       framed_on_close,
                                       server) != 0)
@@ -1131,4 +1141,40 @@ int mcp_server_start_discovery(struct mcp_server *server,
 bool mcp_server_discovery_enabled(const struct mcp_server *server)
 {
     return server && mcp_server_discovery_is_open(server->discovery);
+}
+
+bool mcp_server_network_access_enabled(const struct mcp_server *server)
+{
+    return server && mcp_network_access_policy_enabled(server->network_access_policy);
+}
+
+bool mcp_server_network_address_allowed(const struct mcp_server *server,
+                                        const struct sockaddr *addr)
+{
+    return server &&
+           mcp_network_access_policy_allows_sockaddr(server->network_access_policy, addr);
+}
+
+bool mcp_server_network_ip_allowed(const struct mcp_server *server, const char *ip)
+{
+    return server && mcp_network_access_policy_allows_ip(server->network_access_policy, ip);
+}
+
+size_t mcp_server_network_discovery_peer_count(const struct mcp_server *server)
+{
+    if (!server)
+        return 0;
+    return mcp_network_access_policy_peer_count(server->network_access_policy);
+}
+
+bool mcp_server_network_discovery_peer_at(const struct mcp_server *server,
+                                          size_t index,
+                                          const char **ip,
+                                          unsigned int *discovery_port)
+{
+    return server &&
+           mcp_network_access_policy_peer_at(server->network_access_policy,
+                                             index,
+                                             ip,
+                                             discovery_port);
 }

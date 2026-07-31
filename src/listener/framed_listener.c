@@ -45,6 +45,7 @@ struct mcp_framed_listener {
     bool destroy_on_close;
 
     struct mcp_framed_connection *clients;
+    mcp_framed_accept_cb on_accept;
     mcp_framed_message_cb on_message;
     mcp_framed_close_cb on_close;
     void *cb_arg;
@@ -287,6 +288,18 @@ static void on_connection(uv_stream_t *server_stream, int status)
         return;
     }
 
+    if (conn->kind == LISTENER_KIND_TCP && listener->on_accept) {
+        struct sockaddr_storage peer;
+        int peer_len = sizeof(peer);
+
+        memset(&peer, 0, sizeof(peer));
+        if (uv_tcp_getpeername(&conn->tcp, (struct sockaddr *)&peer, &peer_len) != 0 ||
+            !listener->on_accept(listener->cb_arg, (const struct sockaddr *)&peer)) {
+            connection_close_with_cb(conn);
+            return;
+        }
+    }
+
     conn->next = listener->clients;
     listener->clients = conn;
 
@@ -360,6 +373,7 @@ int mcp_framed_listener_start_pipe(struct mcp_framed_listener *listener,
 int mcp_framed_listener_start_tcp(struct mcp_framed_listener *listener,
                                   const char *host,
                                   unsigned int port,
+                                  mcp_framed_accept_cb on_accept,
                                   mcp_framed_message_cb on_message,
                                   mcp_framed_close_cb on_close,
                                   void *arg)
@@ -387,6 +401,7 @@ int mcp_framed_listener_start_tcp(struct mcp_framed_listener *listener,
     listener->server_stream = (uv_stream_t *)&listener->tcp_server;
     listener->server_stream->data = listener;
     listener->initialized = true;
+    listener->on_accept = on_accept;
     listener->on_message = on_message;
     listener->on_close = on_close;
     listener->cb_arg = arg;

@@ -367,13 +367,50 @@ block，但五项 rlimit 与非空身份切换不支持，`require_non_root` 是
 `system.shell_start` 未实现。状态接口会如实报告 `enforced`、`unsupported`、
 `reject_only` 或 `ignored`。
 
+## 网络访问白名单
+
+`mcp_server` 启动时优先读取 `MCP_NETWORK_ACCESS_CONFIG` 显式指定的 JSON；未指定时
+依次尝试编译期源码路径和安装路径，均不存在时使用 `enabled=false` 的 hard profile。
+生产模板位于 `config/network/network_access.json`：
+
+```json
+{
+  "version": 1,
+  "enabled": true,
+  "allowlist": {
+    "ips": ["127.0.0.1", "192.168.16.136", "192.168.16.137"]
+  },
+  "discovery": {
+    "peers": [
+      {"ip": "192.168.16.136", "discovery_port": 18767},
+      {"ip": "192.168.16.137", "discovery_port": 18767}
+    ]
+  }
+}
+```
+
+JSON v1 使用严格结构：所有字段必须存在，未知字段、重复 key、错误类型、非法或重复
+IPv4 地址都会使启动失败。`enabled=true` 时 `allowlist.ips` 不得为空；
+`discovery.peers[].ip` 必须同时位于白名单中，`discovery_port` 范围为 `1..65535`。
+第一版只接受精确 IPv4，不接受 CIDR、主机名或 IPv6。
+
+策略启用后，TCP、发现 UDP 和编译启用的普通 UDP transport 都按来源 IP 过滤；发现包
+中的声明地址和最终连接目标也必须位于白名单中。广播发现停止，启动、定时、
+`server.list_servers` 和离线通知只向 `discovery.peers` 单播。stdio 和 pipe 不受影响。
+需要本机 TCP adapter 时必须显式加入 `127.0.0.1`。策略只在启动时读取，修改后需重启。
+
+显式配置缺失或任何已发现配置无效都会阻止启动，避免安全配置错误后静默开放。
+策略启用时不得再设置 `MCP_DISCOVERY_HOSTS`；`enabled=false` 时保持原有广播和网络访问
+行为。该策略提供基于来源 IP 的进程内访问控制，不替代应用层身份认证或主机防火墙；
+对存在 IP 欺骗、ARP 劫持等能力的同网段攻击者，应同时使用防火墙和隔离网络。
+
 ## 部署与开机自启
 
 ### 部署约定
 
 构建目录只用于生成候选产物，长期运行的服务应指向独立且稳定的部署目录。
-一次部署至少包含目标平台的 `mcp_server` 和与该版本匹配的
-`config/tools/shell_exec.json`，并遵循下面的顺序：
+一次部署至少包含目标平台的 `mcp_server` 及与该版本匹配的
+`config/tools/shell_exec.json`、`config/network/network_access.json`，并遵循下面的顺序：
 
 1. 记录 Git commit 和工作区状态，在目标平台完成构建与测试。
 2. 确认目标主机架构；交叉编译 ABI 不确定时，优先在目标机临时目录原生构建。
@@ -688,6 +725,7 @@ int main(void){printf(\"hello world!\\n\");return 0;}' > /home/alinx/prj/hello.c
 - `MCP_DISCOVERY_BIND_HOST=<ip>`：UDP 发现监听地址；默认 `0.0.0.0`。
 - `MCP_DISCOVERY_ADVERTISE_HOST=<ip>`：广播中声明给对端连接的地址；默认使用 UDP 来源地址。
 - `MCP_DISCOVERY_HOSTS=<ip[:port],...>`：额外单播发现目标，适合测试或禁止广播的网络。
+- `MCP_NETWORK_ACCESS_CONFIG=<absolute path>`：启动时加载 JSON v1 网络访问白名单；启用后禁止同时设置 `MCP_DISCOVERY_HOSTS`。
 - `MCP_DISCOVERY_PROXY_TIMEOUT_MS=<ms>`：`gateway.proxy_tool` 未显式传入 `proxy_timeout_ms` 时的代理等待超时；默认 `5000`。
 - `MCP_SHELL_EXEC_CONFIG=<absolute path>`：显式指定 JSON v2 shell policy；修改后需重启。
 - `MCP_ENABLE_SANDBOX_CTL=1`：要求有效 JSON v2 和非空 `control.token`，并启用 process-local control。

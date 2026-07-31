@@ -15,6 +15,7 @@ target_sources(mcp_server
         gateway/gateway.c
         listener/framed_listener.c
         main/main.c
+        network/network_access_policy.c
         plugin/plugin_manager.c
         protocol/jsonrpc.c
         registry/tool_registry.c
@@ -55,6 +56,8 @@ target_compile_definitions(mcp_server
         $<$<STREQUAL:${MCP_FILE_TRANSFER_PLUGIN},y>:MCP_FILE_TRANSFER_PLUGIN_BUILTIN=1>
         MCP_SHELL_EXEC_DEFAULT_CONFIG="${PROJECT_SOURCE_DIR}/config/tools/shell_exec.json"
         MCP_SHELL_EXEC_INSTALLED_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/mcp_server/config/tools/shell_exec.json"
+        MCP_NETWORK_ACCESS_DEFAULT_CONFIG="${PROJECT_SOURCE_DIR}/config/network/network_access.json"
+        MCP_NETWORK_ACCESS_INSTALLED_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/mcp_server/config/network/network_access.json"
         $<$<PLATFORM_ID:Linux>:_GNU_SOURCE>
         $<$<PLATFORM_ID:Linux>:_POSIX_C_SOURCE=200809L>
 )

@@ -18,6 +18,7 @@ typedef void (*mcp_framed_message_cb)(void *arg,
                                       const char *data,
                                       size_t len);
 typedef void (*mcp_framed_close_cb)(void *arg, struct mcp_framed_connection *conn);
+typedef bool (*mcp_framed_accept_cb)(void *arg, const struct sockaddr *peer);
 
 int mcp_framed_listener_create(struct mcp_framed_listener **out,
                                uv_loop_t *loop,
@@ -32,6 +33,7 @@ int mcp_framed_listener_start_pipe(struct mcp_framed_listener *listener,
 int mcp_framed_listener_start_tcp(struct mcp_framed_listener *listener,
                                   const char *host,
                                   unsigned int port,
+                                  mcp_framed_accept_cb on_accept,
                                   mcp_framed_message_cb on_message,
                                   mcp_framed_close_cb on_close,
                                   void *arg);
