@@ -16,6 +16,14 @@ target_link_libraries(mcp_network_access_policy_test
         MCP::libuv
 )
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(mcp_network_access_policy_test
+        PRIVATE
+            _GNU_SOURCE
+            _POSIX_C_SOURCE=200809L
+    )
+endif()
+
 if(MSVC)
     target_compile_definitions(mcp_network_access_policy_test PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(mcp_network_access_policy_test PRIVATE /W4)
