@@ -39,7 +39,8 @@ bool mcp_server_discovery_handle_offline_notification(struct mcp_server_discover
 json_t *mcp_server_discovery_local_identity(struct mcp_server_discovery *discovery);
 unsigned int mcp_server_discovery_note_peer_identity(struct mcp_server_discovery *discovery,
                                                      json_t *identity,
-                                                     bool data_channel);
+                                                     bool data_channel,
+                                                     const char *transport_fingerprint);
 void mcp_server_discovery_mark_peer_active(struct mcp_server_discovery *discovery,
                                            uint32_t server_id);
 int mcp_server_discovery_call_remote_tool(struct mcp_server_discovery *discovery,

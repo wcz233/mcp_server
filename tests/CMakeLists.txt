@@ -1,5 +1,20 @@
 find_package(Python3 COMPONENTS Interpreter)
 
+if(Python3_Interpreter_FOUND)
+    find_program(MCP_TEST_OPENSSL_EXECUTABLE NAMES openssl REQUIRED)
+    set(MCP_TEST_TLS_DIR "${CMAKE_CURRENT_BINARY_DIR}/tls-fixtures")
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}"
+                "-DOPENSSL_EXECUTABLE=${MCP_TEST_OPENSSL_EXECUTABLE}"
+                "-DOUTPUT_DIR=${MCP_TEST_TLS_DIR}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/generate_tls_fixtures.cmake"
+        RESULT_VARIABLE _mcp_tls_fixture_result
+    )
+    if(NOT _mcp_tls_fixture_result EQUAL 0)
+        message(FATAL_ERROR "Failed to generate TLS test fixtures")
+    endif()
+endif()
+
 add_executable(mcp_network_access_policy_test
     network_access_policy_test.c
     "${PROJECT_SOURCE_DIR}/src/network/network_access_policy.c"
@@ -381,6 +396,21 @@ if(Python3_Interpreter_FOUND)
     )
 
     add_test(
+        NAME mcp_tls_security_smoke
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tls_security_smoke.py" "$<TARGET_FILE:mcp_server>" 18788
+    )
+
+    add_test(
+        NAME mcp_stdio_proxy_adapter_tcp_smoke
+        COMMAND "${Python3_EXECUTABLE}"
+                "${PROJECT_SOURCE_DIR}/mcp_stdio_proxy_adapter/tests/proxy_tcp_smoke.py"
+                "$<TARGET_FILE:mcp_stdio_proxy_adapter>"
+                "$<TARGET_FILE:mcp_server>"
+                18789
+                "${MCP_TEST_TLS_DIR}"
+    )
+
+    add_test(
         NAME mcp_network_access_smoke
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/network_access_smoke.py" "$<TARGET_FILE:mcp_server>" 18790 18791 18792 18793 18794
     )
@@ -408,4 +438,9 @@ if(Python3_Interpreter_FOUND)
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/udp_smoke.py" "$<TARGET_FILE:mcp_server>" 18765
         )
     endif()
+
+    get_property(_mcp_all_tests DIRECTORY PROPERTY TESTS)
+    set_tests_properties(${_mcp_all_tests} PROPERTIES
+        ENVIRONMENT "MCP_TEST_TLS_DIR=${MCP_TEST_TLS_DIR}"
+    )
 endif()

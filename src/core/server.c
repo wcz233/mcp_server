@@ -14,6 +14,7 @@
 
 #include <jansson.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -520,8 +521,20 @@ static void handle_request(struct mcp_server *server,
             session->peer_server_id =
                 mcp_server_discovery_note_peer_identity(server->discovery,
                                                         peer_identity,
-                                                        data_channel);
+                                                        data_channel,
+                                                        reply_to->transport == MCP_REPLY_STREAM
+                                                            ? mcp_framed_connection_peer_fingerprint(
+                                                                  reply_to->stream)
+                                                            : NULL);
             session->data_channel = data_channel && session->peer_server_id != 0;
+            if (session->peer_server_id == 0) {
+                send_error_to(server,
+                              reply_to,
+                              message->id,
+                              -32600,
+                              "Peer identity does not match the authenticated certificate");
+                return;
+            }
         }
 
         result = build_initialize_result();
@@ -680,6 +693,22 @@ static void handle_notification(struct mcp_server *server,
 {
     struct mcp_client_session *session;
 
+    if (strcmp(message->method, MCP_SERVER_DISCOVERY_OFFLINE_METHOD) == 0) {
+        json_t *fingerprint = json_object_get(message->params, "certificate_fingerprint");
+        const char *transport_fingerprint =
+            reply_to->transport == MCP_REPLY_STREAM
+                ? mcp_framed_connection_peer_fingerprint(reply_to->stream)
+                : NULL;
+
+        session = client_session_for_reply(server, reply_to, false);
+        if (session && session->peer_server_id != 0 &&
+            json_is_string(fingerprint) && transport_fingerprint &&
+            strcmp(json_string_value(fingerprint), transport_fingerprint) == 0)
+            mcp_server_discovery_handle_offline_notification(server->discovery,
+                                                             message->params);
+        return;
+    }
+
     if (strcmp(message->method, "notifications/initialized") == 0) {
         session = client_session_for_reply(server, reply_to, false);
         if (session && session->state == MCP_SESSION_AWAIT_CLIENT_INITIALIZED)
@@ -780,13 +809,6 @@ static void udp_on_datagram(void *arg,
         return;
     }
 
-    if (message->type == MCP_JSONRPC_NOTIFICATION &&
-        strcmp(message->method, MCP_SERVER_DISCOVERY_OFFLINE_METHOD) == 0 &&
-        mcp_server_discovery_handle_offline_notification(server->discovery, message->params)) {
-        mcp_jsonrpc_message_destroy(message);
-        return;
-    }
-
     queue_message(server, message, &reply_to);
 }
 
@@ -854,13 +876,6 @@ static void framed_on_message(void *arg,
     if (mcp_jsonrpc_parse_line(data, len, &message, &error) != 0) {
         send_json_object(server, &reply_to, error);
         json_decref(error);
-        return;
-    }
-
-    if (message->type == MCP_JSONRPC_NOTIFICATION &&
-        strcmp(message->method, MCP_SERVER_DISCOVERY_OFFLINE_METHOD) == 0 &&
-        mcp_server_discovery_handle_offline_notification(server->discovery, message->params)) {
-        mcp_jsonrpc_message_destroy(message);
         return;
     }
 
@@ -1000,6 +1015,7 @@ void mcp_server_destroy(struct mcp_server *server)
 #endif
     mcp_framed_listener_destroy(server->pipe_listener);
     mcp_framed_listener_destroy(server->tcp_listener);
+    mcp_tls_context_destroy(server->tls_context);
     mcp_stdio_transport_destroy(server->stdio);
     mcp_network_access_policy_destroy(server->network_access_policy);
     free(server->tcp_host);
@@ -1078,13 +1094,32 @@ int mcp_server_start_pipe(struct mcp_server *server, const char *path)
 
 int mcp_server_start_tcp(struct mcp_server *server, const char *host, unsigned int port)
 {
+    const char *ca_file;
+    const char *cert_file;
+    const char *key_file;
+    char tls_error[256];
+
     if (!server || !host || server->tcp_listener)
         return -1;
+
+    ca_file = getenv("MCP_TLS_CA_FILE");
+    cert_file = getenv("MCP_TLS_CERT_FILE");
+    key_file = getenv("MCP_TLS_KEY_FILE");
+    if (mcp_tls_context_create(&server->tls_context,
+                               ca_file,
+                               cert_file,
+                               key_file,
+                               tls_error,
+                               sizeof(tls_error)) != 0) {
+        fprintf(stderr, "TLS configuration failed: %s\n", tls_error);
+        return -1;
+    }
 
     if (mcp_framed_listener_create(&server->tcp_listener,
                                    server->loop,
                                    (struct mcp_framed_listener_config){
                                        .max_frame_bytes = server->config.max_line_bytes,
+                                       .tls_context = server->tls_context,
                                    }) != 0)
         return -1;
 

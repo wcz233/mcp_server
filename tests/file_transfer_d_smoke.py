@@ -9,6 +9,8 @@ import sys
 import tempfile
 import threading
 import time
+
+from tls_test_support import add_server_tls_env, connect_tls
 from pathlib import Path
 
 
@@ -67,7 +69,7 @@ def wait_for_tcp(port, proc):
         if proc.poll() is not None:
             raise RuntimeError(f"server exited early; stderr={proc.stderr.read()}")
         try:
-            return socket.create_connection(("127.0.0.1", port), timeout=0.5)
+            return connect_tls(port, timeout=0.5)
         except OSError as exc:
             last_error = exc
             time.sleep(0.05)
@@ -87,6 +89,7 @@ def start_server(exe, tcp_port, discovery_port, peer_discovery_port, cwd):
     env["MCP_DISCOVERY_HOSTS"] = f"127.0.0.1:{peer_discovery_port}"
     env["MCP_STRICT_INIT"] = "0"
     env["MCP_ENABLE_SHELL_EXEC"] = "0"
+    add_server_tls_env(env, "node-a" if tcp_port % 2 == 0 else "node-b")
     return subprocess.Popen(
         [exe],
         stdin=subprocess.DEVNULL,

@@ -6,6 +6,8 @@ import subprocess
 import sys
 import tempfile
 
+from tls_test_support import add_server_tls_env
+
 
 TOKEN = "startup-token-must-not-appear-4e91a7c2"
 
@@ -202,6 +204,7 @@ def verify_transport_failure_cleanup(exe):
     env["MCP_ENABLE_TCP"] = "1"
     env["MCP_TCP_HOST"] = "not-a-valid-host"
     env["MCP_TCP_PORT"] = "18770"
+    add_server_tls_env(env)
 
     stdout, stderr = run_server(exe, env, 1)
     assert "mcp_server_start_tcp failed" in stderr, (stdout, stderr)

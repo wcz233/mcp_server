@@ -8,6 +8,13 @@ import tempfile
 import threading
 import time
 
+from tls_test_support import (
+    add_server_tls_env,
+    certificate_fingerprint,
+    connect_tls,
+    server_context,
+)
+
 
 def encode(payload):
     data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -81,7 +88,7 @@ def wait_for_tcp(port, proc):
         if proc.poll() is not None:
             raise RuntimeError(f"server exited early; stderr={proc.stderr.read()}")
         try:
-            return socket.create_connection(("127.0.0.1", port), timeout=0.5)
+            return connect_tls(port, timeout=0.5)
         except OSError as exc:
             last_error = exc
             time.sleep(0.05)
@@ -105,6 +112,7 @@ def start_server(exe, tcp_port, discovery_port, peer_discovery_port):
     env["MCP_SHELL_EXEC_CONFIG"] = os.path.join(
         os.path.dirname(__file__), "shell_exec_test_config.json"
     )
+    add_server_tls_env(env, "node-a")
     return subprocess.Popen(
         [exe],
         stdin=subprocess.DEVNULL,
@@ -130,6 +138,7 @@ def start_broadcast_port_server(exe, tcp_port, discovery_port, broadcast_port):
     env["MCP_DISCOVERY_HOSTS"] = "127.0.0.1"
     env["MCP_STRICT_INIT"] = "0"
     env["MCP_ENABLE_SHELL_EXEC"] = "0"
+    add_server_tls_env(env, "node-a")
     return subprocess.Popen(
         [exe],
         stdin=subprocess.DEVNULL,
@@ -154,6 +163,7 @@ def start_default_broadcast_port_server(exe, tcp_port, discovery_port):
     env["MCP_DISCOVERY_HOSTS"] = "127.0.0.1"
     env["MCP_STRICT_INIT"] = "0"
     env["MCP_ENABLE_SHELL_EXEC"] = "0"
+    add_server_tls_env(env, "node-a")
     return subprocess.Popen(
         [exe],
         stdin=subprocess.DEVNULL,
@@ -188,6 +198,7 @@ def udp_packet(instance_id, tcp_port, event="online"):
             "reply": False,
             "event": event,
             "advertise_host": "127.0.0.1",
+            "certificate_fingerprint": certificate_fingerprint("node-b"),
             "status": {"hostname": instance_id, "os": "fake"},
         },
         separators=(",", ":"),
@@ -241,6 +252,7 @@ class FakePeer:
         self._listener.bind(("127.0.0.1", tcp_port))
         self._listener.listen(8)
         self._listener.settimeout(0.2)
+        self._tls_context = server_context("node-b")
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -313,6 +325,12 @@ class FakePeer:
                 continue
             except OSError:
                 return
+            conn.settimeout(1.0)
+            try:
+                conn = self._tls_context.wrap_socket(conn, server_side=True)
+            except (OSError, TimeoutError):
+                conn.close()
+                continue
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
     def _handle(self, conn):
@@ -499,7 +517,7 @@ def verify_automatic_tool_discovery(tcp_server, fake_peer, server_id):
     failures = []
     try:
         for _ in range(2):
-            caller = socket.create_connection(("127.0.0.1", tcp_server), timeout=1.0)
+            caller = connect_tls(tcp_server, timeout=1.0)
             caller.settimeout(5.0)
             initialize(caller)
             callers.append(caller)

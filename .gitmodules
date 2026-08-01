@@ -4,3 +4,9 @@
 [submodule "external/jansson"]
 	path = external/jansson
 	url = https://github.com/akheron/jansson.git
+[submodule "mcp_stdio_proxy_adapter"]
+	path = mcp_stdio_proxy_adapter
+	url = https://github.com/wcz233/mcp_stdio_proxy_adapter.git
+[submodule "external/mbedtls"]
+	path = external/mbedtls
+	url = https://github.com/Mbed-TLS/mbedtls.git

@@ -15,7 +15,8 @@ Codex <stdio> mcp_stdio_proxy_adapter <tcp> mcp_server
 - `src/`：服务端源码。
 - `include/`：公开头文件。
 - `config/`：构建配置，包含 Linux 风格 `defconfig` 和平台 CMake 初始配置。
-- `external/`：锁定的第三方源码，默认使用 bundled libuv 和 jansson。
+- `external/`：锁定的第三方源码，默认使用 bundled libuv、jansson 和 Mbed TLS。
+- `mcp_stdio_proxy_adapter/`：由本仓库 gitlink 锁定的 stdio/TCP 适配器子仓库。
 - `tests/`：smoke tests。
 
 ## 初始化依赖
@@ -98,7 +99,7 @@ cmake --build build --parallel
 
 ```text
 mcp_server/build/src/mcp_server
-mcp_stdio_proxy_adapter/build/mcp_stdio_proxy_adapter
+mcp_server/build/mcp_stdio_proxy_adapter/mcp_stdio_proxy_adapter
 ```
 
 ### AArch64 交叉编译
@@ -435,6 +436,9 @@ MCP_ENABLE_STDIO=0 \
 MCP_ENABLE_TCP=1 \
 MCP_TCP_HOST=192.168.16.136 \
 MCP_TCP_PORT=18767 \
+MCP_TLS_CA_FILE=/etc/mcp/tls/ca.cert.pem \
+MCP_TLS_CERT_FILE=/etc/mcp/tls/node.cert.pem \
+MCP_TLS_KEY_FILE=/etc/mcp/tls/node.key.pem \
 MCP_SHELL_EXEC_CONFIG="$PWD/config/tools/shell_exec.json" \
 ./build/src/mcp_server
 ```
@@ -491,6 +495,9 @@ Environment=MCP_ENABLE_STDIO=0
 Environment=MCP_ENABLE_TCP=1
 Environment=MCP_TCP_HOST=192.168.16.136
 Environment=MCP_TCP_PORT=18767
+Environment=MCP_TLS_CA_FILE=/etc/mcp/tls/ca.cert.pem
+Environment=MCP_TLS_CERT_FILE=/etc/mcp/tls/node.cert.pem
+Environment=MCP_TLS_KEY_FILE=/etc/mcp/tls/node.key.pem
 Environment=MCP_SHELL_EXEC_CONFIG=/opt/mcp_server/config/tools/shell_exec.json
 # Environment=MCP_ENABLE_SANDBOX_CTL=1
 ExecStart=/opt/mcp_server/mcp_server
@@ -640,11 +647,15 @@ adapter 通常由 Codex 按 `config.toml` 自动启动，不需要单独常驻�
 
 ```toml
 [mcp_servers.mcp]
-command = "D:\\Project\\2025-12-02\\mcp\\mcp_stdio_proxy_adapter\\build\\Release\\mcp_stdio_proxy_adapter.exe"
+command = "D:\\Project\\2025-12-02\\mcp\\mcp_server\\build\\mcp_stdio_proxy_adapter\\Release\\mcp_stdio_proxy_adapter.exe"
 args = [
   "--transport", "tcp",
   "--host", "192.168.16.3",
   "--port", "18767",
+  "--tls-ca", "D:\\mcp-secrets\\ca.cert.pem",
+  "--tls-cert", "D:\\mcp-secrets\\client.cert.pem",
+  "--tls-key", "D:\\mcp-secrets\\client.key.pem",
+  "--tls-server-name", "mcp-node.example.internal",
   "--timeout-ms", "3000"
 ]
 ```
@@ -653,17 +664,22 @@ Linux 路径示例：
 
 ```toml
 [mcp_servers.mcp]
-command = "/home/alinx/prj/mcp/mcp_stdio_proxy_adapter/build/mcp_stdio_proxy_adapter"
+command = "/home/alinx/prj/mcp/mcp_server/build/mcp_stdio_proxy_adapter/mcp_stdio_proxy_adapter"
 args = [
   "--transport", "tcp",
   "--host", "192.168.16.3",
   "--port", "18767",
+  "--tls-ca", "/etc/mcp/tls/ca.cert.pem",
+  "--tls-cert", "/etc/mcp/tls/client.cert.pem",
+  "--tls-key", "/etc/mcp/tls/client.key.pem",
+  "--tls-server-name", "mcp-node.example.internal",
   "--timeout-ms", "3000"
 ]
 ```
 
 `--host` 和 `--port` 必须与 `mcp_server` 运行时的 `MCP_TCP_HOST`、
-`MCP_TCP_PORT` 对应。
+`MCP_TCP_PORT` 对应。`--tls-server-name` 必须存在于服务端证书 SAN；省略时使用
+`--host`。TLS 文件和证书签发策略见 `docs/transport_security.md`。
 
 ## 在 Codex 中使用
 
@@ -719,6 +735,9 @@ int main(void){printf(\"hello world!\\n\");return 0;}' > /home/alinx/prj/hello.c
 - `MCP_TCP_HOST=<ip>`：TCP 监听地址。
 - `MCP_TCP_PORT=<port>`：TCP 监听端口，示例使用 `18767`。
 - `MCP_TCP_LISTEN_PORT=<port>`：`MCP_TCP_PORT` 未设置时的兼容别名。
+- `MCP_TLS_CA_FILE=<path>`：TCP 模式必填，信任的内部 CA 证书链。
+- `MCP_TLS_CERT_FILE=<path>`：TCP 模式必填，本节点证书。
+- `MCP_TLS_KEY_FILE=<path>`：TCP 模式必填，本节点私钥；应由文件 ACL 限制读取。
 - `MCP_ENABLE_DISCOVERY=1`：TCP 模式下开启 mcp_server 局域网发现；默认开启。
 - `MCP_DISCOVERY_PORT=<port>`：UDP 发现监听端口；默认等于 `MCP_TCP_PORT`。
 - `MCP_UDP_BROADCAST_LISTEN_PORT=<port>`：UDP 广播目标端口；默认等于 `MCP_TCP_PORT`。
@@ -730,8 +749,9 @@ int main(void){printf(\"hello world!\\n\");return 0;}' > /home/alinx/prj/hello.c
 - `MCP_SHELL_EXEC_CONFIG=<absolute path>`：显式指定 JSON v2 shell policy；修改后需重启。
 - `MCP_ENABLE_SANDBOX_CTL=1`：要求有效 JSON v2 和非空 `control.token`，并启用 process-local control。
 
-TCP 协议使用 4 字节大端长度头加 JSON body。`mcp_stdio_proxy_adapter`
-负责把 Codex stdio JSON-RPC 转换成该 TCP framed 协议。
+TCP 仅接受 TLS 1.3 双向认证连接，不提供同端口明文回退。TLS 内仍使用 4 字节大端
+长度头加 JSON/MFT1 body；`mcp_stdio_proxy_adapter` 负责把 Codex stdio JSON-RPC
+转换成该加密 framed 协议。
 
 `server.list_servers` 工具会主动触发一次发现广播，短暂等待响应后返回 JSON
 文本，结构包含 `total` 和 `servers`；每个 server 记录会话内临时 `server_id`、

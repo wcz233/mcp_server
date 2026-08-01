@@ -3,7 +3,7 @@
 ## Default Policy
 
 - Third-party source is tracked through Git submodules under `external/`.
-- Default builds use bundled source from `external/libuv` and `external/jansson`.
+- Default builds use bundled source from `external/libuv`, `external/jansson`, and `external/mbedtls`.
 - `MCP_ALLOW_FETCHCONTENT` remains disabled by policy so the default build stays reproducible and auditable.
 - System-library mode is optional and must be enabled explicitly with CMake options.
 
@@ -19,6 +19,11 @@ jansson
   source repo: https://github.com/akheron/jansson.git
   release tarball: https://github.com/akheron/jansson/releases/download/v2.15.0/jansson-2.15.0.tar.gz
   locked version: v2.15.0
+
+mbedtls
+  source repo: https://github.com/Mbed-TLS/mbedtls.git
+  release tarball: https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/mbedtls-4.1.1.tar.gz
+  locked version: mbedtls-4.1.1
 ```
 
 Exact commits are recorded in `third_party.lock`.
@@ -32,6 +37,6 @@ Exact commits are recorded in `third_party.lock`.
 
 ## Modification Policy
 
-- Do not patch files directly inside `external/libuv` or `external/jansson` in normal development.
+- Do not patch files directly inside `external/libuv`, `external/jansson`, or `external/mbedtls` in normal development.
 - If a patch is unavoidable, prefer a maintained fork or an explicit patch workflow documented in the repository.
 - Never replace the submodule workflow with committed archive files.

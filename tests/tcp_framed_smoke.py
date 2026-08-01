@@ -6,6 +6,8 @@ import subprocess
 import sys
 import time
 
+from tls_test_support import add_server_tls_env, connect_tls
+
 
 def encode(payload):
     data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -43,7 +45,7 @@ def wait_for_tcp(port, proc):
         if proc.poll() is not None:
             raise RuntimeError(f"server exited early; stderr={proc.stderr.read()}")
         try:
-            sock = socket.create_connection(("127.0.0.1", port), timeout=0.5)
+            sock = connect_tls(port, timeout=0.5)
             return sock
         except OSError as exc:
             last_error = exc
@@ -59,6 +61,7 @@ def main():
     env["MCP_ENABLE_TCP"] = "1"
     env["MCP_TCP_HOST"] = "127.0.0.1"
     env["MCP_TCP_PORT"] = str(port)
+    add_server_tls_env(env)
     proc = subprocess.Popen(
         [exe],
         stdin=subprocess.DEVNULL,

@@ -25,6 +25,7 @@ mcp_setup_third_party()
 
 add_subdirectory(external)
 add_subdirectory(src)
+add_subdirectory(mcp_stdio_proxy_adapter)
 
 if(MCP_BUILD_TESTS)
     enable_testing()

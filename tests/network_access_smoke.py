@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 import time
+
+from tls_test_support import add_server_tls_env, certificate_fingerprint, connect_tls
 from pathlib import Path
 
 
@@ -79,6 +81,7 @@ def server_env(config_path, tcp_port, discovery_enabled):
     env["MCP_ENABLE_DISCOVERY"] = "1" if discovery_enabled else "0"
     env["MCP_STRICT_INIT"] = "0"
     env["MCP_ENABLE_SHELL_EXEC"] = "0"
+    add_server_tls_env(env)
     return env
 
 
@@ -114,11 +117,23 @@ def wait_for_tcp(port, proc):
         if proc.poll() is not None:
             raise RuntimeError(f"server exited early: {proc.stderr.read()}")
         try:
-            return socket.create_connection(("127.0.0.1", port), timeout=0.5)
+            return connect_tls(port, timeout=0.5)
         except OSError as exc:
             last_error = exc
             time.sleep(0.05)
     raise RuntimeError(f"tcp listener did not become ready: {last_error}")
+
+
+def wait_for_raw_tcp(port, proc):
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"server exited early: {proc.stderr.read()}")
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=0.5)
+        except OSError:
+            time.sleep(0.05)
+    raise RuntimeError("raw TCP listener did not become ready")
 
 
 def assert_startup_failure(exe, env, cwd, expected):
@@ -137,7 +152,7 @@ def verify_rejected_tcp(exe, config_path, tcp_port, cwd):
     proc = start_server(exe, env, cwd)
     sock = None
     try:
-        sock = wait_for_tcp(tcp_port, proc)
+        sock = wait_for_raw_tcp(tcp_port, proc)
         sock.settimeout(2)
         try:
             sock.sendall(
@@ -169,6 +184,7 @@ def discovery_packet(advertise_host):
             "reply": True,
             "event": "online",
             "advertise_host": advertise_host,
+            "certificate_fingerprint": certificate_fingerprint("node-b"),
             "status": {},
         },
         separators=(",", ":"),

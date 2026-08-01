@@ -19,6 +19,8 @@ target_sources(mcp_server
         plugin/plugin_manager.c
         protocol/jsonrpc.c
         registry/tool_registry.c
+        security/tls_context.c
+        security/tls_stream.c
         tools/builtin_tools.c
         tools/schema.c
         tools/shell_exec.c
@@ -41,6 +43,7 @@ target_link_libraries(mcp_server
     PRIVATE
         MCP::jansson
         MCP::libuv
+        MCP::mbedtls
 )
 
 target_compile_definitions(mcp_server

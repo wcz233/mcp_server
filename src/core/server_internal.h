@@ -11,6 +11,7 @@
 #include "listener/framed_listener.h"
 #include "network/network_access_policy.h"
 #include "plugin/plugin_manager.h"
+#include "security/tls_context.h"
 #include "transport/peer_transport.h"
 #include "transport/stdio_transport.h"
 #include "transport/udp_transport.h"
@@ -58,6 +59,7 @@ struct mcp_server {
     struct mcp_peer_transport *peer_transport;
     struct mcp_server_discovery *discovery;
     struct mcp_network_access_policy *network_access_policy;
+    struct mcp_tls_context *tls_context;
     struct mcp_shell_policy_snapshot *shell_policy_snapshot;
     struct mcp_shell_sandbox_control *sandbox_control;
     struct mcp_shell_job_store *shell_jobs;

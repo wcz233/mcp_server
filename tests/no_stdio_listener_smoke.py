@@ -4,6 +4,8 @@ import subprocess
 import sys
 import time
 
+from tls_test_support import add_server_tls_env
+
 
 def main():
     exe = sys.argv[1]
@@ -13,6 +15,7 @@ def main():
     env["MCP_ENABLE_TCP"] = "1"
     env["MCP_TCP_HOST"] = "127.0.0.1"
     env["MCP_TCP_PORT"] = str(port)
+    add_server_tls_env(env)
     proc = subprocess.Popen(
         [exe],
         stdin=subprocess.DEVNULL,

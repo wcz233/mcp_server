@@ -14,3 +14,11 @@ dependencies:
     commit: 4a9a6db73d5dc553164992e87426502ab2d54512
     release_tarball: https://github.com/akheron/jansson/releases/download/v2.15.0/jansson-2.15.0.tar.gz
     license: MIT
+
+  mbedtls:
+    path: external/mbedtls
+    source: https://github.com/Mbed-TLS/mbedtls.git
+    version: mbedtls-4.1.1
+    commit: 0a8fda272a5a0abef3b47c91bed37185d5a726b1
+    release_tarball: https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/mbedtls-4.1.1.tar.gz
+    license: Apache-2.0 OR GPL-2.0-or-later

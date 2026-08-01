@@ -8,9 +8,11 @@
 
 struct mcp_framed_listener;
 struct mcp_framed_connection;
+struct mcp_tls_context;
 
 struct mcp_framed_listener_config {
     size_t max_frame_bytes;
+    struct mcp_tls_context *tls_context;
 };
 
 typedef void (*mcp_framed_message_cb)(void *arg,
@@ -40,6 +42,8 @@ int mcp_framed_listener_start_tcp(struct mcp_framed_listener *listener,
 int mcp_framed_connection_send(struct mcp_framed_connection *conn,
                                const char *data,
                                size_t len);
+const char *mcp_framed_connection_peer_fingerprint(
+    const struct mcp_framed_connection *conn);
 void mcp_framed_listener_close(struct mcp_framed_listener *listener);
 bool mcp_framed_listener_is_open(const struct mcp_framed_listener *listener);
 
