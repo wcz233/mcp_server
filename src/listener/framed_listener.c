@@ -1,6 +1,8 @@
 #include "listener/framed_listener.h"
 
+#if MCP_TCP_SECURITY_MTLS
 #include "security/tls_stream.h"
+#endif
 
 #include <limits.h>
 #include <stdint.h>
@@ -24,7 +26,9 @@ struct mcp_framed_connection {
     uv_pipe_t pipe;
     uv_tcp_t tcp;
     uv_stream_t *stream;
+#if MCP_TCP_SECURITY_MTLS
     struct mcp_tls_stream *tls;
+#endif
     bool closing;
 
     char *rx_buf;
@@ -102,7 +106,9 @@ static void connection_close_cb(uv_handle_t *handle)
         listener->on_close(listener->cb_arg, conn);
 
     free(conn->rx_buf);
+#if MCP_TCP_SECURITY_MTLS
     mcp_tls_stream_destroy(conn->tls);
+#endif
     free(conn);
     maybe_release_listener(listener);
 }
@@ -113,7 +119,9 @@ static void connection_close_with_cb(struct mcp_framed_connection *conn)
         return;
 
     conn->closing = true;
+#if MCP_TCP_SECURITY_MTLS
     mcp_tls_stream_stop(conn->tls);
+#endif
     if (conn->stream)
         uv_read_stop(conn->stream);
     if (conn->stream && !uv_is_closing((uv_handle_t *)conn->stream)) {
@@ -244,6 +252,7 @@ static void read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
     free(buf->base);
 }
 
+#if MCP_TCP_SECURITY_MTLS
 static void tls_ready_cb(void *arg)
 {
     (void)arg;
@@ -259,6 +268,7 @@ static void tls_error_cb(void *arg, int error_code)
     (void)error_code;
     connection_close_with_cb(arg);
 }
+#endif
 
 static void write_cb(uv_write_t *req, int status)
 {
@@ -333,18 +343,26 @@ static void on_connection(uv_stream_t *server_stream, int status)
     listener->clients = conn;
 
     if (conn->kind == LISTENER_KIND_TCP) {
-        if (mcp_tls_stream_create(&conn->tls,
-                                  listener->config.tls_context,
-                                  true,
-                                  NULL,
-                                  conn->stream,
-                                  tls_ready_cb,
-                                  tls_data_cb,
-                                  tls_error_cb,
-                                  NULL,
-                                  conn) != 0 ||
-            mcp_tls_stream_start(conn->tls) != 0)
-            connection_close_with_cb(conn);
+#if MCP_TCP_SECURITY_MTLS
+        if (listener->config.tls_context) {
+            if (mcp_tls_stream_create(&conn->tls,
+                                      listener->config.tls_context,
+                                      true,
+                                      NULL,
+                                      conn->stream,
+                                      tls_ready_cb,
+                                      tls_data_cb,
+                                      tls_error_cb,
+                                      NULL,
+                                      conn) != 0 ||
+                mcp_tls_stream_start(conn->tls) != 0)
+                connection_close_with_cb(conn);
+        } else
+#endif
+        {
+            if (uv_read_start(conn->stream, alloc_cb, read_cb) != 0)
+                connection_close_with_cb(conn);
+        }
     } else if (uv_read_start(conn->stream, alloc_cb, read_cb) != 0) {
         connection_close_with_cb(conn);
     }
@@ -425,8 +443,7 @@ int mcp_framed_listener_start_tcp(struct mcp_framed_listener *listener,
     struct sockaddr_in addr4;
     struct sockaddr_in6 addr6;
 
-    if (!listener || !host || !listener->config.tls_context ||
-        listener->initialized || port > 65535)
+    if (!listener || !host || listener->initialized || port > 65535)
         return -1;
 
     memset(&addr, 0, sizeof(addr));
@@ -464,7 +481,6 @@ int mcp_framed_connection_send(struct mcp_framed_connection *conn,
                                size_t len)
 {
     struct write_req *wr;
-    char *frame;
 
     if (!conn || conn->closing || !data || len == 0 || len > UINT32_MAX)
         return -1;
@@ -474,17 +490,22 @@ int mcp_framed_connection_send(struct mcp_framed_connection *conn,
 #endif
 
     if (conn->kind == LISTENER_KIND_TCP) {
-        frame = malloc(len + 4);
-        if (!frame)
-            return -1;
-        write_u32_be(frame, (uint32_t)len);
-        memcpy(frame + 4, data, len);
-        if (mcp_tls_stream_send(conn->tls, frame, len + 4) != 0) {
+#if MCP_TCP_SECURITY_MTLS
+        if (conn->tls) {
+            char *frame = malloc(len + 4);
+
+            if (!frame)
+                return -1;
+            write_u32_be(frame, (uint32_t)len);
+            memcpy(frame + 4, data, len);
+            if (mcp_tls_stream_send(conn->tls, frame, len + 4) != 0) {
+                free(frame);
+                return -1;
+            }
             free(frame);
-            return -1;
+            return 0;
         }
-        free(frame);
-        return 0;
+#endif
     }
 
     wr = calloc(1, sizeof(*wr));
@@ -517,7 +538,12 @@ int mcp_framed_connection_send(struct mcp_framed_connection *conn,
 const char *mcp_framed_connection_peer_fingerprint(
     const struct mcp_framed_connection *conn)
 {
+#if MCP_TCP_SECURITY_MTLS
     return conn ? mcp_tls_stream_peer_fingerprint(conn->tls) : NULL;
+#else
+    (void)conn;
+    return NULL;
+#endif
 }
 
 void mcp_framed_listener_close(struct mcp_framed_listener *listener)

@@ -21,6 +21,7 @@ include(MCPInstall)
 mcp_detect_platform()
 mcp_load_default_options()
 mcp_load_kconfig_options()
+mcp_validate_tcp_security()
 mcp_setup_third_party()
 
 add_subdirectory(external)
@@ -40,6 +41,10 @@ install(FILES "${PROJECT_SOURCE_DIR}/config/tools/shell_exec.json"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/mcp_server/config/tools"
 )
 
-install(FILES "${PROJECT_SOURCE_DIR}/config/network/network_access.json"
+install(FILES "${PROJECT_SOURCE_DIR}/config/network/network_white_list.json"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/mcp_server/config/network"
+)
+
+install(FILES "${PROJECT_SOURCE_DIR}/config/network/network_security.json"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/mcp_server/config/network"
 )

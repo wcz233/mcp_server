@@ -518,16 +518,19 @@ static void handle_request(struct mcp_server *server,
                             json_is_true(json_object_get(peer_identity, "data_channel"));
 
         if (peer_identity && mcp_server_discovery_enabled(server)) {
+            const char *transport_fingerprint = NULL;
+
+            if (mcp_server_tcp_security_mtls(server) &&
+                reply_to->transport == MCP_REPLY_STREAM)
+                transport_fingerprint =
+                    mcp_framed_connection_peer_fingerprint(reply_to->stream);
             session->peer_server_id =
                 mcp_server_discovery_note_peer_identity(server->discovery,
                                                         peer_identity,
                                                         data_channel,
-                                                        reply_to->transport == MCP_REPLY_STREAM
-                                                            ? mcp_framed_connection_peer_fingerprint(
-                                                                  reply_to->stream)
-                                                            : NULL);
+                                                        transport_fingerprint);
             session->data_channel = data_channel && session->peer_server_id != 0;
-            if (session->peer_server_id == 0) {
+            if (mcp_server_tcp_security_mtls(server) && session->peer_server_id == 0) {
                 send_error_to(server,
                               reply_to,
                               message->id,
@@ -694,6 +697,12 @@ static void handle_notification(struct mcp_server *server,
     struct mcp_client_session *session;
 
     if (strcmp(message->method, MCP_SERVER_DISCOVERY_OFFLINE_METHOD) == 0) {
+        if (!mcp_server_tcp_security_mtls(server)) {
+            mcp_server_discovery_handle_offline_notification(server->discovery,
+                                                             message->params);
+            return;
+        }
+
         json_t *fingerprint = json_object_get(message->params, "certificate_fingerprint");
         const char *transport_fingerprint =
             reply_to->transport == MCP_REPLY_STREAM
@@ -809,6 +818,14 @@ static void udp_on_datagram(void *arg,
         return;
     }
 
+    if (!mcp_server_tcp_security_mtls(server) &&
+        message->type == MCP_JSONRPC_NOTIFICATION &&
+        strcmp(message->method, MCP_SERVER_DISCOVERY_OFFLINE_METHOD) == 0 &&
+        mcp_server_discovery_handle_offline_notification(server->discovery, message->params)) {
+        mcp_jsonrpc_message_destroy(message);
+        return;
+    }
+
     queue_message(server, message, &reply_to);
 }
 
@@ -876,6 +893,14 @@ static void framed_on_message(void *arg,
     if (mcp_jsonrpc_parse_line(data, len, &message, &error) != 0) {
         send_json_object(server, &reply_to, error);
         json_decref(error);
+        return;
+    }
+
+    if (!mcp_server_tcp_security_mtls(server) &&
+        message->type == MCP_JSONRPC_NOTIFICATION &&
+        strcmp(message->method, MCP_SERVER_DISCOVERY_OFFLINE_METHOD) == 0 &&
+        mcp_server_discovery_handle_offline_notification(server->discovery, message->params)) {
+        mcp_jsonrpc_message_destroy(message);
         return;
     }
 
@@ -1015,7 +1040,9 @@ void mcp_server_destroy(struct mcp_server *server)
 #endif
     mcp_framed_listener_destroy(server->pipe_listener);
     mcp_framed_listener_destroy(server->tcp_listener);
+#if MCP_TCP_SECURITY_MTLS
     mcp_tls_context_destroy(server->tls_context);
+#endif
     mcp_stdio_transport_destroy(server->stdio);
     mcp_network_access_policy_destroy(server->network_access_policy);
     free(server->tcp_host);
@@ -1094,32 +1121,16 @@ int mcp_server_start_pipe(struct mcp_server *server, const char *path)
 
 int mcp_server_start_tcp(struct mcp_server *server, const char *host, unsigned int port)
 {
-    const char *ca_file;
-    const char *cert_file;
-    const char *key_file;
-    char tls_error[256];
-
     if (!server || !host || server->tcp_listener)
         return -1;
-
-    ca_file = getenv("MCP_TLS_CA_FILE");
-    cert_file = getenv("MCP_TLS_CERT_FILE");
-    key_file = getenv("MCP_TLS_KEY_FILE");
-    if (mcp_tls_context_create(&server->tls_context,
-                               ca_file,
-                               cert_file,
-                               key_file,
-                               tls_error,
-                               sizeof(tls_error)) != 0) {
-        fprintf(stderr, "TLS configuration failed: %s\n", tls_error);
-        return -1;
-    }
 
     if (mcp_framed_listener_create(&server->tcp_listener,
                                    server->loop,
                                    (struct mcp_framed_listener_config){
                                        .max_frame_bytes = server->config.max_line_bytes,
+#if MCP_TCP_SECURITY_MTLS
                                        .tls_context = server->tls_context,
+#endif
                                    }) != 0)
         return -1;
 
@@ -1176,6 +1187,46 @@ int mcp_server_start_discovery(struct mcp_server *server,
 bool mcp_server_discovery_enabled(const struct mcp_server *server)
 {
     return server && mcp_server_discovery_is_open(server->discovery);
+}
+
+int mcp_server_configure_tcp_security(struct mcp_server *server,
+                                      bool mtls_enabled,
+                                      const char *ca_file,
+                                      const char *certificate_file,
+                                      const char *private_key_file)
+{
+    if (!server)
+        return -1;
+#if MCP_TCP_SECURITY_MTLS
+    if (mtls_enabled) {
+        char tls_error[256];
+
+        if (mcp_tls_context_create(&server->tls_context,
+                                   ca_file,
+                                   certificate_file,
+                                   private_key_file,
+                                   tls_error,
+                                   sizeof(tls_error)) != 0) {
+            fprintf(stderr, "TLS configuration failed: %s\n", tls_error);
+            return -1;
+        }
+    }
+#else
+    (void)ca_file;
+    (void)certificate_file;
+    (void)private_key_file;
+    if (mtls_enabled) {
+        fputs("mtls TCP security was not compiled\n", stderr);
+        return -1;
+    }
+#endif
+    server->tcp_mtls_enabled = mtls_enabled;
+    return 0;
+}
+
+bool mcp_server_tcp_security_mtls(const struct mcp_server *server)
+{
+    return server && server->tcp_mtls_enabled;
 }
 
 bool mcp_server_network_access_enabled(const struct mcp_server *server)

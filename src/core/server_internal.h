@@ -11,7 +11,9 @@
 #include "listener/framed_listener.h"
 #include "network/network_access_policy.h"
 #include "plugin/plugin_manager.h"
+#if MCP_TCP_SECURITY_MTLS
 #include "security/tls_context.h"
+#endif
 #include "transport/peer_transport.h"
 #include "transport/stdio_transport.h"
 #include "transport/udp_transport.h"
@@ -59,7 +61,10 @@ struct mcp_server {
     struct mcp_peer_transport *peer_transport;
     struct mcp_server_discovery *discovery;
     struct mcp_network_access_policy *network_access_policy;
+#if MCP_TCP_SECURITY_MTLS
     struct mcp_tls_context *tls_context;
+#endif
+    bool tcp_mtls_enabled;
     struct mcp_shell_policy_snapshot *shell_policy_snapshot;
     struct mcp_shell_sandbox_control *sandbox_control;
     struct mcp_shell_job_store *shell_jobs;
@@ -84,6 +89,12 @@ void mcp_server_complete_async_ok(struct mcp_server *server,
 int mcp_server_start_discovery(struct mcp_server *server,
                                const struct mcp_server_discovery_config *config);
 bool mcp_server_discovery_enabled(const struct mcp_server *server);
+int mcp_server_configure_tcp_security(struct mcp_server *server,
+                                      bool mtls_enabled,
+                                      const char *ca_file,
+                                      const char *certificate_file,
+                                      const char *private_key_file);
+bool mcp_server_tcp_security_mtls(const struct mcp_server *server);
 bool mcp_server_network_access_enabled(const struct mcp_server *server);
 bool mcp_server_network_address_allowed(const struct mcp_server *server,
                                         const struct sockaddr *addr);

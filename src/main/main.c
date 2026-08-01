@@ -1,10 +1,14 @@
 #include "mcp/core/server.h"
 #include "core/server_internal.h"
+#if MCP_TCP_SECURITY_MTLS
+#include "security/network_security_config.h"
+#endif
 
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -46,6 +50,57 @@ static unsigned int env_uint(const char *name, unsigned int default_value)
         return default_value;
 
     return (unsigned int)parsed;
+}
+
+static int configure_tcp_security(struct mcp_server *server)
+{
+    const char *requested = getenv("MCP_TCP_SECURITY");
+    bool requested_set = requested && requested[0] != '\0';
+
+    if (requested_set && strcmp(requested, "plaintext") != 0 && strcmp(requested, "mtls") != 0) {
+        fprintf(stderr, "MCP_TCP_SECURITY must be plaintext or mtls\n");
+        return -1;
+    }
+#if MCP_TCP_SECURITY_MTLS
+    {
+        struct mcp_network_security_config *security = NULL;
+        bool requested_mtls = requested_set && strcmp(requested, "mtls") == 0;
+        bool config_mtls;
+        int rc = mcp_network_security_config_create_from_environment(
+            &security,
+            !requested_set || requested_mtls);
+
+        if (rc != 0)
+            return -1;
+        config_mtls = mcp_network_security_config_enabled(security);
+        if (requested_set && security && requested_mtls != config_mtls) {
+            fputs("MCP_TCP_SECURITY conflicts with network_security.json enabled\n", stderr);
+            mcp_network_security_config_destroy(security);
+            return -1;
+        }
+        if (!requested_set && !security) {
+            fputs("network_security.json is required when MCP_TCP_SECURITY is unset\n", stderr);
+            return -1;
+        }
+        rc = mcp_server_configure_tcp_security(
+            server,
+            security ? config_mtls : false,
+            mcp_network_security_config_ca_file(security),
+            mcp_network_security_config_certificate_file(security),
+            mcp_network_security_config_private_key_file(security));
+        if (rc == 0)
+            fprintf(stderr, "TCP security mode: %s\n", config_mtls ? "mtls" : "plaintext");
+        mcp_network_security_config_destroy(security);
+        return rc;
+    }
+#else
+    if (requested_set && strcmp(requested, "mtls") == 0) {
+        fputs("MCP_TCP_SECURITY=mtls is unavailable in a plaintext build\n", stderr);
+        return -1;
+    }
+    fputs("TCP security mode: plaintext\n", stderr);
+    return mcp_server_configure_tcp_security(server, false, NULL, NULL, NULL);
+#endif
 }
 
 static int stdin_fileno_value(void)
@@ -308,6 +363,12 @@ int main(void)
     }
 
     if (tcp_enabled) {
+        rc = configure_tcp_security(server);
+        if (rc != 0) {
+            mcp_server_destroy(server);
+            close_loop(&loop);
+            return 1;
+        }
         rc = mcp_server_start_tcp(server, tcp_host, tcp_port);
         if (rc != 0) {
             fprintf(stderr, "mcp_server_start_tcp failed for %s:%u\n", tcp_host, tcp_port);

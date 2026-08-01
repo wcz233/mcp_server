@@ -19,8 +19,6 @@ target_sources(mcp_server
         plugin/plugin_manager.c
         protocol/jsonrpc.c
         registry/tool_registry.c
-        security/tls_context.c
-        security/tls_stream.c
         tools/builtin_tools.c
         tools/schema.c
         tools/shell_exec.c
@@ -43,8 +41,20 @@ target_link_libraries(mcp_server
     PRIVATE
         MCP::jansson
         MCP::libuv
-        MCP::mbedtls
 )
+
+if(MCP_TCP_SECURITY STREQUAL "mtls")
+    target_sources(mcp_server
+        PRIVATE
+            security/network_security_config.c
+            security/tls_context.c
+            security/tls_stream.c
+    )
+    target_link_libraries(mcp_server PRIVATE MCP::mbedtls)
+    target_compile_definitions(mcp_server PRIVATE MCP_TCP_SECURITY_MTLS=1)
+else()
+    target_compile_definitions(mcp_server PRIVATE MCP_TCP_SECURITY_MTLS=0)
+endif()
 
 target_compile_definitions(mcp_server
     PRIVATE
@@ -59,8 +69,10 @@ target_compile_definitions(mcp_server
         $<$<STREQUAL:${MCP_FILE_TRANSFER_PLUGIN},y>:MCP_FILE_TRANSFER_PLUGIN_BUILTIN=1>
         MCP_SHELL_EXEC_DEFAULT_CONFIG="${PROJECT_SOURCE_DIR}/config/tools/shell_exec.json"
         MCP_SHELL_EXEC_INSTALLED_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/mcp_server/config/tools/shell_exec.json"
-        MCP_NETWORK_ACCESS_DEFAULT_CONFIG="${PROJECT_SOURCE_DIR}/config/network/network_access.json"
-        MCP_NETWORK_ACCESS_INSTALLED_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/mcp_server/config/network/network_access.json"
+        MCP_NETWORK_ACCESS_DEFAULT_CONFIG="${PROJECT_SOURCE_DIR}/config/network/network_white_list.json"
+        MCP_NETWORK_ACCESS_INSTALLED_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/mcp_server/config/network/network_white_list.json"
+        MCP_NETWORK_SECURITY_DEFAULT_CONFIG="${PROJECT_SOURCE_DIR}/config/network/network_security.json"
+        MCP_NETWORK_SECURITY_INSTALLED_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/mcp_server/config/network/network_security.json"
         $<$<PLATFORM_ID:Linux>:_GNU_SOURCE>
         $<$<PLATFORM_ID:Linux>:_POSIX_C_SOURCE=200809L>
 )

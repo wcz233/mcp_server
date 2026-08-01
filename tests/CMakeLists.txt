@@ -1,8 +1,9 @@
 find_package(Python3 COMPONENTS Interpreter)
 
-if(Python3_Interpreter_FOUND)
+set(MCP_TEST_TLS_DIR "${CMAKE_CURRENT_BINARY_DIR}/tls-fixtures")
+file(MAKE_DIRECTORY "${MCP_TEST_TLS_DIR}")
+if(Python3_Interpreter_FOUND AND MCP_TCP_SECURITY STREQUAL "mtls")
     find_program(MCP_TEST_OPENSSL_EXECUTABLE NAMES openssl REQUIRED)
-    set(MCP_TEST_TLS_DIR "${CMAKE_CURRENT_BINARY_DIR}/tls-fixtures")
     execute_process(
         COMMAND "${CMAKE_COMMAND}"
                 "-DOPENSSL_EXECUTABLE=${MCP_TEST_OPENSSL_EXECUTABLE}"
@@ -395,10 +396,12 @@ if(Python3_Interpreter_FOUND)
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tcp_framed_smoke.py" "$<TARGET_FILE:mcp_server>" 18767
     )
 
-    add_test(
-        NAME mcp_tls_security_smoke
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tls_security_smoke.py" "$<TARGET_FILE:mcp_server>" 18788
-    )
+    if(MCP_TCP_SECURITY STREQUAL "mtls")
+        add_test(
+            NAME mcp_tls_security_smoke
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tls_security_smoke.py" "$<TARGET_FILE:mcp_server>" 18788
+        )
+    endif()
 
     add_test(
         NAME mcp_stdio_proxy_adapter_tcp_smoke
@@ -407,23 +410,41 @@ if(Python3_Interpreter_FOUND)
                 "$<TARGET_FILE:mcp_stdio_proxy_adapter>"
                 "$<TARGET_FILE:mcp_server>"
                 18789
+                "${MCP_TCP_SECURITY}"
                 "${MCP_TEST_TLS_DIR}"
     )
 
-    add_test(
-        NAME mcp_network_access_smoke
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/network_access_smoke.py" "$<TARGET_FILE:mcp_server>" 18790 18791 18792 18793 18794
-    )
+    if(MCP_TCP_SECURITY STREQUAL "mtls")
+        add_test(
+            NAME mcp_mtls_build_plaintext_proxy_smoke
+            COMMAND "${Python3_EXECUTABLE}"
+                    "${PROJECT_SOURCE_DIR}/mcp_stdio_proxy_adapter/tests/proxy_tcp_smoke.py"
+                    "$<TARGET_FILE:mcp_stdio_proxy_adapter>"
+                    "$<TARGET_FILE:mcp_server>"
+                    18796
+                    plaintext
+                    "${MCP_TEST_TLS_DIR}"
+        )
+    endif()
+
+    if(MCP_TCP_SECURITY STREQUAL "mtls")
+        add_test(
+            NAME mcp_network_access_smoke
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/network_access_smoke.py" "$<TARGET_FILE:mcp_server>" 18790 18791 18792 18793 18794
+        )
+    endif()
 
     add_test(
         NAME mcp_server_discovery_smoke
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/server_discovery_smoke.py" "$<TARGET_FILE:mcp_server>" 18768 18769 18770 18771
     )
 
-    add_test(
-        NAME mcp_server_discovery_liveness_smoke
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/server_discovery_liveness_smoke.py" "$<TARGET_FILE:mcp_server>" 18772 18773 18774 18775 18776 18777 18778 18779 "${MCP_FILE_TRANSFER_PLUGIN}" "${_mcp_file_transfer_path_plugin}"
-    )
+    if(MCP_TCP_SECURITY STREQUAL "mtls")
+        add_test(
+            NAME mcp_server_discovery_liveness_smoke
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/server_discovery_liveness_smoke.py" "$<TARGET_FILE:mcp_server>" 18772 18773 18774 18775 18776 18777 18778 18779 "${MCP_FILE_TRANSFER_PLUGIN}" "${_mcp_file_transfer_path_plugin}"
+        )
+    endif()
 
     if(TARGET mcp_file_transfer_plugin)
         add_test(
@@ -441,6 +462,7 @@ if(Python3_Interpreter_FOUND)
 
     get_property(_mcp_all_tests DIRECTORY PROPERTY TESTS)
     set_tests_properties(${_mcp_all_tests} PROPERTIES
-        ENVIRONMENT "MCP_TEST_TLS_DIR=${MCP_TEST_TLS_DIR}"
+        ENVIRONMENT
+            "MCP_TEST_TLS_DIR=${MCP_TEST_TLS_DIR};MCP_TEST_TCP_SECURITY=${MCP_TCP_SECURITY}"
     )
 endif()

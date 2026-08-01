@@ -39,12 +39,23 @@ Windows PowerShell：
 .\scripts\bootstrap.ps1
 ```
 
-Mbed TLS 的 Git 标签需要在构建时生成部分源码。Linux 构建环境若尚未安装生成器依赖，
-先在仓库根目录执行：
+`MCP_TCP_SECURITY` 默认为 `mtls`。mTLS 构建会使用 Mbed TLS，并在构建时生成部分源码；
+首次构建前安装其生成器依赖：
 
 ```bash
 python3 -m pip install -r external/mbedtls/scripts/basic.requirements.txt
 ```
+
+没有 TLS/Python 生成环境的节点可直接构建 plaintext 版本；该模式不编译或链接
+Mbed TLS，adapter 也不链接 Jansson：
+
+```bash
+cmake -S . -B build-plaintext -DMCP_TCP_SECURITY=plaintext -DCMAKE_BUILD_TYPE=Release
+cmake --build build-plaintext --parallel
+```
+
+显式构建 mTLS 版本使用 `-DMCP_TCP_SECURITY=mtls`。完整运行时选择规则、证书和依赖说明
+见 `docs/transport_security.md`。
 
 ## 编译
 
@@ -379,7 +390,7 @@ block，但五项 rlimit 与非空身份切换不支持，`require_non_root` 是
 
 `mcp_server` 启动时优先读取 `MCP_NETWORK_ACCESS_CONFIG` 显式指定的 JSON；未指定时
 依次尝试编译期源码路径和安装路径，均不存在时使用 `enabled=false` 的 hard profile。
-生产模板位于 `config/network/network_access.json`：
+生产模板位于 `config/network/network_white_list.json`：
 
 ```json
 {
@@ -418,7 +429,8 @@ IPv4 地址都会使启动失败。`enabled=true` 时 `allowlist.ips` 不得为�
 
 构建目录只用于生成候选产物，长期运行的服务应指向独立且稳定的部署目录。
 一次部署至少包含目标平台的 `mcp_server` 及与该版本匹配的
-`config/tools/shell_exec.json`、`config/network/network_access.json`，并遵循下面的顺序：
+`config/tools/shell_exec.json`、`config/network/network_white_list.json`；mTLS 构建还需匹配的
+`config/network/network_security.json`，并遵循下面的顺序：
 
 1. 记录 Git commit 和工作区状态，在目标平台完成构建与测试。
 2. 确认目标主机架构；交叉编译 ABI 不确定时，优先在目标机临时目录原生构建。
@@ -443,9 +455,8 @@ MCP_ENABLE_STDIO=0 \
 MCP_ENABLE_TCP=1 \
 MCP_TCP_HOST=192.168.16.136 \
 MCP_TCP_PORT=18767 \
-MCP_TLS_CA_FILE=/etc/mcp/tls/ca.cert.pem \
-MCP_TLS_CERT_FILE=/etc/mcp/tls/node.cert.pem \
-MCP_TLS_KEY_FILE=/etc/mcp/tls/node.key.pem \
+MCP_TCP_SECURITY=mtls \
+MCP_NETWORK_SECURITY_CONFIG=/etc/mcp/network_security.json \
 MCP_SHELL_EXEC_CONFIG="$PWD/config/tools/shell_exec.json" \
 ./build/src/mcp_server
 ```
@@ -502,9 +513,8 @@ Environment=MCP_ENABLE_STDIO=0
 Environment=MCP_ENABLE_TCP=1
 Environment=MCP_TCP_HOST=192.168.16.136
 Environment=MCP_TCP_PORT=18767
-Environment=MCP_TLS_CA_FILE=/etc/mcp/tls/ca.cert.pem
-Environment=MCP_TLS_CERT_FILE=/etc/mcp/tls/node.cert.pem
-Environment=MCP_TLS_KEY_FILE=/etc/mcp/tls/node.key.pem
+Environment=MCP_TCP_SECURITY=mtls
+Environment=MCP_NETWORK_SECURITY_CONFIG=/etc/mcp/network_security.json
 Environment=MCP_SHELL_EXEC_CONFIG=/opt/mcp_server/config/tools/shell_exec.json
 # Environment=MCP_ENABLE_SANDBOX_CTL=1
 ExecStart=/opt/mcp_server/mcp_server
@@ -550,6 +560,8 @@ $env:MCP_ENABLE_STDIO = "0"
 $env:MCP_ENABLE_TCP = "1"
 $env:MCP_TCP_HOST = "192.168.16.2"
 $env:MCP_TCP_PORT = "18767"
+$env:MCP_TCP_SECURITY = "mtls"
+$env:MCP_NETWORK_SECURITY_CONFIG = (Resolve-Path "config\network\network_security.json").Path
 $env:MCP_SHELL_EXEC_CONFIG = (Resolve-Path "config\tools\shell_exec.json").Path
 .\build\src\Release\mcp_server.exe
 ```
@@ -659,12 +671,12 @@ args = [
   "--transport", "tcp",
   "--host", "192.168.16.3",
   "--port", "18767",
-  "--tls-ca", "D:\\mcp-secrets\\ca.cert.pem",
-  "--tls-cert", "D:\\mcp-secrets\\client.cert.pem",
-  "--tls-key", "D:\\mcp-secrets\\client.key.pem",
-  "--tls-server-name", "mcp-node.example.internal",
+  "--network-security-config", "D:\\mcp-config\\network_security.json",
   "--timeout-ms", "3000"
 ]
+
+[mcp_servers.mcp.env]
+MCP_TCP_SECURITY = "mtls"
 ```
 
 Linux 路径示例：
@@ -676,17 +688,18 @@ args = [
   "--transport", "tcp",
   "--host", "192.168.16.3",
   "--port", "18767",
-  "--tls-ca", "/etc/mcp/tls/ca.cert.pem",
-  "--tls-cert", "/etc/mcp/tls/client.cert.pem",
-  "--tls-key", "/etc/mcp/tls/client.key.pem",
-  "--tls-server-name", "mcp-node.example.internal",
+  "--network-security-config", "/etc/mcp/network_security.json",
   "--timeout-ms", "3000"
 ]
+
+[mcp_servers.mcp.env]
+MCP_TCP_SECURITY = "mtls"
 ```
 
 `--host` 和 `--port` 必须与 `mcp_server` 运行时的 `MCP_TCP_HOST`、
-`MCP_TCP_PORT` 对应。`--tls-server-name` 必须存在于服务端证书 SAN；省略时使用
-`--host`。TLS 文件和证书签发策略见 `docs/transport_security.md`。
+`MCP_TCP_PORT` 对应。adapter 的 `network_security.json` 中 `mtls.server_name` 必须存在于
+服务端证书 SAN；留空时使用 `--host`。TLS 文件和证书签发策略见
+`docs/transport_security.md`。
 
 ## 在 Codex 中使用
 
@@ -742,9 +755,9 @@ int main(void){printf(\"hello world!\\n\");return 0;}' > /home/alinx/prj/hello.c
 - `MCP_TCP_HOST=<ip>`：TCP 监听地址。
 - `MCP_TCP_PORT=<port>`：TCP 监听端口，示例使用 `18767`。
 - `MCP_TCP_LISTEN_PORT=<port>`：`MCP_TCP_PORT` 未设置时的兼容别名。
-- `MCP_TLS_CA_FILE=<path>`：TCP 模式必填，信任的内部 CA 证书链。
-- `MCP_TLS_CERT_FILE=<path>`：TCP 模式必填，本节点证书。
-- `MCP_TLS_KEY_FILE=<path>`：TCP 模式必填，本节点私钥；应由文件 ACL 限制读取。
+- `MCP_TCP_SECURITY=mtls|plaintext`：mTLS 编译版本的运行模式；plaintext 编译版本拒绝 `mtls`。
+- `MCP_NETWORK_SECURITY_CONFIG=<path>`：`network_security.json` 路径；adapter 也可用
+  `--network-security-config` 指定。
 - `MCP_ENABLE_DISCOVERY=1`：TCP 模式下开启 mcp_server 局域网发现；默认开启。
 - `MCP_DISCOVERY_PORT=<port>`：UDP 发现监听端口；默认等于 `MCP_TCP_PORT`。
 - `MCP_UDP_BROADCAST_LISTEN_PORT=<port>`：UDP 广播目标端口；默认等于 `MCP_TCP_PORT`。
@@ -756,9 +769,9 @@ int main(void){printf(\"hello world!\\n\");return 0;}' > /home/alinx/prj/hello.c
 - `MCP_SHELL_EXEC_CONFIG=<absolute path>`：显式指定 JSON v2 shell policy；修改后需重启。
 - `MCP_ENABLE_SANDBOX_CTL=1`：要求有效 JSON v2 和非空 `control.token`，并启用 process-local control。
 
-TCP 仅接受 TLS 1.3 双向认证连接，不提供同端口明文回退。TLS 内仍使用 4 字节大端
-长度头加 JSON/MFT1 body；`mcp_stdio_proxy_adapter` 负责把 Codex stdio JSON-RPC
-转换成该加密 framed 协议。
+运行模式为 mTLS 时，TCP 仅接受 TLS 1.3 双向认证连接，不在同端口回退；运行模式为
+plaintext 时恢复增加 mTLS 前的明文 framed TCP 行为。两种模式均使用 4 字节大端长度头
+加 JSON/MFT1 body；详细选择矩阵见 `docs/transport_security.md`。
 
 `server.list_servers` 工具会主动触发一次发现广播，短暂等待响应后返回 JSON
 文本，结构包含 `total` 和 `servers`；每个 server 记录会话内临时 `server_id`、

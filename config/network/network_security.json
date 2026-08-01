@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "enabled": true,
+  "mtls": {
+    "ca_file": "",
+    "certificate_file": "",
+    "private_key_file": "",
+    "server_name": ""
+  }
+}

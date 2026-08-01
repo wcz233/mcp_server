@@ -8,11 +8,15 @@
 
 struct mcp_framed_listener;
 struct mcp_framed_connection;
+#if MCP_TCP_SECURITY_MTLS
 struct mcp_tls_context;
+#endif
 
 struct mcp_framed_listener_config {
     size_t max_frame_bytes;
+#if MCP_TCP_SECURITY_MTLS
     struct mcp_tls_context *tls_context;
+#endif
 };
 
 typedef void (*mcp_framed_message_cb)(void *arg,

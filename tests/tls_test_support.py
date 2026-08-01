@@ -1,17 +1,37 @@
 import hashlib
+import json
 import os
 from pathlib import Path
 import socket
 import ssl
 
 
-TLS_FIXTURES = Path(os.environ["MCP_TEST_TLS_DIR"])
+TCP_SECURITY = os.environ.get("MCP_TEST_TCP_SECURITY", "mtls")
+TLS_FIXTURES = Path(os.environ.get("MCP_TEST_TLS_DIR", ""))
 
 
 def add_server_tls_env(env, identity="node-a"):
-    env["MCP_TLS_CA_FILE"] = str(TLS_FIXTURES / "ca.cert.pem")
-    env["MCP_TLS_CERT_FILE"] = str(TLS_FIXTURES / f"{identity}.cert.pem")
-    env["MCP_TLS_KEY_FILE"] = str(TLS_FIXTURES / f"{identity}.key.pem")
+    env["MCP_TCP_SECURITY"] = TCP_SECURITY
+    if TCP_SECURITY == "plaintext":
+        return env
+
+    config_path = TLS_FIXTURES / f"network_security_{identity}.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "enabled": True,
+                "mtls": {
+                    "ca_file": str(TLS_FIXTURES / "ca.cert.pem"),
+                    "certificate_file": str(TLS_FIXTURES / f"{identity}.cert.pem"),
+                    "private_key_file": str(TLS_FIXTURES / f"{identity}.key.pem"),
+                    "server_name": "",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    env["MCP_NETWORK_SECURITY_CONFIG"] = str(config_path)
     return env
 
 
@@ -36,6 +56,8 @@ def client_context(identity="node-b", trusted=True, check_hostname=True):
 
 def connect_tls(port, identity="node-b", trusted=True, timeout=0.5):
     raw = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    if TCP_SECURITY == "plaintext":
+        return raw
     try:
         return client_context(identity, trusted).wrap_socket(raw, server_hostname="localhost")
     except Exception:

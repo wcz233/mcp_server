@@ -38,6 +38,13 @@ config MCP_TRANSPORT_UDP
     bool "UDP transport placeholder"
     default n
 
+config MCP_TCP_SECURITY
+    string "TCP security mode"
+    default "mtls"
+    help
+      Select mtls to compile mutual TLS and plaintext TCP support, or
+      plaintext to compile the historical plaintext TCP path without Mbed TLS.
+
 config MCP_BUILD_TESTS
     bool "Build smoke tests"
     default y

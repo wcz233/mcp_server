@@ -4,7 +4,9 @@
 #include "core/server_internal.h"
 #include "tools/system_status.h"
 #include "tools/tool_result.h"
+#if MCP_TCP_SECURITY_MTLS
 #include "security/tls_stream.h"
+#endif
 #include "transport/peer_transport.h"
 
 #include <stdint.h>
@@ -56,7 +58,9 @@ struct discovery_peer {
     uint32_t server_id;
     char ip[64];
     unsigned int port;
+#if MCP_TCP_SECURITY_MTLS
     char certificate_fingerprint[MCP_TLS_CERT_FINGERPRINT_HEX_SIZE];
+#endif
     json_t *status;
     json_t *tools_list;
     unsigned long long last_seen_ms;
@@ -77,12 +81,22 @@ struct discovery_udp_send {
     struct sockaddr_storage target;
 };
 
+struct discovery_write_req {
+    uv_write_t req;
+    uv_buf_t buf;
+    struct discovery_peer_conn *conn;
+    size_t queued_bytes;
+    bool close_after_write;
+};
+
 struct discovery_peer_conn {
     struct mcp_server_discovery *discovery;
     struct discovery_peer *peer;
     uv_tcp_t tcp;
     uv_connect_t connect_req;
+#if MCP_TCP_SECURITY_MTLS
     struct mcp_tls_stream *tls;
+#endif
     bool initialized;
     bool connected;
     bool connecting;
@@ -91,10 +105,13 @@ struct discovery_peer_conn {
     bool mcp_initialized;
     bool peer_notified;
     bool data_channel;
+#if MCP_TCP_SECURITY_MTLS
     bool close_when_drained;
+#endif
     char *rx_buf;
     size_t rx_len;
     size_t rx_cap;
+    size_t write_queue_bytes;
 };
 
 struct discovery_pending_list {
@@ -223,6 +240,7 @@ static int dup_string(char **dst, const char *value)
     return 0;
 }
 
+#if MCP_TCP_SECURITY_MTLS
 static bool valid_certificate_fingerprint(const char *value)
 {
     size_t index;
@@ -236,6 +254,7 @@ static bool valid_certificate_fingerprint(const char *value)
     }
     return true;
 }
+#endif
 
 static bool make_peer_id(const char *ip, unsigned int port, char **out)
 {
@@ -519,10 +538,14 @@ static json_t *build_discovery_packet(struct mcp_server_discovery *discovery,
     json_object_set_new(packet, "mcp_server_discovery", json_integer(MCP_DISCOVERY_PROTOCOL));
     json_object_set_new(packet, "instance_id", json_string(discovery->instance_id));
     json_object_set_new(packet, "tcp_port", json_integer((json_int_t)discovery->tcp_port));
-    json_object_set_new(packet,
-                        "certificate_fingerprint",
-                        json_string(mcp_tls_context_certificate_fingerprint(
-                            discovery->server->tls_context)));
+#if MCP_TCP_SECURITY_MTLS
+    if (mcp_server_tcp_security_mtls(discovery->server)) {
+        json_object_set_new(packet,
+                            "certificate_fingerprint",
+                            json_string(mcp_tls_context_certificate_fingerprint(
+                                discovery->server->tls_context)));
+    }
+#endif
     json_object_set_new(packet, "reply", json_boolean(reply));
     json_object_set_new(packet, "event", json_string(event ? event : "online"));
     if (discovery->advertise_host)
@@ -809,7 +832,9 @@ static void peer_conn_free(struct discovery_peer_conn *conn)
             conn->peer->conn = NULL;
     }
     free(conn->rx_buf);
+#if MCP_TCP_SECURITY_MTLS
     mcp_tls_stream_destroy(conn->tls);
+#endif
     free(conn);
 }
 
@@ -841,7 +866,9 @@ static void peer_conn_close(struct discovery_peer_conn *conn)
     conn->closing = true;
     conn->connected = false;
     conn->connecting = false;
+#if MCP_TCP_SECURITY_MTLS
     mcp_tls_stream_stop(conn->tls);
+#endif
     if (conn->initialized && !uv_is_closing((uv_handle_t *)&conn->tcp)) {
         conn->tcp.data = conn;
         uv_close((uv_handle_t *)&conn->tcp, peer_conn_close_cb);
@@ -947,6 +974,41 @@ static void peer_conn_process_rx(struct discovery_peer_conn *conn)
     }
 }
 
+static void peer_conn_alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf)
+{
+    (void)handle;
+    (void)suggested_size;
+
+    buf->base = malloc(4096);
+    buf->len = buf->base ? 4096 : 0;
+}
+
+static void peer_conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
+{
+    struct discovery_peer_conn *conn = stream->data;
+
+    if (nread < 0) {
+        free(buf->base);
+        peer_conn_fail(conn);
+        return;
+    }
+    if (nread == 0) {
+        free(buf->base);
+        return;
+    }
+    if (peer_conn_rx_reserve(conn, (size_t)nread) != 0) {
+        free(buf->base);
+        peer_conn_fail(conn);
+        return;
+    }
+
+    memcpy(conn->rx_buf + conn->rx_len, buf->base, (size_t)nread);
+    conn->rx_len += (size_t)nread;
+    free(buf->base);
+    peer_conn_process_rx(conn);
+}
+
+#if MCP_TCP_SECURITY_MTLS
 static void peer_tls_data_cb(void *arg, const unsigned char *data, size_t len)
 {
     struct discovery_peer_conn *conn = arg;
@@ -991,6 +1053,7 @@ static void peer_tls_ready_cb(void *arg)
     if (peer_send_initialize(conn) != 0)
         peer_conn_fail(conn);
 }
+#endif
 
 static void peer_connect_cb(uv_connect_t *req, int status)
 {
@@ -1002,17 +1065,30 @@ static void peer_connect_cb(uv_connect_t *req, int status)
         return;
     }
 
-    if (mcp_tls_stream_create(&conn->tls,
-                              conn->discovery->server->tls_context,
-                              false,
-                              conn->peer->ip,
-                              (uv_stream_t *)&conn->tcp,
-                              peer_tls_ready_cb,
-                              peer_tls_data_cb,
-                              peer_tls_error_cb,
-                              peer_tls_drain_cb,
-                              conn) != 0 ||
-        mcp_tls_stream_start(conn->tls) != 0)
+#if MCP_TCP_SECURITY_MTLS
+    if (mcp_server_tcp_security_mtls(conn->discovery->server)) {
+        if (mcp_tls_stream_create(&conn->tls,
+                                  conn->discovery->server->tls_context,
+                                  false,
+                                  conn->peer->ip,
+                                  (uv_stream_t *)&conn->tcp,
+                                  peer_tls_ready_cb,
+                                  peer_tls_data_cb,
+                                  peer_tls_error_cb,
+                                  peer_tls_drain_cb,
+                                  conn) != 0 ||
+            mcp_tls_stream_start(conn->tls) != 0)
+            peer_conn_fail(conn);
+        return;
+    }
+#endif
+
+    conn->connected = true;
+    if (!conn->data_channel)
+        peer_mark_heartbeat_ok(conn->peer);
+    if (uv_read_start((uv_stream_t *)&conn->tcp, peer_conn_alloc_cb, peer_conn_read_cb) != 0)
+        peer_conn_fail(conn);
+    else if (peer_send_initialize(conn) != 0)
         peer_conn_fail(conn);
 }
 
@@ -1058,30 +1134,87 @@ static void peer_connect(struct mcp_server_discovery *discovery,
         peer_conn_fail(conn);
 }
 
+static void peer_write_cb(uv_write_t *req, int status)
+{
+    struct discovery_write_req *write_req = (struct discovery_write_req *)req;
+    struct discovery_peer_conn *conn = write_req->conn ? write_req->conn : req->handle->data;
+    bool close_after_write = write_req->close_after_write;
+
+    if (conn && conn->write_queue_bytes >= write_req->queued_bytes)
+        conn->write_queue_bytes -= write_req->queued_bytes;
+    free(write_req->buf.base);
+    free(write_req);
+
+    if (status < 0)
+        peer_conn_fail(conn);
+    else if (close_after_write)
+        peer_conn_close(conn);
+}
+
 static int peer_send_frame(struct discovery_peer_conn *conn,
                            const char *data,
                            size_t len,
                            bool close_after_write)
 {
-    char *frame;
-    int rc;
+    struct discovery_write_req *write_req;
 
     if (!conn || !conn->connected || conn->closing || !data || len == 0 || len > UINT32_MAX)
         return -1;
-    if (mcp_tls_stream_pending_write_bytes(conn->tls) + len + 4 >
-        MCP_DISCOVERY_WRITE_HIGH_WATERMARK)
-        return -2;
 
-    frame = malloc(len + 4);
-    if (!frame)
+#if MCP_TCP_SECURITY_MTLS
+    if (conn->tls) {
+        char *frame;
+        int rc;
+
+        if (mcp_tls_stream_pending_write_bytes(conn->tls) + len + 4 >
+            MCP_DISCOVERY_WRITE_HIGH_WATERMARK)
+            return -2;
+        frame = malloc(len + 4);
+        if (!frame)
+            return -1;
+        write_u32_be(frame, (uint32_t)len);
+        memcpy(frame + 4, data, len);
+        rc = mcp_tls_stream_send(conn->tls, frame, len + 4);
+        free(frame);
+        if (rc == 0 && close_after_write)
+            conn->close_when_drained = true;
+        return rc;
+    }
+#endif
+
+    if (conn->write_queue_bytes + len + 4 > MCP_DISCOVERY_WRITE_HIGH_WATERMARK)
+        return -2;
+    write_req = calloc(1, sizeof(*write_req));
+    if (!write_req)
         return -1;
-    write_u32_be(frame, (uint32_t)len);
-    memcpy(frame + 4, data, len);
-    rc = mcp_tls_stream_send(conn->tls, frame, len + 4);
-    free(frame);
-    if (rc == 0 && close_after_write)
-        conn->close_when_drained = true;
-    return rc;
+    write_req->buf.base = malloc(len + 4);
+    if (!write_req->buf.base) {
+        free(write_req);
+        return -1;
+    }
+    write_req->conn = conn;
+    write_req->queued_bytes = len + 4;
+    write_req->close_after_write = close_after_write;
+    write_u32_be(write_req->buf.base, (uint32_t)len);
+    memcpy(write_req->buf.base + 4, data, len);
+#ifdef _WIN32
+    write_req->buf.len = (unsigned long)(len + 4);
+#else
+    write_req->buf.len = len + 4;
+#endif
+
+    conn->write_queue_bytes += write_req->queued_bytes;
+    if (uv_write(&write_req->req,
+                 (uv_stream_t *)&conn->tcp,
+                 &write_req->buf,
+                 1,
+                 peer_write_cb) != 0) {
+        conn->write_queue_bytes -= write_req->queued_bytes;
+        free(write_req->buf.base);
+        free(write_req);
+        return -1;
+    }
+    return 0;
 }
 
 static int discovery_external_send_frame(void *arg,
@@ -1769,10 +1902,14 @@ static json_t *build_offline_params(struct mcp_server_discovery *discovery)
     json_object_set_new(params, "instance_id", json_string(discovery->instance_id));
     json_object_set_new(params, "ip", json_string(ip));
     json_object_set_new(params, "port", json_integer((json_int_t)discovery->tcp_port));
-    json_object_set_new(params,
-                        "certificate_fingerprint",
-                        json_string(mcp_tls_context_certificate_fingerprint(
-                            discovery->server->tls_context)));
+#if MCP_TCP_SECURITY_MTLS
+    if (mcp_server_tcp_security_mtls(discovery->server)) {
+        json_object_set_new(params,
+                            "certificate_fingerprint",
+                            json_string(mcp_tls_context_certificate_fingerprint(
+                                discovery->server->tls_context)));
+    }
+#endif
     json_object_set_new(params, "status", status);
     return params;
 }
@@ -1910,9 +2047,15 @@ static struct discovery_peer *upsert_peer(struct mcp_server_discovery *discovery
     char *id = NULL;
     uint32_t server_id;
 
-    if (!mcp_server_network_ip_allowed(discovery->server, ip) ||
+    if (!mcp_server_network_ip_allowed(discovery->server, ip))
+        return NULL;
+#if MCP_TCP_SECURITY_MTLS
+    if (mcp_server_tcp_security_mtls(discovery->server) &&
         !valid_certificate_fingerprint(certificate_fingerprint))
         return NULL;
+#else
+    (void)certificate_fingerprint;
+#endif
 
     if (!peer) {
         if (!make_peer_id(ip, port, &id))
@@ -1935,15 +2078,21 @@ static struct discovery_peer *upsert_peer(struct mcp_server_discovery *discovery
         peer->server_id = server_id;
         snprintf(peer->ip, sizeof(peer->ip), "%s", ip);
         peer->port = port;
-        snprintf(peer->certificate_fingerprint,
-                 sizeof(peer->certificate_fingerprint),
-                 "%s",
-                 certificate_fingerprint);
+#if MCP_TCP_SECURITY_MTLS
+        if (mcp_server_tcp_security_mtls(discovery->server)) {
+            snprintf(peer->certificate_fingerprint,
+                     sizeof(peer->certificate_fingerprint),
+                     "%s",
+                     certificate_fingerprint);
+        }
+#endif
         peer->next = discovery->peers;
         discovery->peers = peer;
     }
 
-    if (strcmp(peer->certificate_fingerprint, certificate_fingerprint) != 0) {
+#if MCP_TCP_SECURITY_MTLS
+    if (mcp_server_tcp_security_mtls(discovery->server) &&
+        strcmp(peer->certificate_fingerprint, certificate_fingerprint) != 0) {
         peer_conn_close(peer->data_conn);
         peer_conn_close(peer->conn);
         snprintf(peer->certificate_fingerprint,
@@ -1951,6 +2100,7 @@ static struct discovery_peer *upsert_peer(struct mcp_server_discovery *discovery
                  "%s",
                  certificate_fingerprint);
     }
+#endif
 
     json_decref(peer->status);
     peer->status = status ? json_deep_copy(status) : json_object();
@@ -1982,6 +2132,17 @@ static bool mark_peer_offline(struct mcp_server_discovery *discovery,
     if (!discovery || !ip || ip[0] == '\0' || port > 65535)
         return false;
 
+    if (!mcp_server_tcp_security_mtls(discovery->server)) {
+        peer = upsert_peer(discovery,
+                           ip,
+                           port,
+                           NULL,
+                           status,
+                           DISCOVERY_PEER_OFFLINE);
+        return peer != NULL;
+    }
+
+#if MCP_TCP_SECURITY_MTLS
     peer = find_peer(discovery, ip, port);
     if (!peer || !valid_certificate_fingerprint(certificate_fingerprint) ||
         strcmp(peer->certificate_fingerprint, certificate_fingerprint) != 0)
@@ -1996,6 +2157,10 @@ static bool mark_peer_offline(struct mcp_server_discovery *discovery,
     peer_conn_close(peer->data_conn);
     peer_conn_close(peer->conn);
     return true;
+#else
+    (void)certificate_fingerprint;
+    return false;
+#endif
 }
 
 bool mcp_server_discovery_handle_offline_notification(struct mcp_server_discovery *discovery,
@@ -2016,10 +2181,12 @@ bool mcp_server_discovery_handle_offline_notification(struct mcp_server_discover
     if (!json_is_string(ip) ||
         !json_is_integer(port) ||
         json_integer_value(port) < 0 ||
-        json_integer_value(port) > 65535 ||
-        !json_is_string(certificate_fingerprint)) {
+        json_integer_value(port) > 65535) {
         return false;
     }
+    if (mcp_server_tcp_security_mtls(discovery->server) &&
+        !json_is_string(certificate_fingerprint))
+        return false;
 
     if (status && !json_is_object(status))
         status = NULL;
@@ -2027,7 +2194,9 @@ bool mcp_server_discovery_handle_offline_notification(struct mcp_server_discover
     return mark_peer_offline(discovery,
                              json_string_value(ip),
                              (unsigned int)json_integer_value(port),
-                             json_string_value(certificate_fingerprint),
+                             json_is_string(certificate_fingerprint)
+                                 ? json_string_value(certificate_fingerprint)
+                                 : NULL,
                              status);
 }
 
@@ -2053,10 +2222,14 @@ json_t *mcp_server_discovery_local_identity(struct mcp_server_discovery *discove
     json_object_set_new(identity, "instance_id", json_string(discovery->instance_id));
     json_object_set_new(identity, "ip", json_string(ip));
     json_object_set_new(identity, "port", json_integer((json_int_t)discovery->tcp_port));
-    json_object_set_new(identity,
-                        "certificate_fingerprint",
-                        json_string(mcp_tls_context_certificate_fingerprint(
-                            discovery->server->tls_context)));
+#if MCP_TCP_SECURITY_MTLS
+    if (mcp_server_tcp_security_mtls(discovery->server)) {
+        json_object_set_new(identity,
+                            "certificate_fingerprint",
+                            json_string(mcp_tls_context_certificate_fingerprint(
+                                discovery->server->tls_context)));
+    }
+#endif
     json_object_set_new(identity, "status", status);
     return identity;
 }
@@ -2069,8 +2242,11 @@ unsigned int mcp_server_discovery_note_peer_identity(struct mcp_server_discovery
     json_t *ip;
     json_t *port;
     json_t *status;
+#if MCP_TCP_SECURITY_MTLS
     json_t *certificate_fingerprint;
+#endif
     struct discovery_peer *peer;
+    bool mtls;
 
     if (!discovery || !json_is_object(identity))
         return 0;
@@ -2078,15 +2254,25 @@ unsigned int mcp_server_discovery_note_peer_identity(struct mcp_server_discovery
     ip = json_object_get(identity, "ip");
     port = json_object_get(identity, "port");
     status = json_object_get(identity, "status");
+#if MCP_TCP_SECURITY_MTLS
     certificate_fingerprint = json_object_get(identity, "certificate_fingerprint");
+#endif
     if (!json_is_string(ip) ||
         !json_is_integer(port) ||
         json_integer_value(port) < 0 ||
-        json_integer_value(port) > 65535 ||
-        !json_is_string(certificate_fingerprint) ||
-        !transport_fingerprint ||
-        strcmp(json_string_value(certificate_fingerprint), transport_fingerprint) != 0)
+        json_integer_value(port) > 65535)
         return 0;
+    mtls = mcp_server_tcp_security_mtls(discovery->server);
+#if MCP_TCP_SECURITY_MTLS
+    if (mtls &&
+        (!json_is_string(certificate_fingerprint) ||
+         !transport_fingerprint ||
+         strcmp(json_string_value(certificate_fingerprint), transport_fingerprint) != 0))
+        return 0;
+#else
+    if (mtls)
+        return 0;
+#endif
     if (status && !json_is_object(status))
         status = NULL;
 
@@ -2094,16 +2280,19 @@ unsigned int mcp_server_discovery_note_peer_identity(struct mcp_server_discovery
         peer = find_peer(discovery,
                          json_string_value(ip),
                          (unsigned int)json_integer_value(port));
-        if (!peer || peer->state == DISCOVERY_PEER_OFFLINE ||
-            strcmp(peer->certificate_fingerprint, transport_fingerprint) != 0)
+        if (!peer || peer->state == DISCOVERY_PEER_OFFLINE)
             return 0;
+#if MCP_TCP_SECURITY_MTLS
+        if (mtls && strcmp(peer->certificate_fingerprint, transport_fingerprint) != 0)
+            return 0;
+#endif
         return peer->server_id;
     }
 
     peer = upsert_peer(discovery,
                        json_string_value(ip),
                        (unsigned int)json_integer_value(port),
-                       transport_fingerprint,
+                       mtls ? transport_fingerprint : NULL,
                        status,
                        DISCOVERY_PEER_ONLINE);
     if (!peer)
@@ -2128,10 +2317,14 @@ static void discovery_on_datagram(uv_udp_t *handle,
     json_t *reply;
     json_t *event;
     json_t *advertise_host;
+#if MCP_TCP_SECURITY_MTLS
     json_t *certificate_fingerprint;
+#endif
+    const char *fingerprint_value = NULL;
     const char *peer_ip_value = NULL;
     char peer_ip[64];
     bool offline;
+    bool mtls;
 
     (void)flags;
 
@@ -2160,7 +2353,9 @@ static void discovery_on_datagram(uv_udp_t *handle,
     reply = json_object_get(root, "reply");
     event = json_object_get(root, "event");
     advertise_host = json_object_get(root, "advertise_host");
+#if MCP_TCP_SECURITY_MTLS
     certificate_fingerprint = json_object_get(root, "certificate_fingerprint");
+#endif
 
     if (!json_is_integer(protocol) ||
         json_integer_value(protocol) != MCP_DISCOVERY_PROTOCOL ||
@@ -2168,12 +2363,26 @@ static void discovery_on_datagram(uv_udp_t *handle,
         !json_is_integer(tcp_port) ||
         json_integer_value(tcp_port) < 0 ||
         json_integer_value(tcp_port) > 65535 ||
-        !json_is_object(status) ||
-        !json_is_string(certificate_fingerprint) ||
-        !valid_certificate_fingerprint(json_string_value(certificate_fingerprint))) {
+        !json_is_object(status)) {
         json_decref(root);
         return;
     }
+    mtls = mcp_server_tcp_security_mtls(discovery->server);
+#if MCP_TCP_SECURITY_MTLS
+    if (mtls) {
+        if (!json_is_string(certificate_fingerprint) ||
+            !valid_certificate_fingerprint(json_string_value(certificate_fingerprint))) {
+            json_decref(root);
+            return;
+        }
+        fingerprint_value = json_string_value(certificate_fingerprint);
+    }
+#else
+    if (mtls) {
+        json_decref(root);
+        return;
+    }
+#endif
 
     if (strcmp(json_string_value(instance_id), discovery->instance_id) == 0) {
         json_decref(root);
@@ -2195,13 +2404,13 @@ static void discovery_on_datagram(uv_udp_t *handle,
                 mark_peer_offline(discovery,
                                   peer_ip_value,
                                   port,
-                                  json_string_value(certificate_fingerprint),
+                                  fingerprint_value,
                                   status);
         } else {
             upsert_peer(discovery,
                         peer_ip_value,
                         port,
-                        json_string_value(certificate_fingerprint),
+                        fingerprint_value,
                         status,
                         DISCOVERY_PEER_ONLINE);
         }
