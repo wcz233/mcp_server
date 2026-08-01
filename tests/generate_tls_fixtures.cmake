@@ -31,11 +31,12 @@ function(issue_certificate name subject issuer_prefix eku san)
     set(_request_args req -new -sha256
         -key "${OUTPUT_DIR}/${name}.key.pem"
         -out "${OUTPUT_DIR}/${name}.csr.pem"
-        -subj "/CN=${subject}"
-        -addext "extendedKeyUsage=${eku}"
-        -addext keyUsage=critical,digitalSignature)
+        -subj "/CN=${subject}")
+    set(_extensions_file "${OUTPUT_DIR}/${name}.ext.cnf")
+    file(WRITE "${_extensions_file}"
+        "[v3_cert]\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=${eku}\n")
     if(NOT "${san}" STREQUAL "")
-        list(APPEND _request_args -addext "subjectAltName=${san}")
+        file(APPEND "${_extensions_file}" "subjectAltName=${san}\n")
     endif()
     run_openssl(${_request_args})
     run_openssl(x509 -req -sha256
@@ -45,7 +46,9 @@ function(issue_certificate name subject issuer_prefix eku san)
         -CAcreateserial
         -out "${OUTPUT_DIR}/${name}.cert.pem"
         -days 3650
-        -copy_extensions copyall)
+        -extfile "${_extensions_file}"
+        -extensions v3_cert)
+    file(REMOVE "${_extensions_file}")
 endfunction()
 
 issue_certificate(node-a localhost ca serverAuth,clientAuth DNS:localhost,IP:127.0.0.1)
