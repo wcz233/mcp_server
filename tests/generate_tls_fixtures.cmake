@@ -16,14 +16,24 @@ function(run_openssl)
     endif()
 endfunction()
 
-run_openssl(ecparam -name prime256v1 -genkey -noout -out "${OUTPUT_DIR}/ca.key.pem")
-run_openssl(req -x509 -new -sha256
-    -key "${OUTPUT_DIR}/ca.key.pem"
-    -out "${OUTPUT_DIR}/ca.cert.pem"
-    -days 3650
-    -subj /CN=MCP-Test-CA
-    -addext basicConstraints=critical,CA:TRUE
-    -addext keyUsage=critical,keyCertSign,cRLSign)
+function(issue_ca name subject)
+    run_openssl(ecparam -name prime256v1 -genkey -noout
+        -out "${OUTPUT_DIR}/${name}.key.pem")
+    set(_extensions_file "${OUTPUT_DIR}/${name}.ext.cnf")
+    file(WRITE "${_extensions_file}"
+        "[req]\ndistinguished_name=req_dn\nx509_extensions=v3_ca\n"
+        "[req_dn]\n[v3_ca]\nbasicConstraints=critical,CA:TRUE\n"
+        "keyUsage=critical,keyCertSign,cRLSign\n")
+    run_openssl(req -x509 -new -sha256
+        -key "${OUTPUT_DIR}/${name}.key.pem"
+        -out "${OUTPUT_DIR}/${name}.cert.pem"
+        -days 3650
+        -subj "/CN=${subject}"
+        -config "${_extensions_file}")
+    file(REMOVE "${_extensions_file}")
+endfunction()
+
+issue_ca(ca MCP-Test-CA)
 
 function(issue_certificate name subject issuer_prefix eku san)
     run_openssl(ecparam -name prime256v1 -genkey -noout
@@ -55,15 +65,7 @@ issue_certificate(node-a localhost ca serverAuth,clientAuth DNS:localhost,IP:127
 issue_certificate(node-b localhost ca serverAuth,clientAuth DNS:localhost,IP:127.0.0.1)
 issue_certificate(adapter mcp-stdio-proxy-test ca clientAuth "")
 
-run_openssl(ecparam -name prime256v1 -genkey -noout
-    -out "${OUTPUT_DIR}/untrusted-ca.key.pem")
-run_openssl(req -x509 -new -sha256
-    -key "${OUTPUT_DIR}/untrusted-ca.key.pem"
-    -out "${OUTPUT_DIR}/untrusted-ca.cert.pem"
-    -days 3650
-    -subj /CN=MCP-Untrusted-Test-CA
-    -addext basicConstraints=critical,CA:TRUE
-    -addext keyUsage=critical,keyCertSign,cRLSign)
+issue_ca(untrusted-ca MCP-Untrusted-Test-CA)
 issue_certificate(untrusted-client untrusted-client untrusted-ca clientAuth "")
 
 file(REMOVE
