@@ -39,6 +39,13 @@ Windows PowerShell：
 .\scripts\bootstrap.ps1
 ```
 
+Mbed TLS 的 Git 标签需要在构建时生成部分源码。Linux 构建环境若尚未安装生成器依赖，
+先在仓库根目录执行：
+
+```bash
+python3 -m pip install -r external/mbedtls/scripts/basic.requirements.txt
+```
+
 ## 编译
 
 ### Linux 风格 defconfig
@@ -742,7 +749,7 @@ int main(void){printf(\"hello world!\\n\");return 0;}' > /home/alinx/prj/hello.c
 - `MCP_DISCOVERY_PORT=<port>`：UDP 发现监听端口；默认等于 `MCP_TCP_PORT`。
 - `MCP_UDP_BROADCAST_LISTEN_PORT=<port>`：UDP 广播目标端口；默认等于 `MCP_TCP_PORT`。
 - `MCP_DISCOVERY_BIND_HOST=<ip>`：UDP 发现监听地址；默认 `0.0.0.0`。
-- `MCP_DISCOVERY_ADVERTISE_HOST=<ip>`：广播中声明给对端连接的地址；默认使用 UDP 来源地址。
+- `MCP_DISCOVERY_ADVERTISE_HOST=<ip>`：广播中声明给对端连接的地址；默认使用 UDP 来源地址；该 IP 必须存在于本节点证书 SAN。
 - `MCP_DISCOVERY_HOSTS=<ip[:port],...>`：额外单播发现目标，适合测试或禁止广播的网络。
 - `MCP_NETWORK_ACCESS_CONFIG=<absolute path>`：启动时加载 JSON v1 网络访问白名单；启用后禁止同时设置 `MCP_DISCOVERY_HOSTS`。
 - `MCP_DISCOVERY_PROXY_TIMEOUT_MS=<ms>`：`gateway.proxy_tool` 未显式传入 `proxy_timeout_ms` 时的代理等待超时；默认 `5000`。

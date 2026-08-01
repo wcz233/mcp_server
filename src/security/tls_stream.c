@@ -175,6 +175,8 @@ static void tls_process(struct mcp_tls_stream *stream)
     }
 
     for (;;) {
+        size_t encrypted_rx_len = stream->encrypted_rx_len;
+
         rc = mbedtls_ssl_read(&stream->ssl, plaintext, sizeof(plaintext));
         if (rc > 0) {
             if (stream->on_data)
@@ -183,8 +185,13 @@ static void tls_process(struct mcp_tls_stream *stream)
                 return;
             continue;
         }
-        if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE)
+        if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            if (stream->encrypted_rx_len < encrypted_rx_len)
+                continue;
             return;
+        }
+        if (rc == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET)
+            continue;
         tls_fail(stream, rc);
         return;
     }
@@ -308,8 +315,14 @@ int mcp_tls_stream_send(struct mcp_tls_stream *stream, const void *data, size_t 
     if (!stream || !stream->ready || stream->stopped || stream->failed || !data || len == 0)
         return -1;
     while (len > 0) {
+        size_t encrypted_rx_len = stream->encrypted_rx_len;
         int rc = mbedtls_ssl_write(&stream->ssl, cursor, len);
 
+        if (rc == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET)
+            continue;
+        if ((rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) &&
+            stream->encrypted_rx_len < encrypted_rx_len)
+            continue;
         if (rc <= 0)
             return -1;
         cursor += rc;

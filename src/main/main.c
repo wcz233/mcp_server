@@ -234,6 +234,13 @@ int main(void)
     int stdout_fd;
     int rc;
 
+#ifndef _WIN32
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        fprintf(stderr, "ignore SIGPIPE failed\n");
+        return 1;
+    }
+#endif
+
     if (!stdio_enabled && !udp_enabled && !pipe_enabled && !tcp_enabled)
         stdio_enabled = true;
 

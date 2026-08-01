@@ -18,7 +18,8 @@ Use a private CA dedicated to the MCP trust domain. Issue a different ECDSA P-25
 certificate and private key to every server and adapter instance. Server nodes need both
 `serverAuth` and `clientAuth` extended key usages because they accept inbound connections and
 initiate discovery peer connections. Adapter certificates need `clientAuth`. Put every DNS name
-or IP address used by an adapter in the server certificate SAN.
+or IP address used by an adapter in the server certificate SAN. Every IP address advertised by
+server discovery must also appear as an IP SAN in that server node's certificate.
 
 Keep CA private keys offline. Runtime hosts receive only the CA certificate, their own leaf
 certificate, and their own private key. Restrict private-key reads to the service identity. Rotate
@@ -54,8 +55,9 @@ the following checks pass:
 
 1. Network allowlist policy permits the address.
 2. The TLS certificate chains to the configured CA.
-3. The live leaf certificate fingerprint matches the advertised fingerprint.
-4. `initialize.mcp_peer_identity.certificate_fingerprint` matches the live TLS certificate.
+3. The certificate IP SAN matches the address advertised by discovery.
+4. The live leaf certificate fingerprint matches the advertised fingerprint.
+5. `initialize.mcp_peer_identity.certificate_fingerprint` matches the live TLS certificate.
 
 A forged UDP packet can cause connection attempts or temporary liveness noise, but it cannot
 create an authenticated MCP peer or expose framed payloads. Deployments that require discovery

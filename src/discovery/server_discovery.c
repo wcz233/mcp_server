@@ -1005,7 +1005,7 @@ static void peer_connect_cb(uv_connect_t *req, int status)
     if (mcp_tls_stream_create(&conn->tls,
                               conn->discovery->server->tls_context,
                               false,
-                              NULL,
+                              conn->peer->ip,
                               (uv_stream_t *)&conn->tcp,
                               peer_tls_ready_cb,
                               peer_tls_data_cb,
